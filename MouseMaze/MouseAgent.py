@@ -5,6 +5,7 @@ import torch.optim as optim
 import random
 import pygame
 import time
+from gen_maze import generate_random_maze
 
 class Maze:
     def __init__(self, grid):
@@ -75,9 +76,11 @@ class MouseAgent:
         loss.backward()
         self.optimizer.step()
 
-
-def train(agent, env, episodes, maze_grid, epsilon_start=1, epsilon_end=0.1, epsilon_decay=0.995, save_path=None, visualize=True):
+def train(agent, maze_size, episodes, epsilon_start=1, epsilon_end=0.1, epsilon_decay=0.995, save_path=None, visualize=True):
     for episode in range(episodes):
+        maze_grid = generate_random_maze(maze_size[0], maze_size[1])
+        env = Maze(maze_grid.copy())
+
         state = env.reset()
         done = False
         total_reward = 0
@@ -156,25 +159,26 @@ if __name__ == "__main__":
     # Set parameters
     train_flag = False
     agent_weights_save_path = 'agent_weights.pth' 
+    maze_size = (11, 11)
 
     # Example maze grid:
     # 0 = empty cell, 1 = wall, 2 = start, 3 = goal
-    maze_grid = np.array([
-        [2, 0, 0, 0, 1],
-        [1, 1, 0, 1, 1],
-        [0, 0, 0, 0, 0],
-        [1, 1, 1, 0, 1],
-        [0, 0, 0, 0, 3]
-    ])
-   
-    maze_env = Maze(maze_grid.copy())
-    mouse_agent = MouseAgent(input_size=2, output_size=4)
+    # maze_grid = np.array([
+    #     [2, 0, 0, 0, 1],
+    #     [1, 1, 0, 1, 1],
+    #     [0, 0, 0, 0, 0],
+    #     [1, 1, 1, 0, 1],
+    #     [0, 0, 0, 0, 3]
+    # ])
 
     # Train the agent
+    mouse_agent = MouseAgent(input_size=2, output_size=4)
     if train_flag:
-        train(mouse_agent, maze_env, episodes=10000, maze_grid=maze_grid, save_path=agent_weights_save_path, visualize=False)
+        train(mouse_agent, maze_size, episodes=1000, save_path=agent_weights_save_path, visualize=False)
     else:
         mouse_agent.q_net.load_state_dict(torch.load('agent_weights.pth'))
 
     # Test the trained agent in the graphical environment
+    maze_grid = generate_random_maze(maze_size[0], maze_size[1], visualize_maze_flag=True)
+    maze_env = Maze(maze_grid.copy())
     visualize_maze(mouse_agent, maze_grid.copy())
