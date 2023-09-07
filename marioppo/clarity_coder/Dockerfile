@@ -14,6 +14,23 @@ RUN \
     pkg-config \
     cmake
 
+RUN \
+    # Install various dependencies.
+    apt-get -y install \
+        apt-utils \
+        ffmpeg \
+        git \
+        htop \
+        libx264-dev \
+        libx265-dev \
+        tmux \
+        x11-apps \
+        tk8.6-dev \
+        python3-opengl \
+        unzip \
+        zip \
+        xterm
+
 # Set the working directory to /app
 WORKDIR /app
 
@@ -27,14 +44,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Set up environment variables for X11
 ENV DISPLAY=:0
 
-# Install required dependencies
-RUN apt-get install -y \
-    x11-apps \
-    python-opengl \
-    xterm
-
 # Copy mario to working directory
-COPY /ROMs /app/ROMs
-COPY /src /app/src
-COPY randomAgent.py .
+COPY ROMs /app/ROMs
 RUN python -m retro.import /app/ROMs
+
+EXPOSE 6006
