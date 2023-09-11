@@ -13,6 +13,7 @@ fonttools
 google-auth
 google-auth-oauthlib
 grpcio
+setuptools==65.5.0
 gym==0.21.0
 gym-notices==0.0.8
 gym-retro==0.8.0

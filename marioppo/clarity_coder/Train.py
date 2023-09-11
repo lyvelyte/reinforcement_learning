@@ -64,7 +64,7 @@ def make_env(env_id, rank, seed=0):
     """
     def _init():
         env = retro.make(game=env_id)
-        env = TimeLimitWrapper(env, max_steps=4000)
+        env = TimeLimitWrapper(env, max_steps=2000)
         env = MaxAndSkipEnv(env, skip=4)
         env.seed(seed + rank)
         return env
@@ -80,12 +80,11 @@ if __name__ == '__main__':
     os.makedirs(log_dir, exist_ok=True)
     
     env = VecMonitor(SubprocVecEnv([make_env(env_id, i) for i in range(num_cpu)]), log_dir)
-    model = PPO('CnnPolicy', env, verbose=1, tensorboard_log="./board/", learning_rate=3e-5, 
-                n_steps=2048, batch_size=16, n_epochs=1, gamma=0.99, gae_lambda=0.95, clip_range=0.3)
+    model = PPO('CnnPolicy', env, verbose=1, device="cuda", tensorboard_log="./board/", learning_rate=3e-5, ent_coef=1e-2)
     
     print("------------- Start Learning -------------")
     callback = SaveOnBestTrainingRewardCallback(check_freq=1000, log_dir=log_dir)
-    model.learn(total_timesteps=5000000, callback=callback, tb_log_name="PPO-00001")
+    model.learn(total_timesteps=2e6, callback=callback, tb_log_name="PPO-00001")
     model.save(env_id)
     
     print("------------- Done Learning -------------")
