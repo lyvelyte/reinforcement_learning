@@ -88,12 +88,4 @@ if __name__ == '__main__':
     model.save(env_id)
     
     print("------------- Done Learning -------------")
-    
-    env = retro.make(game=env_id)
-    env = TimeLimitWrapper(env)
 
-    obs = env.reset()
-    for _ in range(1000):
-        action, _states = model.predict(obs)
-        obs, rewards, dones, info = env.step(action)
-        env.render()

@@ -4,12 +4,14 @@ from RandomAgent import TimeLimitWrapper
 from stable_baselines3 import PPO
 from stable_baselines3.common.atari_wrappers import MaxAndSkipEnv
 
+from nes_py.wrappers import JoypadSpace
+import gym_super_mario_bros
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 
-model = PPO.load("tmp/best_model.zip")
+model = PPO.load("ppo_level_1_1.zip")
 
 def main():
     steps = 0
-    #env = retro.make(game='MegaMan2-Nes')
     env = retro.make(game='SuperMarioBros-Nes')
     env = TimeLimitWrapper(env)
     env = MaxAndSkipEnv(env, 4)
