@@ -12,24 +12,12 @@ RUN \
     apt-get -y install \
     build-essential \
     pkg-config \
-    cmake
-
-RUN \
-    # Install various dependencies.
-    apt-get -y install \
-        apt-utils \
-        ffmpeg \
-        git \
-        htop \
-        libx264-dev \
-        libx265-dev \
-        tmux \
-        x11-apps \
-        tk8.6-dev \
-        python3-opengl \
-        unzip \
-        zip \
-        xterm
+    cmake \
+    ffmpeg \
+    git \
+    tmux \
+    x11-apps \
+    python-opengl
 
 # Set the working directory to /app
 WORKDIR /app
