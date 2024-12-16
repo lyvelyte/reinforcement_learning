@@ -229,8 +229,8 @@ class ObjectDistributions():
         false_alarm_likelihood_sum = 0
         n_likelihood_bins = len(self.target_pdf_y_vals[dist_idx])
         for i in range(n_likelihood_bins):
-            target_likelihood_sum += p_target*self.target_pdf_y_vals[dist_idx][i]
-            false_alarm_likelihood_sum += p_false_alarm*self.fa_pdf_y_vals[dist_idx][i]
+            target_likelihood_sum += self.target_pdf_y_vals[dist_idx][i]*(self.target_pdf_y_vals[dist_idx][i] / (self.target_pdf_y_vals[dist_idx][i] + self.fa_pdf_y_vals[dist_idx][i]))
+            false_alarm_likelihood_sum += self.fa_pdf_y_vals[dist_idx][i] * (self.fa_pdf_y_vals[dist_idx][i] / (self.fa_pdf_y_vals[dist_idx][i] + self.fa_pdf_y_vals[dist_idx][i]))
             
         expected_log_likelihood_ratio_change = np.log(target_likelihood_sum / false_alarm_likelihood_sum) # n_likelihood bins drops out as it would have been in numerator and denomenator
         new_total_likelihood_ratio = np.exp(total_log_likelihood_ratio + expected_log_likelihood_ratio_change)
@@ -245,9 +245,8 @@ if __name__ == '__main__':
     distros = ObjectDistributions(difficulty = "hard", ideal_look_angle = None, plot_distributions_flag=False)
 
     samples = []
-    for i in range(5):
-        conf_value = distros.sample(distance = 5, is_false_alarm = False, relative_look_angle=None)
-        print(f"Sampled confidence value = {conf_value}")
+    for i in range(1000):
+        conf_value = distros.sample(distance = 100, is_false_alarm = False, relative_look_angle=None)
 
         samples.append({
             'confidence': conf_value,
@@ -256,10 +255,8 @@ if __name__ == '__main__':
         })   
 
     p_target = distros.get_probability_of_target(samples)
+    print(f"The sampled confidence values = {conf_value:0.3f}, the resulting total probability of being a target is {p_target:.3f}")
 
-    print(f"The probability of being a target is {p_target:.3f}")
-
-    new_distance = 10
-    delta_p_target = distros.get_expected_change_in_probability_of_target(samples, new_distance)
-
-    print(f"The expected chagne in probability of being a target if we sampled from a distance of {new_distance} is {delta_p_target:.3f}")
+    # new_distance = 1
+    # delta_p_target = distros.get_expected_change_in_probability_of_target(samples, new_distance)
+    # print(f"\nThe expected change in probability of being a target if we sampled from a distance of {new_distance} is {delta_p_target:.3f}")
