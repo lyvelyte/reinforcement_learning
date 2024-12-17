@@ -39,8 +39,8 @@ class ObjectDistributions():
         self.ideal_look_angle = ideal_look_angle
 
         # Generate relevant distances (meters)
-        self.n_dist = 10    # Number of discrete distance values to use. 
-        self.distances = np.linspace(0, 100, self.n_dist)
+        self.n_dist = 1    # Number of discrete distance values to use. 
+        self.distances = np.linspace(10, 10, self.n_dist)
 
         if difficulty.lower() == 'easy':
             # Generate target distributions
@@ -166,6 +166,7 @@ class ObjectDistributions():
 
         # Compute the total likelihood ratio.
         total_log_likelihood_ratio = 0
+        epsilon = 1e-12
         for i in range(len(samples)):
             dist_idx = find_closest_value_index(self.distances, samples[i]['distance'])
             idx = np.searchsorted(self.x_vals, samples[i]['confidence']) 
@@ -174,7 +175,7 @@ class ObjectDistributions():
             fa_likelihood = self.fa_pdf_y_vals[dist_idx][idx]
 
             # Keep track of the sum of the log likelihoods. 
-            total_log_likelihood_ratio = total_log_likelihood_ratio + np.log(target_likelihood / fa_likelihood)
+            total_log_likelihood_ratio += np.log((target_likelihood + epsilon) / (fa_likelihood + epsilon))
 
         # Compute the final probability of being a target
         total_likelihood_ratio =  np.exp(total_log_likelihood_ratio)
@@ -182,9 +183,9 @@ class ObjectDistributions():
 
         return p_target
     
-    def get_expected_change_in_probability_of_target(self, samples, new_sample_distance, prior_p_target = 0.5):
+    def get_expected_change_in_probability_of_target(self, samples, new_sample_distance):
         """
-        Calcilates the probability of the object being a target given the samples
+        Calculates expected change in probability from sampling an object at the given new_sample_distance.
 
         Parameters:
         samples: A list of samples. Each sample should be a dictionary strucured as
@@ -199,64 +200,99 @@ class ObjectDistributions():
         """    
 
         # ===== Copied from get_probability_of_target ====
-        # Assume an object either is a target or a false alarm (Law of total probability, p_target + p_false_alarm = 1)
+        # Computer current p_target
+        prior_p_target = self.get_probability_of_target(samples)
+        # prior_p_target = 0.5
         prior_p_false_alarm = 1 - prior_p_target
-
-        # Compute the total log likelihood ratio for the existing samples.
-        total_log_likelihood_ratio = 0
-        for i in range(len(samples)):
-            dist_idx = find_closest_value_index(self.distances, samples[i]['distance'])
-            idx = np.searchsorted(self.x_vals, samples[i]['confidence']) 
-
-            target_likelihood = self.target_pdf_y_vals[dist_idx][idx]
-            fa_likelihood = self.fa_pdf_y_vals[dist_idx][idx]
-
-            # Keep track of the sum of the log likelihoods. 
-            total_log_likelihood_ratio += np.log(target_likelihood / fa_likelihood)
-
-        # Compute the final probability of being a target
-        total_likelihood_ratio = np.exp(total_log_likelihood_ratio)
-        p_target = (total_likelihood_ratio * prior_p_target) / (total_likelihood_ratio * prior_p_target + prior_p_false_alarm) 
-        # =====================================================
-
-        p_false_alarm = 1-p_target
-
-        # Determine the distributions the new sample will be pulled from. 
+        
+        # Get the index for the correct distribution slice.
         dist_idx = find_closest_value_index(self.distances, new_sample_distance)
 
-        # Calculate the average log likelihood change for each confidence possible
-        target_likelihood_sum = 0
-        false_alarm_likelihood_sum = 0
-        n_likelihood_bins = len(self.target_pdf_y_vals[dist_idx])
-        for i in range(n_likelihood_bins):
-            target_likelihood_sum += self.target_pdf_y_vals[dist_idx][i]*(self.target_pdf_y_vals[dist_idx][i] / (self.target_pdf_y_vals[dist_idx][i] + self.fa_pdf_y_vals[dist_idx][i]))
-            false_alarm_likelihood_sum += self.fa_pdf_y_vals[dist_idx][i] * (self.fa_pdf_y_vals[dist_idx][i] / (self.fa_pdf_y_vals[dist_idx][i] + self.fa_pdf_y_vals[dist_idx][i]))
-            
-        expected_log_likelihood_ratio_change = np.log(target_likelihood_sum / false_alarm_likelihood_sum) # n_likelihood bins drops out as it would have been in numerator and denomenator
-        new_total_likelihood_ratio = np.exp(total_log_likelihood_ratio + expected_log_likelihood_ratio_change)
-        new_p_target = (new_total_likelihood_ratio * p_target) / (new_total_likelihood_ratio * p_target + p_false_alarm)
+        # Assume object is a target, what would be the expected gain:
+        # Extract the arrays
+        target_likelihoods = self.target_pdf_y_vals[dist_idx]
+        fa_likelihoods = self.fa_pdf_y_vals[dist_idx]
 
-        delta_p_target = new_p_target - p_target
+        # Compute the expected updated belief if the object is a target. 
+        expected_updated_belief = 0.0
+        for i in range(len(target_likelihoods)):
+            t_likelihood = target_likelihoods[i]
+            fa_likelihood = fa_likelihoods[i]  
+            # Compute posterior for T given c_i
+            numerator = prior_p_target * t_likelihood
+            denominator = numerator + (prior_p_false_alarm * fa_likelihood)
+            if denominator > 0:
+                p_t_given_c = numerator / denominator
+            else:
+                p_t_given_c = 0.0
+            expected_updated_belief += p_t_given_c * t_likelihood
+        delta_p_target = expected_updated_belief - prior_p_target
 
-        return delta_p_target
+        # Compute the expected updated belief if the object is a false alarm. 
+        expected_updated_belief = 0.0
+        for i in range(len(fa_likelihoods)):
+            fa_likelihood = fa_likelihoods[i]
+            t_likelihood = target_likelihoods[i] 
+            # Compute posterior for T given c_i
+            numerator = prior_p_false_alarm * fa_likelihood
+            denominator = numerator + (prior_p_target * t_likelihood)
+            if denominator > 0:
+                p_fa_given_c = numerator / denominator
+            else:
+                p_fa_given_c = 0.0
+            expected_updated_belief += p_fa_given_c * fa_likelihood
+        delta_p_false_alarm = expected_updated_belief - prior_p_false_alarm
+
+        # # Compute it statistically to verify:
+        # avg_d_p_target = 0
+        # n_avg = 5000
+        # for i in range(n_avg):
+        #     conf_value = distros.sample(distance = new_sample_distance, is_false_alarm = object_is_false_alarm, relative_look_angle=None)
+
+        #     if i == 0:
+        #         samples.append({
+        #         'confidence': conf_value,
+        #         'distance': new_sample_distance,
+        #         'relative_look_angle': None
+        #         })
+        #     else:
+        #         samples[-1] = {
+        #         'confidence': conf_value,
+        #         'distance': new_sample_distance,
+        #         'relative_look_angle': None
+        #         }
+
+        #     new_p_target = self.get_probability_of_target(samples)
+        #     avg_d_p_target += new_p_target - prior_p_target
+
+        # avg_d_p_target = avg_d_p_target / n_avg      
+        
+        # print(f"avg_d_p_target = {avg_d_p_target}, delta_p_target = {delta_p_target}, delta_p_false_alarm = {delta_p_false_alarm}")    
+
+        expected_belief_gain = prior_p_target*abs(delta_p_target) + prior_p_false_alarm*abs(delta_p_false_alarm)
+
+        return expected_belief_gain
 
 
 if __name__ == '__main__':
-    distros = ObjectDistributions(difficulty = "hard", ideal_look_angle = None, plot_distributions_flag=False)
-
+    distros = ObjectDistributions(difficulty = "medium", ideal_look_angle = None, plot_distributions_flag=False)
+    
     samples = []
-    for i in range(1000):
-        conf_value = distros.sample(distance = 100, is_false_alarm = False, relative_look_angle=None)
+    object_is_false_alarm = False
+    conf_value = 0.5
+    dist_to_sample = 20
+    n_samples = 10
+    for i in range(n_samples):
+        conf_value = distros.sample(distance = dist_to_sample, is_false_alarm = object_is_false_alarm, relative_look_angle=None)
 
         samples.append({
             'confidence': conf_value,
-            'distance': 1,
+            'distance': dist_to_sample,
             'relative_look_angle': None
         })   
 
-    p_target = distros.get_probability_of_target(samples)
-    print(f"The sampled confidence values = {conf_value:0.3f}, the resulting total probability of being a target is {p_target:.3f}")
+        p_target = distros.get_probability_of_target(samples)
+        print(f"The sampled confidence values = {conf_value:0.3f}, the resulting total probability of being a target is {p_target:.3f}")
 
-    # new_distance = 1
-    # delta_p_target = distros.get_expected_change_in_probability_of_target(samples, new_distance)
-    # print(f"\nThe expected change in probability of being a target if we sampled from a distance of {new_distance} is {delta_p_target:.3f}")
+    delta_p_target = distros.get_expected_change_in_probability_of_target(samples, dist_to_sample)
+    print(f"\nThe expected belief gain if we sampled from a distance of {dist_to_sample} is {delta_p_target:.3f}, given the priors.")
