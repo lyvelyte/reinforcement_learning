@@ -1,0 +1,14 @@
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+
+[sandbox_workspace_write]
+network_access = true
+
+# Token / output reducers
+model_reasoning_summary = "none"
+model_verbosity = "low"
+
+[features]
+fast_mode = false
+multi_agent = false
+enable_request_compression = true

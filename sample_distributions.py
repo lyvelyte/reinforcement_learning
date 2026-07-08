@@ -39,8 +39,8 @@ class ObjectDistributions():
         self.ideal_look_angle = ideal_look_angle
 
         # Generate relevant distances (meters)
-        self.n_dist = 1    # Number of discrete distance values to use. 
-        self.distances = np.linspace(10, 10, self.n_dist)
+        self.n_dist = 10    # Number of discrete distance values to use. 
+        self.distances = np.linspace(1, 10, self.n_dist)
 
         if difficulty.lower() == 'easy':
             # Generate target distributions
@@ -245,7 +245,7 @@ class ObjectDistributions():
 
         # # Compute it statistically to verify:
         # avg_d_p_target = 0
-        # n_avg = 5000
+        # n_avg = 10000
         # for i in range(n_avg):
         #     conf_value = distros.sample(distance = new_sample_distance, is_false_alarm = object_is_false_alarm, relative_look_angle=None)
 
@@ -275,13 +275,16 @@ class ObjectDistributions():
 
 
 if __name__ == '__main__':
-    distros = ObjectDistributions(difficulty = "medium", ideal_look_angle = None, plot_distributions_flag=False)
-    
+    distros = ObjectDistributions(difficulty = "easy", ideal_look_angle = None, plot_distributions_flag=True)
+    distros = ObjectDistributions(difficulty = "medium", ideal_look_angle = None, plot_distributions_flag=True)
+    distros = ObjectDistributions(difficulty = "hard", ideal_look_angle = None, plot_distributions_flag=True)
+    exit()
+
     samples = []
-    object_is_false_alarm = False
+    object_is_false_alarm = True
     conf_value = 0.5
-    dist_to_sample = 20
-    n_samples = 10
+    dist_to_sample = 7
+    n_samples = 2
     for i in range(n_samples):
         conf_value = distros.sample(distance = dist_to_sample, is_false_alarm = object_is_false_alarm, relative_look_angle=None)
 
@@ -294,5 +297,6 @@ if __name__ == '__main__':
         p_target = distros.get_probability_of_target(samples)
         print(f"The sampled confidence values = {conf_value:0.3f}, the resulting total probability of being a target is {p_target:.3f}")
 
-    delta_p_target = distros.get_expected_change_in_probability_of_target(samples, dist_to_sample)
-    print(f"\nThe expected belief gain if we sampled from a distance of {dist_to_sample} is {delta_p_target:.3f}, given the priors.")
+    for i in range(10):
+        delta_p_target = distros.get_expected_change_in_probability_of_target(samples, i)
+        print(f"\nThe expected belief gain if we sampled from a distance of {i} is {delta_p_target:.3f}, given the priors.")

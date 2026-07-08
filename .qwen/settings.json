@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda *)",
+      "Bash(timeout *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ]
+  },
+  "$version": 4
+}
