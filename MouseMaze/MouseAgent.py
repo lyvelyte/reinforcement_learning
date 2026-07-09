@@ -521,6 +521,12 @@ def train(
 
             state = next_state
             total_reward += reward
+
+            # Keep WSLg / X11 display alive when GUI dashboard is active.
+            # pygame must pump events regularly or the compositor suppresses the window.
+            if dashboard and step % 50 == 0:
+                pygame.event.pump()
+
             if done:
                 break
 
