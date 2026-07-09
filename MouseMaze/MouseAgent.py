@@ -647,12 +647,11 @@ def _draw_cheese_icon(screen, center_x, center_y, cell_size):
 def visualize_inference(agent, maze_grid, fps=15):
     env = Maze(maze_grid.copy())
     pygame.init()
-    info = pygame.display.Info()
-    # Scale to ~62 % of the desktop so the window is comfortably sized.
-    max_w = int(info.current_w * 0.62)
-    max_h = int(info.current_h * 0.62)
     rows, cols = env.grid.shape[0], env.grid.shape[1]
-    cell_size = max(4, min(max_w // cols, max_h // rows, 50))
+    # Scale so the window comfortably fits a standard monitor regardless of
+    # what pygame reports (WSLg virtual desktops can be misleadingly large).
+    max_window_px = 960           # hard cap; ~⅔ of a 1080p screen
+    cell_size = max(4, min(max_window_px // max(rows, cols), 40))
     width = cols * cell_size
     height = rows * cell_size
     screen = pygame.display.set_mode((width, height))
