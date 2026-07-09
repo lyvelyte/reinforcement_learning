@@ -4,7 +4,11 @@
       "Bash(conda *)",
       "Bash(timeout *)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Agent(general-purpose)",
+      "Bash(tee *)",
+      "Agent(Explore)",
+      "Bash(tail *)"
     ]
   },
   "$version": 4

@@ -12,43 +12,69 @@ from gen_maze import generate_random_maze
 # Hyper-parameters (tweak here)
 # ---------------------------------------------------------------------------
 VIEW_SIZE = 7               # NxN local grid patch fed to the network
-BUFFER_SIZE = 100_000       # experience replay capacity
-BATCH_SIZE = 64             # mini-batch sampled each update
-TARGET_UPDATE_FREQ = 100    # soft-sync target-net every N gradient steps
-LEARNING_RATE = 5e-4        # Adam LR
+BUFFER_SIZE = 200_000       # experience replay capacity
+BATCH_SIZE = 512            # mini-batch sampled each update (GPU loves big batches)
+TARGET_UPDATE_FREQ = 200    # hard-sync target-net every N gradient steps
+LEARNING_RATE = 3e-4        # Adam LR
 GAMMA = 0.99                # discount factor
 EPSILON_START = 1.0
-EPSILON_END = 0.02
-EPSILON_DECAY_STEPS = 4000  # linear decay; match or exceed total training episodes
+EPSILON_END = 0.01
+EPSILON_DECAY_STEPS = 2000  # linear decay; reaches min epsilon by ep 2000
+TEMP_START = 5.0            # initial softmax temperature for policy noise
+TEMP_END = 0.1              # final softmax temperature (near-deterministic)
+TEMP_DECAY_STEPS = 3000     # cooling schedule length
+CYCLE_WINDOW = 10           # recent steps inspected for cycles
+CYCLE_THRESHOLD = 3         # same-pos repetitions before forcing escape
 SHAPING_K = 0.4             # potential-based shaping coefficient (per step)
 MAX_EPISODE_STEPS = 400     # safety cap per maze episode
-TRAIN_EVERY_N_STEPS = 4     # only run gradient step every N environment steps
+TRAIN_EVERY_N_STEPS = 1     # train every step (GPU can keep up)
 TRANSITIONS_PER_EPISODE_CAP = MAX_EPISODE_STEPS  # drop stale goal-specific transitions from older mazes
+NUM_EVAL_EPISODES = 20      # fresh greedy evals per checkpoint
+EVAL_PERIOD = 50            # eval every this many training episodes
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ---------------------------------------------------------------------------
-# Experience replay buffer
+# Experience replay buffer (pre-allocated numpy — faster than deque)
 # ---------------------------------------------------------------------------
 class ReplayBuffer:
+    __slots__ = ("states", "actions", "rewards", "next_states", "dones", "capacity", "_pos", "_size")
+
     def __init__(self, capacity=BUFFER_SIZE):
-        self.buffer = deque(maxlen=capacity)
+        flat_size = VIEW_SIZE * VIEW_SIZE
+        self.capacity = capacity
+        self.states = np.empty((capacity, flat_size), dtype=np.float32)
+        self.actions = np.empty(capacity, dtype=np.int64)
+        self.rewards = np.empty(capacity, dtype=np.float32)
+        self.next_states = np.empty((capacity, flat_size), dtype=np.float32)
+        self.dones = np.empty(capacity, dtype=np.float32)
+        self._pos = 0
+        self._size = 0
 
     def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+        idx = self._pos % self.capacity
+        self.states[idx] = state.ravel()
+        self.actions[idx] = action
+        self.rewards[idx] = reward
+        self.next_states[idx] = next_state.ravel()
+        self.dones[idx] = done
+        self._pos += 1
+        if self._size < self.capacity:
+            self._size += 1
 
     def sample(self, batch_size=BATCH_SIZE):
-        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
-        states, actions, rewards, next_states, dones = zip(*batch)
+        n = min(batch_size, self._size)
+        idx = np.random.randint(0, self._size, size=n)
         return (
-            np.array(states),
-            np.array(actions).astype(np.int64),
-            np.array(rewards).astype(np.float32),
-            np.array(next_states),
-            np.array(dones).astype(np.float32),
+            self.states[idx],
+            self.actions[idx],
+            self.rewards[idx],
+            self.next_states[idx],
+            self.dones[idx],
         )
 
     def __len__(self):
-        return len(self.buffer)
+        return self._size
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +170,7 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(128, output_size),
         )
+        self.to(DEVICE)
 
     def forward(self, x):
         # x: (B, V*V) -> (B, 1, V, V)
@@ -173,12 +200,17 @@ class MouseAgent:
         """Call at the start of each episode to reset per-episode counters."""
         self._episode_transitions = 0
 
-    def get_action(self, state, epsilon=0.0):
+    def get_action(self, state, epsilon=0.0, temperature=None):
         if np.random.random() < epsilon:
             return random.randint(0, 3)
         with torch.no_grad():
-            q = self.online_net(torch.FloatTensor(state).unsqueeze(0))
-            return q.argmax(dim=1).item()
+            q = self.online_net(
+                torch.as_tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+            )
+            q_vals = q.cpu().numpy()[0]
+        if temperature is not None:
+            return _softmax_action(q_vals, temperature)
+        return int(np.argmax(q_vals))
 
     def store_transition(self, state, action, reward, next_state, done):
         if self._episode_transitions < TRANSITIONS_PER_EPISODE_CAP:
@@ -193,11 +225,11 @@ class MouseAgent:
             return None
         states, actions, rewards, next_states, dones = self.buffer.sample()
 
-        s = torch.FloatTensor(states)
-        a = torch.LongTensor(actions).unsqueeze(1)
-        r = torch.FloatTensor(rewards)
-        ns = torch.FloatTensor(next_states)
-        d = torch.FloatTensor(dones)
+        s = torch.as_tensor(states, dtype=torch.float32, device=DEVICE)
+        a = torch.as_tensor(actions, dtype=torch.long, device=DEVICE).unsqueeze(1)
+        r = torch.as_tensor(rewards, dtype=torch.float32, device=DEVICE)
+        ns = torch.as_tensor(next_states, dtype=torch.float32, device=DEVICE)
+        d = torch.as_tensor(dones, dtype=torch.float32, device=DEVICE)
 
         q_values = self.online_net(s)
         q_a = q_values.gather(1, a).squeeze(1)
@@ -210,19 +242,16 @@ class MouseAgent:
             ).squeeze(1)
             target_q = r + GAMMA * next_q_target * (1.0 - d)
 
-        loss = nn.MSELoss()(q_a, target_q)
+        loss = nn.SmoothL1Loss()(q_a, target_q)
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
         self.optimizer.step()
         self.update_count += 1
 
+        # Hard target sync (stable for DQN on discrete envs)
         if self.update_count % TARGET_UPDATE_FREQ == 0:
-            tau = 0.05
-            for p_tgt, p_online in zip(
-                self.target_net.parameters(), self.online_net.parameters()
-            ):
-                p_tgt.data = tau * p_online.data + (1 - tau) * p_tgt.data
+            self.target_net.load_state_dict(self.online_net.state_dict())
 
         return loss.item()
 
@@ -230,8 +259,9 @@ class MouseAgent:
         torch.save(self.online_net.state_dict(), path)
 
     def load(self, path):
-        self.online_net.load_state_dict(torch.load(path))
-        self.target_net.load_state_dict(self.online_net.state_dict())
+        state = torch.load(path, map_location=DEVICE)
+        self.online_net.load_state_dict(state)
+        self.target_net.load_state_dict(state)
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +289,59 @@ class MetricsTracker:
 def _linear_epsilon(episode):
     progress = min(episode / EPSILON_DECAY_STEPS, 1.0)
     return EPSILON_START + (EPSILON_END - EPSILON_START) * progress
+
+
+def _linear_temperature(episode):
+    progress = min(episode / TEMP_DECAY_STEPS, 1.0)
+    return TEMP_START + (TEMP_END - TEMP_START) * progress
+
+
+def _softmax_action(q_vals, temperature=1.0):
+    """Sample an action by softmax over Q-values scaled by *temperature*.
+
+    High temperature ≈ uniform random; low temperature ≈ argmax.
+    """
+    logits = np.asarray(q_vals, dtype=np.float64) / max(temperature, 1e-4)
+    probs = np.exp(logits - np.max(logits))
+    probs /= probs.sum()
+    return int(np.random.choice(len(q_vals), p=probs))
+
+
+def _try_escape_cycle(env, history):
+    """Return an action index to break out of a cycle, or None.
+
+    Checks the last CYCLE_WINDOW positions; if current position appears
+    >= CYCLE_THRESHOLD times, pick a random valid neighbor not seen recently.
+    """
+    pos = env.current_position
+    recent = history[-CYCLE_WINDOW:]
+    from collections import Counter
+    counts = Counter(recent)
+    if counts.get(pos, 0) < CYCLE_THRESHOLD:
+        return None
+    visited = set(recent)
+    for candidate in random.sample(range(4), 4):
+        dr, dc = Maze.ACTIONS[candidate]
+        nxt = (pos[0] + dr, pos[1] + dc)
+        if env._is_valid(nxt) and nxt not in visited:
+            return candidate
+    return None
+
+
+def _eval_greedy(agent, maze_size, n_episodes=NUM_EVAL_EPISODES):
+    """Run epsilon=0 greedy eval on fresh mazes; returns solve fraction."""
+    wins = 0
+    for _ in range(n_episodes):
+        env = Maze(generate_random_maze(maze_size[0], maze_size[1]).copy())
+        state = env.reset()
+        done = False
+        for _ in range(MAX_EPISODE_STEPS):
+            action = agent.get_action(state, epsilon=0.0)  # pure greedy
+            state, reward, done, _ = env.step(action)
+            if done:
+                wins += 1
+                break
+    return wins / n_episodes
 
 
 # ---------------------------------------------------------------------------
@@ -355,19 +438,19 @@ def _draw_curve(screen, data, rect, color, label):
 # Training
 # ---------------------------------------------------------------------------
 def train(
-    agent, maze_size, episodes=2000, save_path=None,
-    dashboard_flag=True, eval_every=50
+    agent, maze_size, episodes=5000, save_path=None,
+    dashboard_flag=False, eval_every=50
 ):
     """Train *agent* on random mazes of size *maze_size*.
 
-    If *dashboard_flag* is True, a pygame window shows live reward/loss curves.
-    Every *eval_every* episodes the trained policy runs a fresh maze and the
-    result is printed (solved or not, steps taken).
+    Every EVAL_PERIOD episodes runs greedy (epsilon=0) evals and saves best
+    weights based on actual inference-quality performance.
     """
+    print(f"[train] device = {DEVICE}  |  CUDA available = {torch.cuda.is_available()}")
     tracker = MetricsTracker()
     dashboard = None if not dashboard_flag else Dashboard()
 
-    best_solve_rate = 0.0
+    best_eval_rate = -1.0
     best_weights = None
 
     for ep in range(episodes):
@@ -378,11 +461,20 @@ def train(
         done = False
         total_reward = 0.0
         last_loss = None
+        position_history = [env.current_position]
 
         for step in range(MAX_EPISODE_STEPS):
             eps = _linear_epsilon(ep)
-            action = agent.get_action(state, eps)
+            temperature = _linear_temperature(ep)
+            action = agent.get_action(state, eps, temperature=temperature)
+
+            # Cycle detection — override with escape if stuck
+            escape = _try_escape_cycle(env, position_history)
+            if escape is not None:
+                action = escape
+
             next_state, reward, done, _moved = env.step(action)
+            position_history.append(env.current_position)
             agent.store_transition(state, action, reward, next_state, done)
             loss = agent.train_step()
             if loss is not None:
@@ -396,31 +488,37 @@ def train(
         steps_taken = step + 1
         tracker.record(total_reward, last_loss, steps_taken, done)
 
+        # Periodic greedy eval (epsilon=0 — the real inference metric)
+        eval_rate = -1.0
+        if ep % EVAL_PERIOD == 0 or ep == episodes - 1:
+            eval_rate = _eval_greedy(agent, maze_size)
+
+        # Save best checkpoint based on GREEDY performance (matches inference)
+        if eval_rate >= 0 and eval_rate > best_eval_rate:
+            best_eval_rate = eval_rate
+            best_weights = {k: v.clone() for k, v in agent.online_net.state_dict().items()}
+
         # Console progress
         if ep % eval_every == 0 or ep == episodes - 1:
-            rate = f"{tracker.solve_rate:.0%}"
+            online_rate = tracker.solve_rate
             avg = (
                 sum(tracker.rewards) / len(tracker.rewards)
                 if tracker.rewards else 0
             )
-            print(
-                f"Ep {ep:5d} | solve {rate} | "
-                f"avg_reward {avg:+6.1f} | buf {len(agent.buffer):>6d}"
-            )
+            line = f"Ep {ep:5d} | online {online_rate:.0%} | avg_reward {avg:+6.1f} | buf {len(agent.buffer):>6d}"
+            if eval_rate >= 0:
+                line += f" | greedy_eval {eval_rate:.0%}"
+            print(line)
 
-        # Dashboard (throttled)
+        # Dashboard (optional, off by default for speed)
         if dashboard and ep % 3 == 0:
             dashboard.draw(tracker, ep)
 
-        # Periodic eval / best-snapshot (check every episode, so we don't miss the peak)
-        if len(tracker.solved) >= 20 and tracker.solve_rate > best_solve_rate:
-            best_solve_rate = tracker.solve_rate
-            best_weights = {k: v.clone() for k, v in agent.online_net.state_dict().items()}
-
+    # Restore best greedy-performance weights & save
     if best_weights is not None:
         agent.online_net.load_state_dict(best_weights)
         agent.target_net.load_state_dict(agent.online_net.state_dict())
-        print(f"Loaded best weights (solve rate {best_solve_rate:.0%}).")
+        print(f"Loaded best weights (greedy eval {best_eval_rate:.0%}).")
 
     if save_path:
         agent.save(save_path)
@@ -505,7 +603,9 @@ def visualize_inference(agent, maze_grid, fps=15):
 
     state = env._local_view(env.current_position)
     with torch.no_grad():
-        q_vals = agent.online_net(torch.FloatTensor(state).unsqueeze(0)).numpy()[0]
+        q_vals = agent.online_net(
+            torch.as_tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        ).cpu().numpy()[0]
     action = int(np.argmax(q_vals))
 
     while running:
@@ -584,7 +684,9 @@ def visualize_inference(agent, maze_grid, fps=15):
 
         state = env._local_view(env.current_position)
         with torch.no_grad():
-            q_vals = agent.online_net(torch.FloatTensor(state).unsqueeze(0)).numpy()[0]
+            q_vals = agent.online_net(
+                torch.as_tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+            ).cpu().numpy()[0]
         action = int(np.argmax(q_vals))
 
     label = "SOLVED!" if solved else "Gave up (timeout)"
@@ -604,7 +706,7 @@ if __name__ == "__main__":
     if train_flag:
         mouse_agent = MouseAgent()
         print("Training...")
-        train(mouse_agent, maze_size, episodes=2000, save_path=agent_weights_path)
+        train(mouse_agent, maze_size, episodes=5000, save_path=agent_weights_path)
 
     # --- Inference -------------------------------------------------------
     mouse_agent = MouseAgent()

@@ -1,3 +1,4 @@
+import math
 import random
 import matplotlib.pyplot as plt
 import numpy as np
@@ -46,7 +47,22 @@ def generate_random_maze(n_rows, n_cols, visualize_maze_flag = False):
     grid[1::2, 1::2] = 0
     maze = wilsons_algorithm(grid)
 
-    start, end = (1, 1), (m-2, n-2)
+    # Pick all open (non-wall) corridor cells.
+    open_cells = [(r, c) for r in range(m) for c in range(n) if grid[r, c] == 0]
+    start = random.choice(open_cells)
+
+    min_manhattan = math.ceil(max(m, n) / 2)
+    far_enough = [cell for cell in open_cells
+                  if abs(cell[0] - start[0]) + abs(cell[1] - start[1]) >= min_manhattan]
+    if far_enough:
+        end = random.choice(far_enough)
+    else:
+        # Fallback: pick the single farthest cell.
+        end_cell = max(open_cells, key=lambda cell:
+                       abs(cell[0] - start[0]) + abs(cell[1] - start[1]))
+        end = end_cell
+
+    start, end = start, end
 
     if visualize_maze_flag:
         draw_maze(maze, start, end)

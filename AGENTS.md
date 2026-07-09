@@ -7,6 +7,34 @@
 - These instructions apply repo-wide. Follow any deeper `AGENTS.md` for
   directory-specific guidance.
 
+## Project Layout
+Two independent RL projects live side-by-side under this repo root:
+
+| Directory | What it does | Algorithm | Framework |
+|-----------|-------------|-----------|-----------|
+| `marioppo/alveybj/` | Train and evaluate PPO agents on Atari/ALE envs (Breakout-v5) | PPO + CNN (LSTM variant commented out) | stable-baselines3 |
+| `marioppo/clarity_coder/` | Alternative PPO trainer with custom callback, GPU support | PPO | stable-baselines3 |
+| `MouseMaze/` | DQN agent navigating a grid maze via 5×5 local view window | DQN + experience replay | PyTorch |
+
+### Key entrypoints
+- **`marioppo/alveybj/Train.py`** — Train PPO (10 M timesteps, Breakout-v5, video every 24 episodes). LSTM path is commented out.
+- **`marioppo/alveybj/Test.py`** — Evaluate a loaded model (50 evals × 100 steps). Video export available via wrapper flag.
+- **`marioppo/clarity_coder/Train.py`** — Train PPO (2 M timesteps, custom `SaveOnBestTrainingRewardCallback`, TensorBoard under `./board/`).
+- **`marioppo/clarity_coder/Test.py`** — Evaluate `ppo_level_1_1.zip` (40 episodes × 200 steps).
+- **`MouseMaze/MouseAgent.py`** — All-in-one: `ReplayBuffer`, `Maze` env, `QNetwork` (MLP), `MouseAgent` (epsilon-greedy DQN), `MetricsTracker`, matplotlib `Dashboard`, and `train()` function.
+- **`MouseMaze/gen_maze.py`** — Maze generator (Wilson's algorithm, perfect mazes).
+
+### Model artifacts
+- `marioppo/alveybj/models/best_model.zip` — CNN-PPO weights.
+- `marioppo/alveybj/lstm_models/best_model.zip` — RecurrentPPO weights.
+- `marioppo/clarity_coder/ppo_level_1_1.zip` — PPO level-1 model.
+- `MouseMaze/agent_weights.pth` — DQN PyTorch state dict.
+
+### Logs & telemetry
+- `marioppo/alveybj/tensorboard_logs/` — TensorBoard runs for PPO training.
+- `marioppo/alveybj/logs/monitor.csv` — OpenAI monitor data.
+- `marioppo/alveybj/evaluations.npz` — Saved evaluation metrics.
+
 ## Environment & Commands
 - Use the shared conda environment named `ml`.
 - Run Python scripts with `conda run -n ml python <script>.py ...`.
