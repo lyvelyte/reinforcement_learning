@@ -648,9 +648,9 @@ def visualize_inference(agent, maze_grid, fps=15):
     env = Maze(maze_grid.copy())
     pygame.init()
     info = pygame.display.Info()
-    # Reserve ~8 % for window chrome / panels so the maze isn't edge-to-edge.
-    max_w = int(info.current_w * 0.92)
-    max_h = int(info.current_h * 0.92)
+    # Scale to ~62 % of the desktop so the window is comfortably sized.
+    max_w = int(info.current_w * 0.62)
+    max_h = int(info.current_h * 0.62)
     rows, cols = env.grid.shape[0], env.grid.shape[1]
     cell_size = max(4, min(max_w // cols, max_h // rows, 50))
     width = cols * cell_size
