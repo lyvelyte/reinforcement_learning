@@ -14,6 +14,7 @@ from MouseAgent import (
     EpisodeStats,
     EvalMetrics,
     Maze,
+    MaskedPPOAgent,
     MetricsTracker,
     MouseAgent,
     TrainConfig,
@@ -25,7 +26,10 @@ from MouseAgent import (
     _optional_bool,
     _rects_overlap,
     _train_config_from_args,
+    build_n_step_transition,
+    curriculum_distance_range,
     dashboard_layout,
+    make_maze,
     parse_args,
     train,
 )
@@ -105,6 +109,29 @@ def test_reward_invalid_move_solve_and_timeout_flags():
     assert info["solved"] is False
 
 
+def test_potential_reward_discourages_two_step_oscillation():
+    env = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    env.reset()
+
+    _, toward_reward, done, _info = env.step(0)
+    _, reverse_reward, reverse_done, _info = env.step(1)
+
+    assert toward_reward > 0.0
+    assert reverse_reward < 0.0
+    assert toward_reward + reverse_reward < 0.0
+    assert done is False
+    assert reverse_done is False
+
+    goal_env = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    goal_env.reset()
+    goal_env.step(0)
+    _, goal_reward, done, info = goal_env.step(0)
+
+    assert goal_reward > 10.0
+    assert done is True
+    assert info["solved"] is True
+
+
 def test_valid_action_mask_marks_open_neighbor_actions():
     env = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
     env.reset()
@@ -135,9 +162,36 @@ def test_dynamic_timeout_uses_optimal_steps_with_cap():
     assert capped_env.max_episode_steps == 6
 
 
+def test_curriculum_distance_ranges_and_sampling_are_deterministic():
+    config = TrainConfig(
+        maze_size=(11, 11),
+        curriculum_max_retries=500,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    rng = random.Random(123)
+
+    assert curriculum_distance_range(config, 1) == (6, 10)
+    assert curriculum_distance_range(config, 6_000) == (8, 16)
+    assert curriculum_distance_range(config, 16_000) is None
+    assert curriculum_distance_range(TrainConfig(maze_size=(5, 5)), 1) is None
+
+    easy = [make_maze(config, rng=rng, episode=1).optimal_start_steps for _ in range(8)]
+    medium = [
+        make_maze(config, rng=rng, episode=6_000).optimal_start_steps
+        for _ in range(8)
+    ]
+
+    assert all(6 <= steps <= 10 for steps in easy)
+    assert all(8 <= steps <= 16 for steps in medium)
+
+
 def test_agent_masks_invalid_greedy_and_random_actions():
     config = TrainConfig(
         maze_size=(5, 5),
+        network_type="flat",
         dashboard_flag=False,
         save_path=None,
         training_log_path=None,
@@ -161,6 +215,73 @@ def test_agent_masks_invalid_greedy_and_random_actions():
 
     assert greedy_action == 0
     assert set(random_actions.tolist()) == {0}
+
+
+def test_spatial_q_network_masks_actions_and_saves_metadata(tmp_path):
+    save_path = tmp_path / "spatial_checkpoint.pth"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        save_path=str(save_path),
+        dashboard_flag=False,
+        training_log_path=None,
+        device="cpu",
+    )
+    env = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    state = env.reset()
+    mask = env.valid_action_mask()
+    agent = MouseAgent(config=config, device=torch.device("cpu"))
+
+    with torch.no_grad():
+        for parameter in agent.online_net.parameters():
+            parameter.zero_()
+        agent.online_net.advantage_head.bias.copy_(
+            torch.tensor([1.0, 10.0, 0.0, 0.0])
+        )
+
+    assert agent.q_values(state).shape == (4,)
+    assert agent.get_action(state, action_mask=mask) == 0
+
+    agent.save(str(save_path))
+    payload = torch.load(save_path, map_location=torch.device("cpu"))
+
+    assert payload["algorithm"] == "dqn"
+    assert payload["network_type"] == "spatial"
+
+
+def test_n_step_transition_uses_discounted_rewards_and_done_flush():
+    state0 = np.zeros((3, 5, 5), dtype=np.float32)
+    state1 = np.ones((3, 5, 5), dtype=np.float32)
+    state2 = np.full((3, 5, 5), 2.0, dtype=np.float32)
+    state3 = np.full((3, 5, 5), 3.0, dtype=np.float32)
+    mask = np.ones(4, dtype=np.bool_)
+    transitions = deque(
+        [
+            (state0, 2, 1.0, state1, False, mask),
+            (state1, 1, 2.0, state2, False, mask),
+            (state2, 0, 3.0, state3, False, mask),
+        ]
+    )
+
+    result = build_n_step_transition(transitions, gamma=0.5, n_steps=3)
+
+    assert result[0] is state0
+    assert result[1] == 2
+    assert result[2] == 2.75
+    assert result[3] is state3
+    assert result[4] is False
+
+    done_transitions = deque(
+        [
+            (state0, 2, 1.0, state1, False, mask),
+            (state1, 1, 2.0, state2, True, mask),
+            (state2, 0, 99.0, state3, False, mask),
+        ]
+    )
+    done_result = build_n_step_transition(done_transitions, gamma=0.5, n_steps=3)
+
+    assert done_result[2] == 2.0
+    assert done_result[3] is state2
+    assert done_result[4] is True
 
 
 class BfsAgent:
@@ -197,6 +318,15 @@ class BfsAgent:
                 best_action = action
                 best_distance = distances[nr, nc]
         return best_action
+
+
+class LoopAgent:
+    def get_actions(self, states, epsilon=0.0, action_masks=None):
+        actions = []
+        for state in states:
+            agent_pos = tuple(np.argwhere(state[1] > 0.5)[0])
+            actions.append(1 if agent_pos == (1, 2) else 0)
+        return np.array(actions, dtype=np.int64)
 
 
 def test_greedy_eval_is_separate_from_training_solve_rate():
@@ -237,6 +367,37 @@ def test_greedy_eval_is_separate_from_training_solve_rate():
     assert metrics.solve_rate == 1.0
     assert metrics.avg_steps == 2.0
     assert metrics.optimality_ratio == 1.0
+
+
+def test_greedy_eval_reports_loop_diagnostics():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        episodes=1,
+        eval_episodes=3,
+        max_episode_steps=6,
+        timeout_step_factor=None,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+
+    metrics = _eval_greedy(
+        LoopAgent(),
+        config,
+        maze_factory=lambda: Maze(
+            fixed_grid(),
+            observation_mode="full",
+            max_episode_steps=6,
+            timeout_step_factor=None,
+        ),
+    )
+
+    assert metrics.solve_rate == 0.0
+    assert metrics.timeout_rate == 1.0
+    assert metrics.loop_rate == 1.0
+    assert metrics.repeated_state_action_rate == 1.0
+    assert metrics.failed_final_distance > 0.0
 
 
 def test_greedy_eval_uses_fixed_seed_without_consuming_global_random(monkeypatch):
@@ -420,10 +581,25 @@ def test_cli_args_override_top_level_train_config_defaults():
             "3",
             "--eval-seed",
             "99",
+            "--algorithm",
+            "ppo",
+            "--network-type",
+            "spatial",
+            "--resume",
             "--timeout-step-factor",
             "3.5",
             "--min-episode-steps",
             "7",
+            "--distance-shaping-mode",
+            "none",
+            "--no-curriculum",
+            "--curriculum-easy-range",
+            "4",
+            "8",
+            "--n-step-returns",
+            "4",
+            "--ppo-rollout-steps",
+            "8",
             "--learning-rate",
             "0.001",
             "--device",
@@ -439,8 +615,16 @@ def test_cli_args_override_top_level_train_config_defaults():
     assert config.eval_every == 3
     assert config.dashboard_every == 3
     assert config.eval_seed == 99
+    assert config.algorithm == "ppo"
+    assert config.network_type == "spatial"
+    assert config.resume is True
     assert config.timeout_step_factor == 3.5
     assert config.min_episode_steps == 7
+    assert config.distance_shaping_mode == "none"
+    assert config.curriculum_enabled is False
+    assert config.curriculum_easy_range == (4, 8)
+    assert config.n_step_returns == 4
+    assert config.ppo_rollout_steps == 8
     assert config.learning_rate == 0.001
     assert config.device == "cpu"
     assert _optional_bool(args.infer_flag, DEFAULT_INFER_FLAG) is False
@@ -484,6 +668,56 @@ def test_small_cpu_training_smoke_runs_without_dashboard():
     assert tracker.latest_eval.solve_rate >= 0.0
 
 
+def test_ppo_masked_sampling_never_chooses_invalid_actions():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="ppo",
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    env = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    state = env.reset()
+    mask = env.valid_action_mask()
+    agent = MaskedPPOAgent(config=config, device=torch.device("cpu"))
+
+    actions, _log_probs, values = agent.sample_actions(
+        np.stack([state] * 20),
+        np.stack([mask] * 20),
+    )
+
+    assert set(actions.tolist()) == {0}
+    assert values.shape == (20,)
+
+
+def test_small_cpu_ppo_training_smoke_runs_without_dashboard():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="ppo",
+        episodes=3,
+        seed=123,
+        max_episode_steps=10,
+        num_envs=1,
+        batch_size=4,
+        ppo_rollout_steps=4,
+        ppo_epochs=1,
+        eval_every=2,
+        eval_episodes=1,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    agent = MaskedPPOAgent(config=config, device=torch.device("cpu"))
+
+    tracker = train(agent=agent, config=config)
+
+    assert agent.update_count > 0
+    assert len(tracker.solved) == 3
+    assert tracker.latest_eval.solve_rate >= 0.0
+
+
 def test_agent_checkpoint_restores_optimizer_and_counters(tmp_path):
     save_path = tmp_path / "checkpoint.pth"
     config = TrainConfig(maze_size=(5, 5), save_path=str(save_path), device="cpu")
@@ -499,12 +733,13 @@ def test_agent_checkpoint_restores_optimizer_and_counters(tmp_path):
     assert resumed.update_count == 7
     assert resumed.total_env_steps == 42
     assert resumed.best_greedy_solve_rate == 0.25
+    assert resumed.network_type == "spatial"
     assert resumed.optimizer.state_dict()["param_groups"] == (
         agent.optimizer.state_dict()["param_groups"]
     )
 
 
-def test_train_automatically_resumes_existing_save_path(tmp_path, capsys):
+def test_train_resumes_existing_save_path_only_when_requested(tmp_path, capsys):
     save_path = tmp_path / "resume_weights.pth"
     config = TrainConfig(
         maze_size=(5, 5),
@@ -523,6 +758,7 @@ def test_train_automatically_resumes_existing_save_path(tmp_path, capsys):
         save_path=str(save_path),
         training_log_path=None,
         device="cpu",
+        resume=True,
     )
     first_agent = MouseAgent(config=config, device=torch.device("cpu"))
     first_agent.update_count = 11
@@ -537,6 +773,33 @@ def test_train_automatically_resumes_existing_save_path(tmp_path, capsys):
     assert str(save_path) in output
     assert resumed_agent.update_count == 11
     assert resumed_agent.total_env_steps >= 99
+
+    fresh_config = TrainConfig(
+        maze_size=(5, 5),
+        episodes=1,
+        seed=123,
+        max_episode_steps=10,
+        buffer_size=128,
+        batch_size=4,
+        min_replay_size=128,
+        target_update_freq=2,
+        num_envs=1,
+        train_updates_per_step=1,
+        eval_every=1,
+        eval_episodes=1,
+        dashboard_flag=False,
+        save_path=str(save_path),
+        training_log_path=None,
+        device="cpu",
+        resume=False,
+    )
+    fresh_agent = MouseAgent(config=fresh_config, device=torch.device("cpu"))
+
+    train(agent=fresh_agent, config=fresh_config)
+    output = capsys.readouterr().out
+
+    assert "[train] starting fresh" in output
+    assert fresh_agent.update_count != 11
 
 
 def test_training_does_not_log_duplicate_eval_episodes(tmp_path, monkeypatch):
