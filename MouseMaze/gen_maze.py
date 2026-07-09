@@ -1,6 +1,5 @@
 import math
 import random
-import matplotlib.pyplot as plt
 import numpy as np
 
 def create_grid(m, n):
@@ -31,6 +30,8 @@ def wilsons_algorithm(grid):
     return grid
 
 def draw_maze(grid, start, end):
+    import matplotlib.pyplot as plt
+
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.imshow(grid, cmap='gray_r', origin='upper')
     ax.scatter(start[1], start[0], c='green', s=100, marker='o', label='Start')
