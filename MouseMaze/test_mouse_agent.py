@@ -1,9 +1,11 @@
 import json
+import random
 from collections import deque
 
 import numpy as np
 import torch
 
+import MouseAgent as mouse_agent_module
 from MouseAgent import (
     DASHBOARD_TOOLTIPS,
     DEFAULT_INFER_FLAG,
@@ -103,6 +105,64 @@ def test_reward_invalid_move_solve_and_timeout_flags():
     assert info["solved"] is False
 
 
+def test_valid_action_mask_marks_open_neighbor_actions():
+    env = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    env.reset()
+
+    mask = env.valid_action_mask()
+
+    assert mask.tolist() == [True, False, False, False]
+
+
+def test_dynamic_timeout_uses_optimal_steps_with_cap():
+    env = Maze(
+        fixed_grid(),
+        observation_mode="full",
+        max_episode_steps=10,
+        timeout_step_factor=4.0,
+        min_episode_steps=5,
+    )
+    capped_env = Maze(
+        fixed_grid(),
+        observation_mode="full",
+        max_episode_steps=6,
+        timeout_step_factor=4.0,
+        min_episode_steps=5,
+    )
+
+    assert env.optimal_start_steps == 2
+    assert env.max_episode_steps == 8
+    assert capped_env.max_episode_steps == 6
+
+
+def test_agent_masks_invalid_greedy_and_random_actions():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    env = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    state = env.reset()
+    mask = env.valid_action_mask()
+    agent = MouseAgent(config=config, device=torch.device("cpu"))
+    with torch.no_grad():
+        for parameter in agent.online_net.parameters():
+            parameter.zero_()
+        agent.online_net.advantage.bias.copy_(torch.tensor([1.0, 10.0, 0.0, 0.0]))
+
+    greedy_action = agent.get_action(state, action_mask=mask)
+    random_actions = agent.get_actions(
+        np.stack([state] * 20),
+        epsilon=1.0,
+        action_masks=np.stack([mask] * 20),
+    )
+
+    assert greedy_action == 0
+    assert set(random_actions.tolist()) == {0}
+
+
 class BfsAgent:
     def get_action(self, state, epsilon=0.0):
         walls = state[0] > 0.5
@@ -177,6 +237,42 @@ def test_greedy_eval_is_separate_from_training_solve_rate():
     assert metrics.solve_rate == 1.0
     assert metrics.avg_steps == 2.0
     assert metrics.optimality_ratio == 1.0
+
+
+def test_greedy_eval_uses_fixed_seed_without_consuming_global_random(monkeypatch):
+    rng_draws = []
+
+    def fake_make_maze(config, rng=None):
+        rng_draws.append(rng.random())
+        return Maze(
+            fixed_grid(),
+            observation_mode="full",
+            max_episode_steps=10,
+        )
+
+    monkeypatch.setattr(mouse_agent_module, "make_maze", fake_make_maze)
+    config = TrainConfig(
+        maze_size=(5, 5),
+        episodes=1,
+        eval_episodes=3,
+        eval_seed=77,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    random.seed(999)
+    expected_next_random = random.Random(999).random()
+
+    first = _eval_greedy(BfsAgent(), config)
+    first_draws = rng_draws.copy()
+    rng_draws.clear()
+    second = _eval_greedy(BfsAgent(), config)
+
+    assert first.solve_rate == 1.0
+    assert second.solve_rate == 1.0
+    assert rng_draws == first_draws
+    assert random.random() == expected_next_random
 
 
 def test_dashboard_layout_rectangles_do_not_overlap():
@@ -322,6 +418,12 @@ def test_cli_args_override_top_level_train_config_defaults():
             "--no-dashboard",
             "--eval-every",
             "3",
+            "--eval-seed",
+            "99",
+            "--timeout-step-factor",
+            "3.5",
+            "--min-episode-steps",
+            "7",
             "--learning-rate",
             "0.001",
             "--device",
@@ -336,6 +438,9 @@ def test_cli_args_override_top_level_train_config_defaults():
     assert config.dashboard_flag is False
     assert config.eval_every == 3
     assert config.dashboard_every == 3
+    assert config.eval_seed == 99
+    assert config.timeout_step_factor == 3.5
+    assert config.min_episode_steps == 7
     assert config.learning_rate == 0.001
     assert config.device == "cpu"
     assert _optional_bool(args.infer_flag, DEFAULT_INFER_FLAG) is False
@@ -374,6 +479,7 @@ def test_small_cpu_training_smoke_runs_without_dashboard():
     tracker = train(agent=agent, config=config)
 
     assert len(agent.buffer) > 0
+    assert agent.buffer.next_action_masks.shape == (128, 4)
     assert len(tracker.solved) == 3
     assert tracker.latest_eval.solve_rate >= 0.0
 
@@ -384,6 +490,7 @@ def test_agent_checkpoint_restores_optimizer_and_counters(tmp_path):
     agent = MouseAgent(config=config, device=torch.device("cpu"))
     agent.update_count = 7
     agent.total_env_steps = 42
+    agent.best_greedy_solve_rate = 0.25
 
     agent.save(str(save_path))
     resumed = MouseAgent(config=config, device=torch.device("cpu"))
@@ -391,6 +498,7 @@ def test_agent_checkpoint_restores_optimizer_and_counters(tmp_path):
 
     assert resumed.update_count == 7
     assert resumed.total_env_steps == 42
+    assert resumed.best_greedy_solve_rate == 0.25
     assert resumed.optimizer.state_dict()["param_groups"] == (
         agent.optimizer.state_dict()["param_groups"]
     )
@@ -429,6 +537,101 @@ def test_train_automatically_resumes_existing_save_path(tmp_path, capsys):
     assert str(save_path) in output
     assert resumed_agent.update_count == 11
     assert resumed_agent.total_env_steps >= 99
+
+
+def test_training_does_not_log_duplicate_eval_episodes(tmp_path, monkeypatch):
+    class ControlledEnv:
+        def __init__(self, done_after, solved):
+            self.done_after = done_after
+            self.solved = solved
+            self.start = (1, 1)
+            self.goal = (1, 2)
+            self.current_position = self.start
+            self.max_episode_steps = done_after
+            self.optimal_start_steps = 1
+            self.invalid_moves = 0
+            self.total_reward = 0.0
+            self.steps = 0
+
+        def reset(self):
+            self.current_position = self.start
+            self.invalid_moves = 0
+            self.total_reward = 0.0
+            self.steps = 0
+            return np.zeros((3, 5, 5), dtype=np.float32)
+
+        def valid_action_mask(self):
+            return np.ones(4, dtype=np.bool_)
+
+        def step(self, action):
+            self.steps += 1
+            done = self.steps >= self.done_after
+            if done and self.solved:
+                self.current_position = self.goal
+                self.total_reward = 1.0
+            timeout = done and not self.solved
+            return (
+                np.zeros((3, 5, 5), dtype=np.float32),
+                0.0,
+                done,
+                {
+                    "invalid": False,
+                    "moved": True,
+                    "solved": done and self.solved,
+                    "timeout": timeout,
+                    "distance": 0.0,
+                    "optimal_steps": self.optimal_start_steps,
+                    "steps": self.steps,
+                    "invalid_moves": self.invalid_moves,
+                },
+            )
+
+    envs = [
+        ControlledEnv(done_after=1, solved=True),
+        ControlledEnv(done_after=5, solved=False),
+        ControlledEnv(done_after=5, solved=False),
+    ]
+
+    def fake_make_maze(config, rng=None):
+        if envs:
+            return envs.pop(0)
+        return ControlledEnv(done_after=5, solved=False)
+
+    monkeypatch.setattr(mouse_agent_module, "make_maze", fake_make_maze)
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_eval_greedy",
+        lambda agent, config: EvalMetrics(solve_rate=0.0),
+    )
+    log_path = tmp_path / "training_log.jsonl"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        episodes=2,
+        seed=123,
+        max_episode_steps=10,
+        buffer_size=128,
+        batch_size=4,
+        min_replay_size=128,
+        target_update_freq=2,
+        num_envs=2,
+        train_updates_per_step=1,
+        eval_every=100,
+        eval_episodes=1,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=str(log_path),
+        device="cpu",
+    )
+
+    train(agent=MouseAgent(config=config, device=torch.device("cpu")), config=config)
+    eval_episodes = [
+        json.loads(line)["episode"]
+        for line in log_path.read_text().splitlines()
+        if json.loads(line)["event"] == "eval"
+    ]
+
+    assert eval_episodes == sorted(set(eval_episodes))
+    assert eval_episodes == [1, 2]
 
 
 def test_training_writes_jsonl_log_with_metrics_speed_and_utilization(tmp_path):
