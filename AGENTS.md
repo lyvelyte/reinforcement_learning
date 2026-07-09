@@ -77,3 +77,7 @@ If tests cannot be added or run, explain why and describe the risk.
 - After finishing edits, always commit all changes (even those un-related to the changes Codex made, I just want to keep the repo continously updated with all changes tracked):
   `git add -A`
   `git commit -m "<brief top-level description>"`
+
+
+When using ask_user_question, keep every question header 12 characters or less.
+Use short headers like Scope, File, Branch, Choice, Confirm, Details, Path, Mode.

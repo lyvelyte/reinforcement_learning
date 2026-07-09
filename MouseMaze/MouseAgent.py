@@ -27,13 +27,16 @@ TEMP_DECAY_STEPS = 1500     # cooling schedule length
 CYCLE_WINDOW = 10           # recent steps inspected for cycles
 CYCLE_THRESHOLD = 3         # same-pos repetitions before forcing escape
 SHAPING_K = 0.4             # potential-based shaping coefficient (per step)
+EFFICIENCY_BONUS = 5.0      # extra reward if episode finishes under target
+EFFICIENCY_TARGET_FLOOR = 60   # don't tighten the efficiency bar below this
+EFFICIENCY_TARGET_FRAC = 0.6   # target = 60% of recent avg success length
 MAX_EPISODE_STEPS = 400     # safety cap per maze episode
 TRAIN_EVERY_N_STEPS = 1     # train every step (GPU can keep up)
 TRANSITIONS_PER_EPISODE_CAP = MAX_EPISODE_STEPS  # drop stale goal-specific transitions from older mazes
 NUM_EVAL_EPISODES = 20      # fresh greedy evals per checkpoint
 EVAL_PERIOD = 50            # eval every this many training episodes
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+# DEVICE = torch.device("cpu")
 
 # ---------------------------------------------------------------------------
 # Experience replay buffer (pre-allocated numpy — faster than deque)
@@ -96,6 +99,29 @@ class Maze:
         self.start = tuple(np.argwhere(self.grid == 2)[0])
         self.goal = tuple(np.argwhere(self.grid == 3)[0])
         self.current_position = self.start
+        self.steps = 0
+        self.efficiency_target = None  # set by training loop; None = no bonus
+        self._compute_bfs_distances()
+
+    def _compute_bfs_distances(self):
+        """BFS from goal → shortest-path distance for every reachable cell."""
+        from collections import deque as bfs_deque
+        dist = np.full(self.grid.shape, -1, dtype=np.float32)
+        gr, gc = self.goal
+        dist[gr, gc] = 0
+        queue = bfs_deque([(gr, gc)])
+        while queue:
+            r, c = queue.popleft()
+            d = dist[r, c] + 1
+            for dr, dc in self.ACTIONS:
+                nr, nc = r + dr, c + dc
+                if (0 <= nr < self.grid.shape[0]
+                    and 0 <= nc < self.grid.shape[1]
+                    and self.grid[nr, nc] != 1
+                    and dist[nr, nc] < 0):
+                    dist[nr, nc] = d
+                    queue.append((nr, nc))
+        self.bfs_distances = dist
 
     def _local_view(self, position, size=VIEW_SIZE):
         """Return a local patch centred on *position*, encoding walls/goal."""
@@ -123,17 +149,23 @@ class Maze:
         if reached_goal:
             reward += 100.0
 
-        # Potential-based shaping: guide towards goal w/o changing optimal policy
-        old_dist = abs(old_pos[0] - self.goal[0]) + abs(old_pos[1] - self.goal[1])
-        new_dist = abs(self.current_position[0] - self.goal[0]) + abs(
-            self.current_position[1] - self.goal[1]
-        )
-        reward += SHAPING_K * (old_dist - new_dist)
+        # Potential-based shaping using BFS shortest-path distance
+        old_potential = self.bfs_distances[old_pos]
+        new_potential = self.bfs_distances[self.current_position]
+        reward += SHAPING_K * (old_potential - new_potential)
+
+        # Stepping-efficiency bonus: extra reward for fast solves
+        if reached_goal and self.efficiency_target is not None:
+            if self.steps <= self.efficiency_target:
+                reward += EFFICIENCY_BONUS
+
+        self.steps += 1
 
         obs = self._local_view(self.current_position)
         return obs, reward, reached_goal, moved
 
     def reset(self):
+        self.steps = 0
         self.current_position = self.start
         return self._local_view(self.current_position)
 
@@ -275,6 +307,8 @@ class MetricsTracker:
         self.solve_lengths = deque(maxlen=window)
         self.solved = deque(maxlen=window)           # 1 if reached goal, 0 otherwise
         self.solve_lengths_success = deque(maxlen=window)   # steps for successful runs only
+        self.solve_rate_history = deque(maxlen=400)  # rolling solve rate snapshots
+        self.avg_steps_to_solve_history = deque(maxlen=400)  # avg steps/success snapshots
 
     def record(self, total_reward, loss, steps, solved):
         self.rewards.append(total_reward)
@@ -284,6 +318,11 @@ class MetricsTracker:
         self.solved.append(1 if solved else 0)
         if solved:
             self.solve_lengths_success.append(steps)
+
+    def snapshot(self):
+        """Record current rolling solve-rate and avg-steps for plotting."""
+        self.solve_rate_history.append(self.solve_rate)
+        self.avg_steps_to_solve_history.append(self.avg_steps_to_solve)
 
     @property
     def solve_rate(self):
@@ -361,7 +400,7 @@ def _eval_greedy(agent, maze_size, n_episodes=NUM_EVAL_EPISODES):
 # Live dashboard pygame window
 # ---------------------------------------------------------------------------
 class Dashboard:
-    def __init__(self, width=560, height=380):
+    def __init__(self, width=720, height=480):
         self.running = True
         self.disabled = False
         self.screen = None
@@ -411,7 +450,7 @@ class Dashboard:
         lines = [
             f"Episode      {episode}",
             f"Solve rate    {solve_pct:.1%}",
-            f"Avg steps/success  {avg_to_solve:.0f}" if avg_to_solve else "Avg steps/success  —",
+            f"Avg steps/success  {avg_to_solve:.0f}" if avg_to_solve else "Avg steps/success  \u2014",
             f"Avg reward    {avg_r:+.1f}     Avg len   {avg_len:.0f}",
         ]
         y = 18
@@ -427,18 +466,33 @@ class Dashboard:
         fill_w = int(bar_w * solve_pct)
         pygame.draw.rect(self.screen, bar_color, (bar_x, bar_y, fill_w, bar_h), border_radius=3)
 
+        # --- Three curves in a row: Reward | Loss | Solve Rate ---
         curve_top = y + 34
-        # Reward curve
-        _draw_curve(
+        plot_margin = 58   # left margin per for y-axis labels + ticks
+        gap = 14           # horizontal gap between plots
+        avail = W - plot_margin * 3 - gap * 2 - 12  # subtract left margins, gaps, right pad
+        plot_w = avail // 3
+        plot_h = H - curve_top - 50  # leave room below for x-axis labels
+
+        ox = plot_margin
+        rects = []
+        for _ in range(3):
+            rects.append((ox, curve_top, plot_w, plot_h))
+            ox += plot_w + gap
+
+        _draw_curve_with_axes(
             self.screen, list(tracker.rewards),
-            (60, curve_top, W // 2 - 40, H - curve_top - 80),
-            (64, 224, 208), "Reward"
+            rects[0], (64, 224, 208), "Reward", "Reward"
         )
-        # Loss curve
-        _draw_curve(
+        # Loss values are non-negative; high initial loss is normal for DQN —
+        # the target network starts with random weights, so early targets are garbage.
+        _draw_curve_with_axes(
             self.screen, list(tracker.losses),
-            (W // 2 + 10, curve_top, W - W // 2 - 30, H - curve_top - 80),
-            (208, 64, 64), "Loss"
+            rects[1], (208, 64, 64), "Loss", "Loss"
+        )
+        _draw_bounded_curve(
+            self.screen, list(tracker.solve_rate_history),
+            rects[2], (50, 205, 50), "Solve %",
         )
 
         pygame.display.flip()
@@ -474,6 +528,121 @@ def _draw_curve(screen, data, rect, color, label):
         pygame.draw.lines(screen, color, False, pts, 1)
 
 
+def _draw_y_axes(screen, rect, y_min, y_max, ylabel):
+    """Draw y-axis ticks with labels and a rotated ylabel."""
+    x0, y0, w, h = rect
+    font = pygame.font.SysFont("mono", 10)
+    mid_val = (y_min + y_max) / 2.0
+
+    for val in [y_min, mid_val, y_max]:
+        py = y0 + h - 4 - int((val - y_min) / max(y_max - y_min, 1e-9) * (h - 8))
+        # Tick line
+        pygame.draw.line(screen, (120, 120, 130), (x0 - 2, py), (x0 + 4, py))
+        # Label right-aligned left of the plot
+        txt = font.render(f"{val:.1f}", True, (160, 160, 170))
+        screen.blit(txt, (x0 - 36 - txt.get_width(), py - 5))
+
+    # Y label (rotated)
+    yfont = pygame.font.SysFont("mono", 11)
+    rotated = yfont.render(ylabel, True, (170, 170, 180))
+    screen.blit(rotated, (x0 - 48 - rotated.get_width(), y0 + h // 2 - 6))
+
+
+def _draw_x_axes(screen, rect, x_label):
+    """Draw x-axis ticks and label centred below the plot."""
+    x0, y0, w, h = rect
+    font = pygame.font.SysFont("mono", 10)
+
+    # Short horizontal ticks at bottom
+    for ratio in (0.0, 0.5, 1.0):
+        px = x0 + int(ratio * (w - 4))
+        pygame.draw.line(screen, (120, 120, 130), (px, y0 + h - 4), (px, y0 + h + 2))
+
+    # X label centred below
+    surf = font.render(x_label, True, (160, 160, 170))
+    screen.blit(surf, (x0 + w // 2 - surf.get_width() // 2, y0 + h + 4))
+
+
+def _draw_bounded_y_axes(screen, rect):
+    """Draw y-axis ticks for a [0, 1]-bounded value: 0%, 50%, 100%."""
+    x0, y0, w, h = rect
+    font = pygame.font.SysFont("mono", 10)
+    labels = [(0.0, "0%"), (0.5, "50%"), (1.0, "100%")]
+    for val, txt in labels:
+        py = y0 + h - 4 - int((val - 0.0) / 1.0 * (h - 8))
+        pygame.draw.line(screen, (120, 120, 130), (x0 - 2, py), (x0 + 4, py))
+        surf = font.render(txt, True, (160, 160, 170))
+        screen.blit(surf, (x0 - 36 - surf.get_width(), py - 5))
+    # Y label
+    yfont = pygame.font.SysFont("mono", 11)
+    rotated = yfont.render("Solve", True, (170, 170, 180))
+    screen.blit(rotated, (x0 - 48 - rotated.get_width(), y0 + h // 2 - 6))
+
+
+def _draw_curve_with_axes(screen, data, rect, color, label, y_label):
+    """Draw a line curve inside *rect*, complete with axis labels and ticks.
+
+    Replaces the older split of _draw_curve + _draw_y_axes + _draw_x_axes so
+    each plot is self-contained and laid out consistently.
+    """
+    if not data:
+        return
+    x0, y0, w, h = rect
+    font_title = pygame.font.SysFont("mono", 12)
+    screen.blit(font_title.render(label, True, color), (x0 + 4, y0 - 2))
+
+    # Border
+    pygame.draw.rect(screen, (80, 80, 90), rect, 1)
+
+    mn = min(data)
+    mx = max(data)
+    rng = mx - mn if mx != mn else 1.0
+
+    pts = []
+    for i, v in enumerate(data):
+        px = x0 + int(i * (w - 4) / max(len(data) - 1, 1))
+        py = y0 + h - 4 - int((v - mn) / rng * (h - 8))
+        pts.append((px, py))
+
+    if len(pts) > 1:
+        pygame.draw.lines(screen, color, False, pts, 1)
+
+    # Axes
+    _draw_y_axes(screen, rect, mn, mx, y_label)
+    _draw_x_axes(screen, rect, "Episode")
+
+
+def _draw_bounded_curve(screen, data, rect, color, label):
+    """Draw a curve clamped to [0, 1] y-range with 0%/50%/100% ticks.
+
+    Used for the solve-rate plot so the y-axis is always in the same frame
+    of reference regardless of actual values.
+    """
+    if not data:
+        return
+    x0, y0, w, h = rect
+    font_title = pygame.font.SysFont("mono", 12)
+    screen.blit(font_title.render(label, True, color), (x0 + 4, y0 - 2))
+
+    # Border
+    pygame.draw.rect(screen, (80, 80, 90), rect, 1)
+
+    pts = []
+    for i, v in enumerate(data):
+        px = x0 + int(i * (w - 4) / max(len(data) - 1, 1))
+        # Clamp to [0, 1] even if data goes outside
+        clamped = max(0.0, min(1.0, v))
+        py = y0 + h - 4 - int(clamped * (h - 8))
+        pts.append((px, py))
+
+    if len(pts) > 1:
+        pygame.draw.lines(screen, color, False, pts, 1)
+
+    _draw_bounded_y_axes(screen, rect)
+    _draw_x_axes(screen, rect, "Episode")
+    
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -496,6 +665,14 @@ def train(
     for ep in range(episodes):
         maze_grid = generate_random_maze(maze_size[0], maze_size[1])
         env = Maze(maze_grid.copy())
+
+        # Decay efficiency target based on recent success lengths
+        if len(tracker.solve_lengths_success) >= 10:
+            avg_succ = tracker.avg_steps_to_solve
+            env.efficiency_target = max(
+                int(avg_succ * EFFICIENCY_TARGET_FRAC), EFFICIENCY_TARGET_FLOOR
+            )
+
         agent.new_episode()
         state = env.reset()
         done = False
@@ -533,6 +710,7 @@ def train(
 
         steps_taken = step + 1
         tracker.record(total_reward, last_loss, steps_taken, done)
+        tracker.snapshot()
 
         # Periodic greedy eval (epsilon=0 — the real inference metric)
         eval_rate = -1.0
@@ -553,11 +731,13 @@ def train(
             )
             avg_succ = tracker.avg_steps_to_solve
             steps_str = f"{avg_succ:.0f}" if avg_succ > 0 else "\u2014"
+            target_str = f"{env.efficiency_target}" if env.efficiency_target is not None else "\u2014"
             line = (
                 f"Ep {ep:5d} "
                 f"| solve_rate {online_rate:.0%} "
                 f"| avg_reward {avg:+7.1f} "
-                f"| avg_steps+ {steps_str}"
+                f"| avg_steps+ {steps_str} "
+                f"| eff_target {target_str}"
             )
             if eval_rate >= 0:
                 line += f" | greedy_eval {eval_rate:.0%}"
@@ -785,15 +965,15 @@ def visualize_inference(agent, maze_grid, fps=15):
 # Main entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    maze_size = (51, 51)
+    maze_size = (11, 11)
     agent_weights_path = "agent_weights.pth"
 
     # --- Training --------------------------------------------------------
-    train_flag = False
+    train_flag = True
     if train_flag:
         mouse_agent = MouseAgent()
         print("Training...")
-        train(mouse_agent, maze_size, episodes=5000, save_path=agent_weights_path)
+        train(mouse_agent, maze_size, episodes=50000, save_path=agent_weights_path)
 
     # --- Inference -------------------------------------------------------
     mouse_agent = MouseAgent()
