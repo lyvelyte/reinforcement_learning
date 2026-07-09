@@ -646,10 +646,15 @@ def _draw_cheese_icon(screen, center_x, center_y, cell_size):
 # ---------------------------------------------------------------------------
 def visualize_inference(agent, maze_grid, fps=15):
     env = Maze(maze_grid.copy())
-    cell_size = 50
-    width = env.grid.shape[1] * cell_size
-    height = env.grid.shape[0] * cell_size
     pygame.init()
+    info = pygame.display.Info()
+    # Reserve ~8 % for window chrome / panels so the maze isn't edge-to-edge.
+    max_w = int(info.current_w * 0.92)
+    max_h = int(info.current_h * 0.92)
+    rows, cols = env.grid.shape[0], env.grid.shape[1]
+    cell_size = max(4, min(max_w // cols, max_h // rows, 50))
+    width = cols * cell_size
+    height = rows * cell_size
     screen = pygame.display.set_mode((width, height))
     pygame.display.set_caption("Mouse Maze - Inference")
     clock = pygame.time.Clock()
@@ -767,11 +772,11 @@ def visualize_inference(agent, maze_grid, fps=15):
 # Main entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    maze_size = (11, 11)
+    maze_size = (51, 51)
     agent_weights_path = "agent_weights.pth"
 
     # --- Training --------------------------------------------------------
-    train_flag = True
+    train_flag = False
     if train_flag:
         mouse_agent = MouseAgent()
         print("Training...")
