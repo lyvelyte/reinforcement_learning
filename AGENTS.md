@@ -63,6 +63,16 @@ Two independent RL projects live side-by-side under this repo root:
 - Do not delete, weaken, or add trivial tests. Update or add tests when behavior
   changes enough to need coverage.
 
+When making changes, add or update tests that verify any new behavior, bug fix, or regression-prone logic. Tests should focus on observable behavior and meaningful edge cases, not implementation details.
+
+Before finishing, run the relevant test suite or the smallest test command that gives confidence in the change. If a broader test suite is practical, run it as well. Report what was run and the result.
+
+Do not add tests only to increase coverage or to exercise trivial code paths. Avoid brittle tests that duplicate implementation details, over-mock simple behavior, or assert insignificant formatting unless formatting is the behavior being changed.
+
+For bug fixes, prefer adding a regression test that fails without the fix and passes with it. For new features, cover the main success path and important failure or edge cases.
+
+If tests cannot be added or run, explain why and describe the risk.
+
 ## Versions & Commits
 - After finishing edits, always commit all changes (even those un-related to the changes Codex made, I just want to keep the repo continously updated with all changes tracked):
   `git add -A`

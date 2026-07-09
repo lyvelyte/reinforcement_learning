@@ -20,9 +20,9 @@ GAMMA = 0.99                # discount factor
 EPSILON_START = 1.0
 EPSILON_END = 0.01
 EPSILON_DECAY_STEPS = 2000  # linear decay; reaches min epsilon by ep 2000
-TEMP_START = 5.0            # initial softmax temperature for policy noise
-TEMP_END = 0.1              # final softmax temperature (near-deterministic)
-TEMP_DECAY_STEPS = 3000     # cooling schedule length
+TEMP_START = 1.0            # initial softmax temperature for policy noise
+TEMP_END = 0.05             # final softmax temperature (near-deterministic)
+TEMP_DECAY_STEPS = 1500     # cooling schedule length
 CYCLE_WINDOW = 10           # recent steps inspected for cycles
 CYCLE_THRESHOLD = 3         # same-pos repetitions before forcing escape
 SHAPING_K = 0.4             # potential-based shaping coefficient (per step)
@@ -272,7 +272,8 @@ class MetricsTracker:
         self.rewards = deque(maxlen=window)
         self.losses = deque(maxlen=500)
         self.solve_lengths = deque(maxlen=window)
-        self.solved = deque(maxlen=window)
+        self.solved = deque(maxlen=window)           # 1 if reached goal, 0 otherwise
+        self.solve_lengths_success = deque(maxlen=window)   # steps for successful runs only
 
     def record(self, total_reward, loss, steps, solved):
         self.rewards.append(total_reward)
@@ -280,10 +281,21 @@ class MetricsTracker:
             self.losses.append(loss)
         self.solve_lengths.append(steps)
         self.solved.append(1 if solved else 0)
+        if solved:
+            self.solve_lengths_success.append(steps)
 
     @property
     def solve_rate(self):
         return sum(self.solved) / len(self.solved) if self.solved else 0.0
+
+    @property
+    def avg_steps_to_solve(self):
+        """Average length of successful episodes (goal reached) in the window."""
+        return (
+            sum(self.solve_lengths_success) / len(self.solve_lengths_success)
+            if self.solve_lengths_success
+            else 0
+        )
 
 
 def _linear_epsilon(episode):
@@ -348,14 +360,30 @@ def _eval_greedy(agent, maze_size, n_episodes=NUM_EVAL_EPISODES):
 # Live dashboard pygame window
 # ---------------------------------------------------------------------------
 class Dashboard:
-    def __init__(self, width=560, height=340):
-        pygame.init()
-        self.screen = pygame.display.set_mode((width, height))
-        pygame.display.set_caption("Training Dashboard")
+    def __init__(self, width=560, height=380):
         self.running = True
+        self.disabled = False
+        self.screen = None
+        # Headless check — pygame display will silently fail without a
+        # running X11/Wayland server, which is common on GPU servers.
+        import os
+        display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        if not display:
+            print("[dashboard] No DISPLAY/WAYLAND_DISPLAY — headless mode, disabling GUI.")
+            self.disabled = True
+            return
+        pygame.init()
+        try:
+            self.screen = pygame.display.set_mode((width, height))
+            pygame.display.set_caption("Training Dashboard")
+            self.disabled = False
+        except pygame.error:
+            print("[dashboard] pygame.display.set_mode failed — falling back to console only.")
+            self.disabled = True
+            self.screen = None
 
     def draw(self, tracker, episode):
-        if not self.running or self.screen is None:
+        if self.disabled or not self.running or self.screen is None:
             return
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
@@ -376,28 +404,39 @@ class Dashboard:
             if tracker.solve_lengths
             else 0
         )
+        solve_pct = tracker.solve_rate
+        avg_to_solve = tracker.avg_steps_to_solve
+
         lines = [
-            f"Episode    {episode}",
-            f"Solve rate  {tracker.solve_rate:.1%}",
-            f"Avg reward   {avg_r:+.1f}   Avg steps  {avg_len:.0f}",
+            f"Episode      {episode}",
+            f"Solve rate    {solve_pct:.1%}",
+            f"Avg steps/success  {avg_to_solve:.0f}" if avg_to_solve else "Avg steps/success  —",
+            f"Avg reward    {avg_r:+.1f}     Avg len   {avg_len:.0f}",
         ]
         y = 18
         for line in lines:
-            self.screen.blit(
-                font_sm.render(line, True, (200, 200, 210)), (12, y)
-            )
-            y += 20
+            surf = font_sm.render(line, True, (200, 200, 210))
+            self.screen.blit(surf, (12, y))
+            y += 22
 
+        # Solve-rate highlight bar
+        bar_x, bar_y, bar_w, bar_h = 12, y + 6, W - 24, 14
+        bar_color = (50, 205, 50) if solve_pct > 0.5 else (208, 168, 64) if solve_pct > 0.2 else (208, 64, 64)
+        pygame.draw.rect(self.screen, (60, 60, 70), (bar_x, bar_y, bar_w, bar_h), border_radius=3)
+        fill_w = int(bar_w * solve_pct)
+        pygame.draw.rect(self.screen, bar_color, (bar_x, bar_y, fill_w, bar_h), border_radius=3)
+
+        curve_top = y + 34
         # Reward curve
         _draw_curve(
             self.screen, list(tracker.rewards),
-            (60, 80, W // 2 - 40, H - 100),
+            (60, curve_top, W // 2 - 40, H - curve_top - 80),
             (64, 224, 208), "Reward"
         )
         # Loss curve
         _draw_curve(
             self.screen, list(tracker.losses),
-            (W // 2 + 10, 80, W - W // 2 - 30, H - 100),
+            (W // 2 + 10, curve_top, W - W // 2 - 30, H - curve_top - 80),
             (208, 64, 64), "Loss"
         )
 
@@ -406,7 +445,7 @@ class Dashboard:
     def close(self):
         self.running = False
         if self.screen is not None:
-            pygame.display.quit()
+            self.screen = None
 
 
 def _draw_curve(screen, data, rect, color, label):
@@ -439,7 +478,7 @@ def _draw_curve(screen, data, rect, color, label):
 # ---------------------------------------------------------------------------
 def train(
     agent, maze_size, episodes=5000, save_path=None,
-    dashboard_flag=False, eval_every=50
+    dashboard_flag=True, eval_every=50
 ):
     """Train *agent* on random mazes of size *maze_size*.
 
@@ -505,9 +544,19 @@ def train(
                 sum(tracker.rewards) / len(tracker.rewards)
                 if tracker.rewards else 0
             )
-            line = f"Ep {ep:5d} | online {online_rate:.0%} | avg_reward {avg:+6.1f} | buf {len(agent.buffer):>6d}"
+            avg_succ = tracker.avg_steps_to_solve
+            steps_str = f"{avg_succ:.0f}" if avg_succ > 0 else "\u2014"
+            line = (
+                f"Ep {ep:5d} "
+                f"| solve_rate {online_rate:.0%} "
+                f"| avg_reward {avg:+7.1f} "
+                f"| avg_steps+ {steps_str}"
+            )
             if eval_rate >= 0:
                 line += f" | greedy_eval {eval_rate:.0%}"
+            if best_eval_rate >= 0:
+                line += f" | best_greedy {best_eval_rate:.0%}"
+            line += f" | buf {len(agent.buffer):>6d}"
             print(line)
 
         # Dashboard (optional, off by default for speed)
@@ -519,6 +568,20 @@ def train(
         agent.online_net.load_state_dict(best_weights)
         agent.target_net.load_state_dict(agent.online_net.state_dict())
         print(f"Loaded best weights (greedy eval {best_eval_rate:.0%}).")
+
+    # Final summary
+    final_avg = (
+        sum(tracker.rewards) / len(tracker.rewards) if tracker.rewards else 0
+    )
+    avg_succ_final = tracker.avg_steps_to_solve
+    steps_final_str = f"{avg_succ_final:.0f}" if avg_succ_final > 0 else "\u2014"
+    print(
+        f"[train] DONE \u2014 "
+        f"final solve_rate {tracker.solve_rate:.1%} | "
+        f"avg_reward {final_avg:+.1f} | "
+        f"best greedy eval {max(best_eval_rate, 0):.1%} | "
+        f"avg steps (success) {steps_final_str}"
+    )
 
     if save_path:
         agent.save(save_path)
@@ -702,7 +765,7 @@ if __name__ == "__main__":
     agent_weights_path = "agent_weights.pth"
 
     # --- Training --------------------------------------------------------
-    train_flag = False
+    train_flag = True
     if train_flag:
         mouse_agent = MouseAgent()
         print("Training...")
