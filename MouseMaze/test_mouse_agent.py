@@ -10,13 +10,17 @@ from MouseAgent import (
     DASHBOARD_TOOLTIPS,
     DEFAULT_INFER_FLAG,
     DEFAULT_TRAIN_FLAG,
+    BfsPlanner,
+    CurriculumController,
     Dashboard,
     EpisodeStats,
     EvalMetrics,
     Maze,
+    MazeBatch,
     MaskedPPOAgent,
     MetricsTracker,
     MouseAgent,
+    ReplayBuffer,
     TrainConfig,
     _chart_x_max,
     _dashboard_tooltip_at,
@@ -29,8 +33,11 @@ from MouseAgent import (
     build_n_step_transition,
     curriculum_distance_range,
     dashboard_layout,
+    linear_epsilon,
     make_maze,
     parse_args,
+    pretrain_with_expert,
+    run_benchmark,
     train,
 )
 
@@ -176,7 +183,7 @@ def test_curriculum_distance_ranges_and_sampling_are_deterministic():
     assert curriculum_distance_range(config, 1) == (6, 10)
     assert curriculum_distance_range(config, 6_000) == (8, 16)
     assert curriculum_distance_range(config, 16_000) is None
-    assert curriculum_distance_range(TrainConfig(maze_size=(5, 5)), 1) is None
+    assert curriculum_distance_range(TrainConfig(maze_size=(5, 5)), 1) == (3, 5)
 
     easy = [make_maze(config, rng=rng, episode=1).optimal_start_steps for _ in range(8)]
     medium = [
@@ -186,6 +193,135 @@ def test_curriculum_distance_ranges_and_sampling_are_deterministic():
 
     assert all(6 <= steps <= 10 for steps in easy)
     assert all(8 <= steps <= 16 for steps in medium)
+
+
+def test_curriculum_promotes_only_after_repeated_validation_success():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        curriculum_promotion_rate=0.75,
+        curriculum_promotion_evals=2,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    controller = CurriculumController(config)
+
+    assert controller.target_range() == (3, 5)
+    assert controller.record_validation(EvalMetrics(solve_rate=0.80)) is False
+    assert controller.level == 0
+    assert controller.record_validation(EvalMetrics(solve_rate=0.80)) is True
+    assert controller.level == 1
+    assert controller.target_range() == (4, 7)
+    assert controller.previous_range() == (3, 5)
+
+
+def test_maze_batch_matches_sequential_maze_transitions():
+    sequential = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    batched_source = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    sequential_state = sequential.reset()
+    batched_source.reset()
+    batch = MazeBatch([batched_source])
+
+    assert np.array_equal(batch.observations()[0], sequential_state)
+    for action in (0, 0):
+        sequential_state, sequential_reward, sequential_done, sequential_info = sequential.step(
+            action
+        )
+        batch_step = batch.step(np.array([action], dtype=np.int64))
+
+        assert np.array_equal(batch_step.states[0], sequential_state)
+        assert np.isclose(batch_step.rewards[0], sequential_reward)
+        assert bool(batch_step.dones[0]) is sequential_done
+        assert bool(batch_step.invalid[0]) is bool(sequential_info["invalid"])
+        assert np.array_equal(batch_step.action_masks[0], sequential.valid_action_mask())
+
+
+def test_bfs_planner_and_expert_labels_select_shortest_legal_action():
+    env = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    state = env.reset()
+    mask = env.valid_action_mask()
+    targets = env.expert_action_distribution()
+    planner = BfsPlanner()
+
+    assert targets.tolist() == [1.0, 0.0, 0.0, 0.0]
+    assert planner.get_action(state, action_mask=mask) == 0
+    metrics = _eval_greedy(
+        planner,
+        TrainConfig(
+            maze_size=(5, 5),
+            eval_episodes=3,
+            dashboard_flag=False,
+            save_path=None,
+            training_log_path=None,
+            device="cpu",
+        ),
+        maze_factory=lambda: Maze(fixed_grid(), observation_mode="full", max_episode_steps=10),
+    )
+    assert metrics.solve_rate == 1.0
+
+
+def test_prioritized_replay_samples_high_priority_transition_more_often():
+    buffer = ReplayBuffer((3, 5, 5), capacity=8, seed=123)
+    state = np.zeros((3, 5, 5), dtype=np.float32)
+    mask = np.ones(4, dtype=np.bool_)
+    for action in range(8):
+        buffer.push(state, action % 4, 0.0, state, False, mask)
+    buffer.update_priorities(np.arange(8), np.array([1.0] * 7 + [100.0]))
+
+    sampled = [
+        int(buffer.sample(1, prioritized=True, alpha=1.0, beta=0.4)[6][0])
+        for _ in range(200)
+    ]
+
+    assert sampled.count(7) > 150
+
+
+def test_transition_indexed_epsilon_schedule_and_benchmark_suites():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        epsilon_decay_steps=10,
+        epsilon_final_steps=20,
+        epsilon_start=1.0,
+        epsilon_mid=0.2,
+        epsilon_end=0.1,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+
+    assert linear_epsilon(0, config) == 1.0
+    assert np.isclose(linear_epsilon(10, config), 0.2)
+    assert np.isclose(linear_epsilon(20, config), 0.1)
+    result = run_benchmark(BfsPlanner(), config, episodes=3)
+
+    assert result.validation.solve_rate == 1.0
+    assert result.final_test.solve_rate == 1.0
+    assert result.stress_test.solve_rate == 1.0
+    assert result.validation.difficulty_solve_rates
+    assert 0.0 < result.validation.solve_rate_lower_bound < 1.0
+
+
+def test_expert_pretraining_updates_a_full_map_dqn():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        network_type="flat",
+        batch_size=4,
+        expert_pretrain_mazes=1,
+        expert_pretrain_epochs=1,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    agent = MouseAgent(config=config, device=torch.device("cpu"))
+
+    loss = pretrain_with_expert(agent, config)
+
+    assert loss is not None
+    assert loss >= 0.0
+    assert agent.update_count > 0
 
 
 def test_agent_masks_invalid_greedy_and_random_actions():
@@ -668,6 +804,37 @@ def test_small_cpu_training_smoke_runs_without_dashboard():
     assert tracker.latest_eval.solve_rate >= 0.0
 
 
+def test_vectorized_dqn_trains_with_prioritized_replay_after_warmup():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        episodes=3,
+        seed=321,
+        max_episode_steps=10,
+        buffer_size=128,
+        batch_size=4,
+        min_replay_size=4,
+        warmup_steps=4,
+        updates_per_transition=1.0,
+        prioritized_replay=True,
+        target_tau=0.1,
+        num_envs=2,
+        eval_every_steps=1_000,
+        eval_episodes=1,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+        vectorized_envs=True,
+    )
+    agent = MouseAgent(config=config, device=torch.device("cpu"))
+
+    train(agent=agent, config=config)
+
+    assert agent.update_count > 0
+    assert len(agent.buffer) >= config.min_replay_size
+    assert np.all(agent.buffer.priorities[: len(agent.buffer)] > 0)
+
+
 def test_ppo_masked_sampling_never_chooses_invalid_actions():
     config = TrainConfig(
         maze_size=(5, 5),
@@ -737,6 +904,31 @@ def test_agent_checkpoint_restores_optimizer_and_counters(tmp_path):
     assert resumed.optimizer.state_dict()["param_groups"] == (
         agent.optimizer.state_dict()["param_groups"]
     )
+
+
+def test_checkpoint_can_restore_optional_replay_contents(tmp_path):
+    save_path = tmp_path / "replay_checkpoint.pth"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        buffer_size=16,
+        min_replay_size=4,
+        checkpoint_replay=True,
+        save_path=str(save_path),
+        dashboard_flag=False,
+        training_log_path=None,
+        device="cpu",
+    )
+    agent = MouseAgent(config=config, device=torch.device("cpu"))
+    state = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10).reset()
+    agent.store_transition(state, 0, 1.0, state, False, np.ones(4, dtype=np.bool_))
+    agent.save(str(save_path))
+
+    resumed = MouseAgent(config=config, device=torch.device("cpu"))
+    resumed.load(str(save_path))
+
+    assert len(resumed.buffer) == 1
+    assert resumed.buffer.actions[0] == 0
+    assert resumed.buffer.rewards[0] == 1.0
 
 
 def test_train_resumes_existing_save_path_only_when_requested(tmp_path, capsys):
@@ -967,3 +1159,4 @@ def test_training_saves_new_best_weights_to_configured_path(tmp_path, capsys):
     assert "[train] new best weights saved to" in output
     assert str(save_path) in output
     assert tracker.latest_eval.solve_rate >= 0.0
+    linear_epsilon,

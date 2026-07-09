@@ -1,6 +1,28 @@
 MouseMaze training improvement plan
 ===================================
 
+Implementation status (2026-07-09)
+-----------------------------------
+Implemented in `MouseAgent.py`:
+* Deterministic validation/final/stress benchmark suites via `--benchmark`,
+  difficulty-bucket metrics, and a 95% Wilson lower bound for solve rate.
+* A reusable `TaskSampler`/`CurriculumController` path with validation-gated,
+  size-scaled curriculum promotion and previous/uniform task mixing.
+* Transition-indexed epsilon/evaluation clocks, random warm-up, explicit UTD
+  (`updates_per_transition`), prioritized replay, and soft target updates.
+* Atomic checkpoints with schedule/RNG state and optional replay persistence.
+* `MazeBatch` vectorized full-map DQN collection, cached spatial coordinates,
+  optional BFS planner inference (`--planner-fallback`), and optional
+  shortest-path expert pretraining.
+* Regression coverage for vector-transition equivalence, the oracle,
+  curriculum promotion, replay priorities, benchmarks, pretraining, and a
+  real DQN update after warm-up.
+
+The remaining items are deliberate experimental follow-ups: task-cache
+prefilling, pinned replay/`torch.compile` profiling, configurable trunk-size
+ablations, and PPO-specific KL/entropy diagnostics. They require measured
+hardware comparisons before becoming defaults.
+
 Goal
 ----
 Train a policy quickly on new, fully observable 11x11 mazes while keeping the

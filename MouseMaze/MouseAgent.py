@@ -10,9 +10,9 @@ import subprocess
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, Protocol
 
 import numpy as np
 import torch
@@ -46,15 +46,26 @@ LEARNING_RATE = 3e-4
 GAMMA = 0.99
 N_STEP_RETURNS = 3
 EPSILON_START = 1.0
-EPSILON_END = 0.05
+EPSILON_MID = 0.10
+EPSILON_END = 0.02
 EPSILON_DECAY_EPISODES = 5_000
+EPSILON_DECAY_STEPS = 500_000
+EPSILON_FINAL_STEPS = 1_500_000
 DEFAULT_NUM_ENVS = 64
 DEFAULT_TRAIN_UPDATES_PER_STEP = 4
+DEFAULT_UPDATES_PER_TRANSITION = 0.125
+DEFAULT_WARMUP_STEPS = 10_000
+DEFAULT_TARGET_TAU = 0.005
+DEFAULT_PRIORITIZED_REPLAY = True
+DEFAULT_PRIORITY_ALPHA = 0.6
+DEFAULT_PRIORITY_BETA_START = 0.4
+DEFAULT_PRIORITY_BETA_STEPS = 1_500_000
 MAX_EPISODE_STEPS = 200
 DEFAULT_TIMEOUT_STEP_FACTOR = 4.0
 DEFAULT_MIN_EPISODE_STEPS = 20
 NUM_EVAL_EPISODES = 200
 EVAL_PERIOD = 100
+EVAL_PERIOD_STEPS = 10_000
 EVAL_SEED_OFFSET = 1_000_003
 DEFAULT_DASHBOARD_FLAG = True
 DEFAULT_DASHBOARD_EVERY = EVAL_PERIOD
@@ -78,6 +89,15 @@ DEFAULT_CURRICULUM_MEDIUM_EPISODES = 15_000
 DEFAULT_CURRICULUM_EASY_RANGE = (6, 10)
 DEFAULT_CURRICULUM_MEDIUM_RANGE = (8, 16)
 DEFAULT_CURRICULUM_MAX_RETRIES = 200
+DEFAULT_CURRICULUM_PROMOTION_RATE = 0.90
+DEFAULT_CURRICULUM_PROMOTION_EVALS = 3
+DEFAULT_CURRICULUM_PREVIOUS_FRACTION = 0.20
+DEFAULT_CURRICULUM_UNIFORM_FRACTION = 0.10
+DEFAULT_VECTORIZED_ENVS = True
+DEFAULT_CHECKPOINT_REPLAY = False
+DEFAULT_EXPERT_PRETRAIN_MAZES = 0
+DEFAULT_EXPERT_PRETRAIN_EPOCHS = 3
+DEFAULT_PLANNER_FALLBACK = False
 
 PPO_ROLLOUT_STEPS = 128
 PPO_EPOCHS = 4
@@ -126,10 +146,20 @@ class TrainConfig:
     gamma: float = GAMMA
     n_step_returns: int = N_STEP_RETURNS
     epsilon_start: float = EPSILON_START
+    epsilon_mid: float = EPSILON_MID
     epsilon_end: float = EPSILON_END
     epsilon_decay_episodes: int = EPSILON_DECAY_EPISODES
+    epsilon_decay_steps: int = EPSILON_DECAY_STEPS
+    epsilon_final_steps: int = EPSILON_FINAL_STEPS
     num_envs: int = DEFAULT_NUM_ENVS
     train_updates_per_step: int = DEFAULT_TRAIN_UPDATES_PER_STEP
+    updates_per_transition: float = DEFAULT_UPDATES_PER_TRANSITION
+    warmup_steps: int = DEFAULT_WARMUP_STEPS
+    target_tau: float = DEFAULT_TARGET_TAU
+    prioritized_replay: bool = DEFAULT_PRIORITIZED_REPLAY
+    priority_alpha: float = DEFAULT_PRIORITY_ALPHA
+    priority_beta_start: float = DEFAULT_PRIORITY_BETA_START
+    priority_beta_steps: int = DEFAULT_PRIORITY_BETA_STEPS
     ppo_rollout_steps: int = PPO_ROLLOUT_STEPS
     ppo_epochs: int = PPO_EPOCHS
     ppo_clip_range: float = PPO_CLIP_RANGE
@@ -138,7 +168,17 @@ class TrainConfig:
     ppo_entropy_coef: float = PPO_ENTROPY_COEF
     ppo_max_grad_norm: float = PPO_MAX_GRAD_NORM
     eval_every: int = EVAL_PERIOD
+    eval_every_steps: int = EVAL_PERIOD_STEPS
     eval_episodes: int = NUM_EVAL_EPISODES
+    curriculum_promotion_rate: float = DEFAULT_CURRICULUM_PROMOTION_RATE
+    curriculum_promotion_evals: int = DEFAULT_CURRICULUM_PROMOTION_EVALS
+    curriculum_previous_fraction: float = DEFAULT_CURRICULUM_PREVIOUS_FRACTION
+    curriculum_uniform_fraction: float = DEFAULT_CURRICULUM_UNIFORM_FRACTION
+    vectorized_envs: bool = DEFAULT_VECTORIZED_ENVS
+    checkpoint_replay: bool = DEFAULT_CHECKPOINT_REPLAY
+    expert_pretrain_mazes: int = DEFAULT_EXPERT_PRETRAIN_MAZES
+    expert_pretrain_epochs: int = DEFAULT_EXPERT_PRETRAIN_EPOCHS
+    planner_fallback: bool = DEFAULT_PLANNER_FALLBACK
     dashboard_flag: bool = DEFAULT_DASHBOARD_FLAG
     dashboard_every: int = DEFAULT_DASHBOARD_EVERY
     save_path: str | None = DEFAULT_SAVE_PATH
@@ -162,12 +202,18 @@ class TrainConfig:
                 f"observation_mode must be one of {OBSERVATION_MODES}; "
                 f"got {self.observation_mode!r}"
             )
+        if self.planner_fallback and self.observation_mode != "full":
+            raise ValueError("planner_fallback requires full observations")
         if self.distance_shaping_mode not in DISTANCE_SHAPING_MODES:
             raise ValueError(
                 "distance_shaping_mode must be one of "
                 f"{DISTANCE_SHAPING_MODES}; got {self.distance_shaping_mode!r}"
             )
-        if self.view_size % 2 == 0:
+        if len(self.maze_size) != 2 or min(self.maze_size) < 3:
+            raise ValueError("maze_size must contain two dimensions >= 3")
+        if any(size % 2 == 0 for size in self.maze_size):
+            raise ValueError("maze_size dimensions must be odd for the maze generator")
+        if self.view_size < 1 or self.view_size % 2 == 0:
             raise ValueError("view_size must be odd so the agent has a center cell")
         if self.episodes < 1:
             raise ValueError("episodes must be >= 1")
@@ -177,6 +223,30 @@ class TrainConfig:
             raise ValueError("batch_size must be >= 1")
         if self.min_replay_size < 1:
             raise ValueError("min_replay_size must be >= 1")
+        if self.buffer_size < self.min_replay_size:
+            raise ValueError("buffer_size must be >= min_replay_size")
+        if self.target_update_freq < 1:
+            raise ValueError("target_update_freq must be >= 1")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
+        if not 0 < self.gamma <= 1:
+            raise ValueError("gamma must be in (0, 1]")
+        if not 0 <= self.epsilon_end <= self.epsilon_mid <= self.epsilon_start <= 1:
+            raise ValueError("epsilon values must satisfy 0 <= end <= mid <= start <= 1")
+        if self.epsilon_decay_steps < 1 or self.epsilon_final_steps < self.epsilon_decay_steps:
+            raise ValueError("epsilon step boundaries must satisfy 1 <= decay <= final")
+        if self.updates_per_transition < 0:
+            raise ValueError("updates_per_transition must be non-negative")
+        if self.warmup_steps < 0:
+            raise ValueError("warmup_steps must be non-negative")
+        if not 0 <= self.target_tau <= 1:
+            raise ValueError("target_tau must be in [0, 1]")
+        if self.priority_alpha < 0:
+            raise ValueError("priority_alpha must be non-negative")
+        if not 0 <= self.priority_beta_start <= 1:
+            raise ValueError("priority_beta_start must be in [0, 1]")
+        if self.priority_beta_steps < 1:
+            raise ValueError("priority_beta_steps must be >= 1")
         if self.max_episode_steps < 1:
             raise ValueError("max_episode_steps must be >= 1")
         if self.timeout_step_factor is not None and self.timeout_step_factor <= 0:
@@ -191,6 +261,16 @@ class TrainConfig:
             )
         if self.curriculum_max_retries < 1:
             raise ValueError("curriculum_max_retries must be >= 1")
+        if not 0 < self.curriculum_promotion_rate <= 1:
+            raise ValueError("curriculum_promotion_rate must be in (0, 1]")
+        if self.curriculum_promotion_evals < 1:
+            raise ValueError("curriculum_promotion_evals must be >= 1")
+        if not 0 <= self.curriculum_previous_fraction <= 1:
+            raise ValueError("curriculum_previous_fraction must be in [0, 1]")
+        if not 0 <= self.curriculum_uniform_fraction <= 1:
+            raise ValueError("curriculum_uniform_fraction must be in [0, 1]")
+        if self.curriculum_previous_fraction + self.curriculum_uniform_fraction > 1:
+            raise ValueError("curriculum sampling fractions must sum to at most 1")
         self._validate_distance_range("curriculum_easy_range", self.curriculum_easy_range)
         self._validate_distance_range(
             "curriculum_medium_range",
@@ -208,8 +288,12 @@ class TrainConfig:
             raise ValueError("ppo_gae_lambda must be in (0, 1]")
         if self.eval_every < 1:
             raise ValueError("eval_every must be >= 1")
+        if self.eval_every_steps < 1:
+            raise ValueError("eval_every_steps must be >= 1")
         if self.eval_episodes < 1:
             raise ValueError("eval_episodes must be >= 1")
+        if self.expert_pretrain_mazes < 0 or self.expert_pretrain_epochs < 0:
+            raise ValueError("expert pretraining settings must be non-negative")
         if self.dashboard_every < 1:
             raise ValueError("dashboard_every must be >= 1")
 
@@ -235,6 +319,7 @@ class EpisodeStats:
 @dataclass(slots=True)
 class EvalMetrics:
     solve_rate: float = 0.0
+    solve_rate_lower_bound: float = 0.0
     avg_steps: float = 0.0
     optimality_ratio: float = 0.0
     timeout_rate: float = 0.0
@@ -242,6 +327,7 @@ class EvalMetrics:
     loop_rate: float = 0.0
     repeated_state_action_rate: float = 0.0
     failed_final_distance: float = 0.0
+    difficulty_solve_rates: dict[str, float] | None = None
 
 
 @dataclass(slots=True)
@@ -268,6 +354,48 @@ class DashboardState:
 ChartPoint = tuple[int, float]
 RawTransition = tuple[np.ndarray, int, float, np.ndarray, bool, np.ndarray]
 ReplayTransition = tuple[np.ndarray, int, float, np.ndarray, bool, np.ndarray]
+
+
+class TaskSampler(Protocol):
+    """Create tasks and describe their difficulty without coupling to an agent."""
+
+    def sample(self) -> "Maze":
+        """Return one new training environment."""
+
+    def describe(self, environment: "Maze") -> dict[str, float | str]:
+        """Return task metadata used for curriculum and evaluation reporting."""
+
+
+class ExpertPolicy(Protocol):
+    """Optional source of target action distributions for an environment."""
+
+    def optimal_action_distribution(
+        self,
+        state: np.ndarray,
+        action_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Return probabilities over legal optimal actions for one state."""
+
+
+class Planner(Protocol):
+    """Optional exact policy used as a fallback or benchmarking oracle."""
+
+    def get_actions(
+        self,
+        states: np.ndarray,
+        epsilon: float = 0.0,
+        action_masks: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return one legal action per state."""
+
+
+@dataclass(slots=True)
+class BenchmarkResult:
+    """Metrics for validation, final-test, and stress evaluation suites."""
+
+    validation: EvalMetrics
+    final_test: EvalMetrics
+    stress_test: EvalMetrics
 
 
 def set_global_seed(seed: int) -> None:
@@ -316,6 +444,21 @@ def device_diagnostics(device: torch.device) -> str:
     )
 
 
+def _atomic_torch_save(payload: object, path: str) -> None:
+    """Write a checkpoint atomically so interrupted saves keep the old file."""
+
+    absolute_path = os.path.abspath(path)
+    directory = os.path.dirname(absolute_path)
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = f"{absolute_path}.tmp-{uuid.uuid4().hex}"
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, absolute_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
 def observation_shape(
     maze_size: tuple[int, int],
     observation_mode: str = "full",
@@ -342,7 +485,7 @@ def resolved_eval_seed(config: TrainConfig) -> int:
 # Experience replay buffer
 # ---------------------------------------------------------------------------
 class ReplayBuffer:
-    """Pre-allocated NumPy replay buffer for DQN transitions."""
+    """Pre-allocated uniform or proportional-prioritized DQN replay buffer."""
 
     __slots__ = (
         "states",
@@ -351,12 +494,19 @@ class ReplayBuffer:
         "next_states",
         "dones",
         "next_action_masks",
+        "priorities",
         "capacity",
         "_pos",
         "_size",
+        "_rng",
     )
 
-    def __init__(self, observation_shape_: tuple[int, ...], capacity: int = BUFFER_SIZE):
+    def __init__(
+        self,
+        observation_shape_: tuple[int, ...],
+        capacity: int = BUFFER_SIZE,
+        seed: int | None = None,
+    ):
         self.capacity = int(capacity)
         self.states = np.empty((capacity, *observation_shape_), dtype=np.float32)
         self.actions = np.empty(capacity, dtype=np.int64)
@@ -364,8 +514,10 @@ class ReplayBuffer:
         self.next_states = np.empty((capacity, *observation_shape_), dtype=np.float32)
         self.dones = np.empty(capacity, dtype=np.float32)
         self.next_action_masks = np.empty((capacity, 4), dtype=np.bool_)
+        self.priorities = np.ones(capacity, dtype=np.float32)
         self._pos = 0
         self._size = 0
+        self._rng = np.random.default_rng(seed)
 
     def push(
         self,
@@ -383,12 +535,35 @@ class ReplayBuffer:
         self.next_states[idx] = next_state
         self.dones[idx] = float(done)
         self.next_action_masks[idx] = self._normalize_action_mask(next_action_mask)
+        self.priorities[idx] = self.priorities[: self._size].max(initial=1.0)
         self._pos += 1
         self._size = min(self._size + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> tuple[np.ndarray, ...]:
+    def sample(
+        self,
+        batch_size: int,
+        prioritized: bool = False,
+        alpha: float = DEFAULT_PRIORITY_ALPHA,
+        beta: float = 1.0,
+    ) -> tuple[np.ndarray, ...]:
+        """Sample transitions with normalized importance weights.
+
+        The final two arrays are buffer indices and importance weights. They
+        make uniform and prioritized replay share one training call-site.
+        """
+
         n = min(batch_size, self._size)
-        idx = np.random.randint(0, self._size, size=n)
+        if n < 1:
+            raise ValueError("cannot sample an empty replay buffer")
+        if prioritized and alpha > 0:
+            scaled = np.maximum(self.priorities[: self._size], 1e-6) ** alpha
+            probabilities = scaled / scaled.sum()
+            idx = self._rng.choice(self._size, size=n, replace=True, p=probabilities)
+            weights = (self._size * probabilities[idx]) ** (-beta)
+            weights /= weights.max(initial=1.0)
+        else:
+            idx = self._rng.integers(0, self._size, size=n)
+            weights = np.ones(n, dtype=np.float32)
         return (
             self.states[idx],
             self.actions[idx],
@@ -396,7 +571,58 @@ class ReplayBuffer:
             self.next_states[idx],
             self.dones[idx],
             self.next_action_masks[idx],
+            idx,
+            weights.astype(np.float32, copy=False),
         )
+
+    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
+        """Update sampled priorities from absolute TD errors."""
+
+        index_array = np.asarray(indices, dtype=np.int64)
+        priority_array = np.asarray(priorities, dtype=np.float32)
+        if index_array.shape != priority_array.shape:
+            raise ValueError("indices and priorities must have matching shapes")
+        self.priorities[index_array] = np.maximum(priority_array, 1e-6)
+
+    def state_dict(self) -> dict[str, object]:
+        """Return replay contents and RNG state for optional exact resume."""
+
+        return {
+            "capacity": self.capacity,
+            "pos": self._pos,
+            "size": self._size,
+            "states": self.states.copy(),
+            "actions": self.actions.copy(),
+            "rewards": self.rewards.copy(),
+            "next_states": self.next_states.copy(),
+            "dones": self.dones.copy(),
+            "next_action_masks": self.next_action_masks.copy(),
+            "priorities": self.priorities.copy(),
+            "rng_state": self._rng.bit_generator.state,
+        }
+
+    def load_state_dict(self, payload: dict[str, object]) -> None:
+        """Restore a replay snapshot after validating its capacity."""
+
+        if int(payload["capacity"]) != self.capacity:
+            raise ValueError("replay capacity does not match the loaded checkpoint")
+        for name in (
+            "states",
+            "actions",
+            "rewards",
+            "next_states",
+            "dones",
+            "next_action_masks",
+            "priorities",
+        ):
+            target = getattr(self, name)
+            source = np.asarray(payload[name], dtype=target.dtype)
+            if source.shape != target.shape:
+                raise ValueError(f"replay field {name} has shape {source.shape}, expected {target.shape}")
+            target[...] = source
+        self._pos = int(payload["pos"])
+        self._size = int(payload["size"])
+        self._rng.bit_generator.state = payload["rng_state"]
 
     def __len__(self) -> int:
         return self._size
@@ -622,29 +848,232 @@ class Maze:
             dtype=np.bool_,
         )
 
+    def expert_action_distribution(
+        self,
+        position: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        """Return a uniform distribution over shortest-path legal actions.
+
+        This is an optional environment-provided teaching signal. It does not
+        participate in ordinary RL reward or action selection.
+        """
+
+        base = self.current_position if position is None else position
+        action_mask = self.valid_action_mask(base)
+        distance = float(self.bfs_distances[base])
+        targets = np.zeros(4, dtype=np.float32)
+        if distance <= 0:
+            targets[action_mask] = 1.0 / max(int(action_mask.sum()), 1)
+            return targets
+        for action, (dr, dc) in enumerate(self.ACTIONS):
+            if not action_mask[action]:
+                continue
+            neighbor = (base[0] + dr, base[1] + dc)
+            if self.bfs_distances[neighbor] == distance - 1:
+                targets[action] = 1.0
+        if targets.sum() == 0:
+            targets[action_mask] = 1.0
+        return targets / targets.sum()
+
     def manhattan_to_goal(self) -> int:
         return abs(self.current_position[0] - self.goal[0]) + abs(
             self.current_position[1] - self.goal[1]
         )
 
 
+class BfsPlanner:
+    """Exact MouseMaze planner implementing the generic Planner protocol."""
+
+    def get_actions(
+        self,
+        states: np.ndarray,
+        epsilon: float = 0.0,
+        action_masks: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return a shortest-path action for each full-map observation."""
+
+        del epsilon
+        state_batch = states[np.newaxis, ...] if states.ndim == 3 else states
+        masks = None if action_masks is None else np.asarray(action_masks, dtype=np.bool_)
+        if masks is not None and masks.ndim == 1:
+            masks = masks[np.newaxis, :]
+        actions = np.empty(state_batch.shape[0], dtype=np.int64)
+        for index, state in enumerate(state_batch):
+            walls = state[0] > 0.5
+            position = tuple(np.argwhere(state[1] > 0.5)[0])
+            goal = tuple(np.argwhere(state[2] > 0.5)[0])
+            distances = _bfs_distances_from_observation(walls, goal)
+            mask = (
+                np.ones(4, dtype=np.bool_)
+                if masks is None
+                else masks[index]
+            )
+            candidates = []
+            for action, (dr, dc) in enumerate(Maze.ACTIONS):
+                row, col = position[0] + dr, position[1] + dc
+                if (
+                    mask[action]
+                    and 0 <= row < walls.shape[0]
+                    and 0 <= col < walls.shape[1]
+                    and distances[row, col] >= 0
+                ):
+                    candidates.append((distances[row, col], action))
+            actions[index] = min(candidates, default=(0, 0))[1]
+        return actions
+
+    def get_action(
+        self,
+        state: np.ndarray,
+        epsilon: float = 0.0,
+        action_mask: np.ndarray | None = None,
+    ) -> int:
+        """Return one exact action for compatibility with scalar evaluation."""
+
+        del epsilon
+        return int(self.get_actions(state, action_mask)[0])
+
+
+def _bfs_distances_from_observation(
+    walls: np.ndarray,
+    goal: tuple[int, int],
+) -> np.ndarray:
+    """Compute a distance map for a full-map planner observation."""
+
+    distances = np.full(walls.shape, -1, dtype=np.int32)
+    distances[goal] = 0
+    queue = deque([goal])
+    while queue:
+        row, col = queue.popleft()
+        for dr, dc in Maze.ACTIONS:
+            next_row, next_col = row + dr, col + dc
+            if (
+                0 <= next_row < walls.shape[0]
+                and 0 <= next_col < walls.shape[1]
+                and not walls[next_row, next_col]
+                and distances[next_row, next_col] < 0
+            ):
+                distances[next_row, next_col] = distances[row, col] + 1
+                queue.append((next_row, next_col))
+    return distances
+
+
 def curriculum_distance_range(
     config: TrainConfig,
     episode: int | None,
 ) -> tuple[int, int] | None:
-    """Return the target optimal path range for a training episode."""
+    """Return a size-scaled legacy curriculum range for a training episode.
+
+    New training uses :class:`CurriculumController`; this helper remains for
+    callers that rely on a deterministic episode-indexed schedule.
+    """
 
     if (
         not config.curriculum_enabled
         or episode is None
-        or config.maze_size != DEFAULT_MAZE_SIZE
     ):
         return None
+    scale = max(config.maze_size) / max(DEFAULT_MAZE_SIZE)
     if episode <= config.curriculum_easy_episodes:
-        return config.curriculum_easy_range
+        return _scale_distance_range(config.curriculum_easy_range, scale)
     if episode <= config.curriculum_medium_episodes:
-        return config.curriculum_medium_range
+        return _scale_distance_range(config.curriculum_medium_range, scale)
     return None
+
+
+def _scale_distance_range(
+    value: tuple[int, int],
+    scale: float,
+) -> tuple[int, int]:
+    low = max(1, int(round(value[0] * scale)))
+    high = max(low, int(round(value[1] * scale)))
+    return low, high
+
+
+class CurriculumController:
+    """Promote task difficulty only after repeated validation success."""
+
+    def __init__(self, config: TrainConfig):
+        self.config = config
+        self.level = 0
+        self.success_streak = 0
+
+    @property
+    def complete(self) -> bool:
+        return self.level >= 2
+
+    def target_range(self) -> tuple[int, int] | None:
+        """Return the current maze path-length range, or uniform sampling."""
+
+        if not self.config.curriculum_enabled or self.complete:
+            return None
+        scale = max(self.config.maze_size) / max(DEFAULT_MAZE_SIZE)
+        source = (
+            self.config.curriculum_easy_range
+            if self.level == 0
+            else self.config.curriculum_medium_range
+        )
+        return _scale_distance_range(source, scale)
+
+    def previous_range(self) -> tuple[int, int] | None:
+        """Return the immediately previous curriculum range when available."""
+
+        if self.level < 1:
+            return None
+        scale = max(self.config.maze_size) / max(DEFAULT_MAZE_SIZE)
+        return _scale_distance_range(self.config.curriculum_easy_range, scale)
+
+    def record_validation(self, metrics: EvalMetrics) -> bool:
+        """Record validation quality and return whether a promotion occurred."""
+
+        if not self.config.curriculum_enabled or self.complete:
+            return False
+        if metrics.solve_rate >= self.config.curriculum_promotion_rate:
+            self.success_streak += 1
+        else:
+            self.success_streak = 0
+        if self.success_streak < self.config.curriculum_promotion_evals:
+            return False
+        self.level += 1
+        self.success_streak = 0
+        return True
+
+
+class MazeTaskSampler:
+    """Difficulty-aware MouseMaze sampler conforming to ``TaskSampler``."""
+
+    def __init__(self, config: TrainConfig, rng: random.Random):
+        self.config = config
+        self.rng = rng
+        self.curriculum = CurriculumController(config)
+
+    def sample(self) -> Maze:
+        """Sample from current, previous, and uniform task distributions."""
+
+        target_range = self.curriculum.target_range()
+        if target_range is not None:
+            draw = self.rng.random()
+            if draw < self.config.curriculum_uniform_fraction:
+                target_range = None
+            elif draw < (
+                self.config.curriculum_uniform_fraction
+                + self.config.curriculum_previous_fraction
+            ):
+                target_range = self.curriculum.previous_range()
+        try:
+            return make_maze(self.config, rng=self.rng, target_range=target_range)
+        except TypeError as exc:
+            if "target_range" not in str(exc):
+                raise
+            return make_maze(self.config, rng=self.rng)
+
+    def describe(self, environment: Maze) -> dict[str, float | str]:
+        """Describe a task using reusable difficulty metadata."""
+
+        distance = environment.optimal_start_steps
+        return {
+            "difficulty": float(distance),
+            "bucket": difficulty_bucket(distance),
+        }
 
 
 def _maze_from_grid(config: TrainConfig, grid: np.ndarray) -> Maze:
@@ -669,8 +1098,10 @@ def make_maze(
     config: TrainConfig,
     rng: random.Random | None = None,
     episode: int | None = None,
+    target_range: tuple[int, int] | None = None,
 ) -> Maze:
-    target_range = curriculum_distance_range(config, episode)
+    if target_range is None:
+        target_range = curriculum_distance_range(config, episode)
     if target_range is None:
         grid = generate_random_maze(config.maze_size[0], config.maze_size[1], rng=rng)
         return _maze_from_grid(config, grid)
@@ -686,15 +1117,190 @@ def make_maze(
     return _maze_from_grid(config, grid)
 
 
-def make_training_maze(config: TrainConfig, rng: random.Random, episode: int) -> Maze:
+def make_training_maze(
+    config: TrainConfig,
+    rng: random.Random,
+    episode: int,
+    sampler: MazeTaskSampler | None = None,
+) -> Maze:
     """Create a training maze while tolerating older test monkeypatches."""
 
+    if sampler is not None:
+        return sampler.sample()
     try:
         return make_maze(config, rng=rng, episode=episode)
     except TypeError as exc:
         if "episode" not in str(exc):
             raise
         return make_maze(config, rng=rng)
+
+
+@dataclass(slots=True)
+class BatchStep:
+    """Results of stepping a same-shaped batch of full-map maze tasks."""
+
+    states: np.ndarray
+    rewards: np.ndarray
+    dones: np.ndarray
+    action_masks: np.ndarray
+    invalid: np.ndarray
+    solved: np.ndarray
+    timeout: np.ndarray
+
+
+class MazeBatch:
+    """Vectorized full-observation Maze adapter used by DQN collection.
+
+    Individual ``Maze`` objects remain the source of task construction and
+    rendering. This adapter only batches their fixed-shape transition logic.
+    """
+
+    def __init__(self, environments: list[Maze]):
+        if not environments:
+            raise ValueError("MazeBatch requires at least one environment")
+        first = environments[0]
+        if first.observation_mode != "full":
+            raise ValueError("MazeBatch supports full observations only")
+        grid_shape = first.grid.shape
+        if any(env.observation_mode != "full" or env.grid.shape != grid_shape for env in environments):
+            raise ValueError("all batched mazes must use full observations and one grid shape")
+        self.size = len(environments)
+        self.grid_shape = grid_shape
+        self.grids = np.empty((self.size, *grid_shape), dtype=np.uint8)
+        self.bfs_distances = np.empty((self.size, *grid_shape), dtype=np.float32)
+        self.starts = np.empty((self.size, 2), dtype=np.int64)
+        self.goals = np.empty((self.size, 2), dtype=np.int64)
+        self.positions = np.empty((self.size, 2), dtype=np.int64)
+        self.steps = np.empty(self.size, dtype=np.int64)
+        self.invalid_moves = np.empty(self.size, dtype=np.int64)
+        self.total_rewards = np.empty(self.size, dtype=np.float32)
+        self.optimal_steps = np.empty(self.size, dtype=np.int64)
+        self.max_episode_steps = np.empty(self.size, dtype=np.int64)
+        self.step_penalty = first.step_penalty
+        self.invalid_move_penalty = first.invalid_move_penalty
+        self.goal_reward = first.goal_reward
+        self.timeout_penalty = first.timeout_penalty
+        self.distance_shaping_scale = first.distance_shaping_scale
+        self.distance_shaping_mode = first.distance_shaping_mode
+        self.gamma = first.gamma
+        for index, environment in enumerate(environments):
+            self.replace(index, environment)
+
+    def replace(self, index: int, environment: Maze) -> None:
+        """Replace a completed slot with a freshly generated equivalent task."""
+
+        if environment.observation_mode != "full" or environment.grid.shape != self.grid_shape:
+            raise ValueError("replacement maze must match the batch observation shape")
+        self.grids[index] = environment.grid
+        self.bfs_distances[index] = environment.bfs_distances
+        self.starts[index] = environment.start
+        self.goals[index] = environment.goal
+        self.positions[index] = environment.current_position
+        self.steps[index] = environment.steps
+        self.invalid_moves[index] = environment.invalid_moves
+        self.total_rewards[index] = environment.total_reward
+        self.optimal_steps[index] = environment.optimal_start_steps
+        self.max_episode_steps[index] = environment.max_episode_steps
+
+    def observations(self) -> np.ndarray:
+        """Build batched full-map observations without a Python env loop."""
+
+        observations = np.zeros((self.size, 3, *self.grid_shape), dtype=np.float32)
+        observations[:, 0] = self.grids == 1
+        indices = np.arange(self.size)
+        observations[indices, 1, self.positions[:, 0], self.positions[:, 1]] = 1.0
+        observations[indices, 2, self.goals[:, 0], self.goals[:, 1]] = 1.0
+        return observations
+
+    def valid_action_masks(self) -> np.ndarray:
+        """Return legal action masks for every current batch position."""
+
+        deltas = np.asarray(Maze.ACTIONS, dtype=np.int64)
+        candidates = self.positions[:, np.newaxis, :] + deltas[np.newaxis, :, :]
+        rows, cols = self.grid_shape
+        in_bounds = (
+            (candidates[:, :, 0] >= 0)
+            & (candidates[:, :, 0] < rows)
+            & (candidates[:, :, 1] >= 0)
+            & (candidates[:, :, 1] < cols)
+        )
+        clipped_rows = np.clip(candidates[:, :, 0], 0, rows - 1)
+        clipped_cols = np.clip(candidates[:, :, 1], 0, cols - 1)
+        walls = self.grids[
+            np.arange(self.size)[:, np.newaxis],
+            clipped_rows,
+            clipped_cols,
+        ] == 1
+        return in_bounds & ~walls
+
+    def step(self, actions: np.ndarray) -> BatchStep:
+        """Apply one action per environment and return vectorized transition data."""
+
+        action_array = np.asarray(actions, dtype=np.int64)
+        if action_array.shape != (self.size,):
+            raise ValueError(f"actions must have shape ({self.size},), got {action_array.shape}")
+        if np.any((action_array < 0) | (action_array >= len(Maze.ACTIONS))):
+            raise ValueError("actions must be in [0, 3]")
+
+        indices = np.arange(self.size)
+        deltas = np.asarray(Maze.ACTIONS, dtype=np.int64)
+        old_positions = self.positions.copy()
+        action_masks = self.valid_action_masks()
+        valid = action_masks[indices, action_array]
+        candidates = old_positions + deltas[action_array]
+        self.positions[valid] = candidates[valid]
+        invalid = ~valid
+        self.invalid_moves += invalid.astype(np.int64)
+
+        old_distance = self.bfs_distances[indices, old_positions[:, 0], old_positions[:, 1]]
+        new_distance = self.bfs_distances[
+            indices,
+            self.positions[:, 0],
+            self.positions[:, 1],
+        ]
+        solved = np.all(self.positions == self.goals, axis=1)
+        rewards = np.full(self.size, self.step_penalty, dtype=np.float32)
+        rewards += invalid.astype(np.float32) * self.invalid_move_penalty
+        if self.distance_shaping_mode == "potential":
+            shaping = self.gamma * (-new_distance) - (-old_distance)
+            rewards += self.distance_shaping_scale * np.where(old_distance > 0, shaping, 0.0)
+        elif self.distance_shaping_mode == "fractional":
+            shaping = np.divide(
+                old_distance - new_distance,
+                old_distance,
+                out=np.zeros_like(old_distance),
+                where=old_distance > 0,
+            )
+            rewards += self.distance_shaping_scale * shaping
+        rewards += solved.astype(np.float32) * self.goal_reward
+        self.steps += 1
+        timeout = ~solved & (self.steps >= self.max_episode_steps)
+        rewards += timeout.astype(np.float32) * self.timeout_penalty
+        dones = solved | timeout
+        self.total_rewards += rewards
+        return BatchStep(
+            states=self.observations(),
+            rewards=rewards,
+            dones=dones,
+            action_masks=self.valid_action_masks(),
+            invalid=invalid,
+            solved=solved,
+            timeout=timeout,
+        )
+
+    def episode_stats(self, index: int) -> EpisodeStats:
+        """Return terminal statistics for one slot before replacing it."""
+
+        solved = bool(np.array_equal(self.positions[index], self.goals[index]))
+        timeout = (not solved) and self.steps[index] >= self.max_episode_steps[index]
+        return EpisodeStats(
+            total_reward=float(self.total_rewards[index]),
+            steps=int(self.steps[index]),
+            solved=solved,
+            timeout=bool(timeout),
+            invalid_moves=int(self.invalid_moves[index]),
+            optimal_steps=int(self.optimal_steps[index]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -718,8 +1324,23 @@ class ResidualBlock(nn.Module):
 class SpatialTrunk(nn.Module):
     """Fully convolutional trunk over wall, goal, and coordinate channels."""
 
-    def __init__(self, channels: int = 64, residual_blocks: int = 6):
+    def __init__(
+        self,
+        input_shape: tuple[int, int, int],
+        channels: int = 64,
+        residual_blocks: int = 6,
+    ):
         super().__init__()
+        _input_channels, rows, cols = input_shape
+        row_coords = torch.linspace(-1.0, 1.0, rows)
+        col_coords = torch.linspace(-1.0, 1.0, cols)
+        row_plane = row_coords.view(1, rows, 1).expand(1, rows, cols)
+        col_plane = col_coords.view(1, 1, cols).expand(1, rows, cols)
+        self.register_buffer(
+            "coordinate_planes",
+            torch.cat((row_plane, col_plane), dim=0),
+            persistent=False,
+        )
         layers: list[nn.Module] = [
             nn.Conv2d(4, channels, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -729,12 +1350,8 @@ class SpatialTrunk(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         walls_and_goal = torch.cat((x[:, 0:1], x[:, 2:3]), dim=1)
-        batch, _channels, rows, cols = x.shape
-        row_coords = torch.linspace(-1.0, 1.0, rows, device=x.device, dtype=x.dtype)
-        col_coords = torch.linspace(-1.0, 1.0, cols, device=x.device, dtype=x.dtype)
-        row_plane = row_coords.view(1, 1, rows, 1).expand(batch, 1, rows, cols)
-        col_plane = col_coords.view(1, 1, 1, cols).expand(batch, 1, rows, cols)
-        return self.net(torch.cat((walls_and_goal, row_plane, col_plane), dim=1))
+        coordinates = self.coordinate_planes.to(dtype=x.dtype).expand(x.shape[0], -1, -1, -1)
+        return self.net(torch.cat((walls_and_goal, coordinates), dim=1))
 
 
 def _gather_agent_cell(cell_values: torch.Tensor, observations: torch.Tensor) -> torch.Tensor:
@@ -749,7 +1366,7 @@ class SpatialQNetwork(nn.Module):
         super().__init__()
         _channels, _rows, _cols = input_shape
         hidden_channels = 64
-        self.trunk = SpatialTrunk(hidden_channels)
+        self.trunk = SpatialTrunk(input_shape, hidden_channels)
         self.value_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
         self.advantage_head = nn.Conv2d(hidden_channels, output_size, kernel_size=1)
 
@@ -820,7 +1437,7 @@ class MaskedActorCriticNetwork(nn.Module):
         super().__init__()
         _channels, _rows, _cols = input_shape
         hidden_channels = 64
-        self.trunk = SpatialTrunk(hidden_channels)
+        self.trunk = SpatialTrunk(input_shape, hidden_channels)
         self.policy_head = nn.Conv2d(hidden_channels, output_size, kernel_size=1)
         self.value_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
 
@@ -852,10 +1469,15 @@ class MouseAgent:
             self.config.view_size,
         )
         self._build_networks(self.network_type)
-        self.buffer = ReplayBuffer(self.observation_shape, self.config.buffer_size)
+        self.buffer = ReplayBuffer(
+            self.observation_shape,
+            self.config.buffer_size,
+            seed=self.config.seed,
+        )
         self.update_count = 0
         self.total_env_steps = 0
         self.best_greedy_solve_rate = -1.0
+        self.training_state: dict[str, object] = {}
 
     def _build_networks(self, network_type: str) -> None:
         self.network_type = network_type
@@ -925,8 +1547,27 @@ class MouseAgent:
         if len(self.buffer) < self.config.min_replay_size:
             return None
 
-        states, actions, rewards, next_states, dones, next_action_masks = self.buffer.sample(
-            self.config.batch_size
+        priority_progress = min(
+            self.total_env_steps / self.config.priority_beta_steps,
+            1.0,
+        )
+        priority_beta = self.config.priority_beta_start + (
+            1.0 - self.config.priority_beta_start
+        ) * priority_progress
+        (
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            next_action_masks,
+            replay_indices,
+            importance_weights,
+        ) = self.buffer.sample(
+            self.config.batch_size,
+            prioritized=self.config.prioritized_replay,
+            alpha=self.config.priority_alpha,
+            beta=priority_beta,
         )
         s = torch.as_tensor(states, dtype=torch.float32, device=self.device)
         a = torch.as_tensor(actions, dtype=torch.long, device=self.device).unsqueeze(1)
@@ -934,6 +1575,7 @@ class MouseAgent:
         ns = torch.as_tensor(next_states, dtype=torch.float32, device=self.device)
         d = torch.as_tensor(dones, dtype=torch.float32, device=self.device)
         next_masks = torch.as_tensor(next_action_masks, dtype=torch.bool, device=self.device)
+        weights = torch.as_tensor(importance_weights, dtype=torch.float32, device=self.device)
 
         q_values = self.online_net(s)
         q_a = q_values.gather(1, a).squeeze(1)
@@ -946,14 +1588,29 @@ class MouseAgent:
             bootstrap_discount = self.config.gamma ** self.config.n_step_returns
             target_q = r + bootstrap_discount * next_q * (1.0 - d)
 
-        loss = nn.SmoothL1Loss()(q_a, target_q)
+        td_errors = target_q - q_a
+        loss = (nn.functional.smooth_l1_loss(q_a, target_q, reduction="none") * weights).mean()
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
         self.optimizer.step()
 
+        if self.config.prioritized_replay:
+            self.buffer.update_priorities(
+                replay_indices,
+                td_errors.detach().abs().cpu().numpy() + 1e-6,
+            )
+
         self.update_count += 1
-        if self.update_count % self.config.target_update_freq == 0:
+        if self.config.target_tau > 0:
+            with torch.no_grad():
+                for target, online in zip(
+                    self.target_net.parameters(),
+                    self.online_net.parameters(),
+                    strict=True,
+                ):
+                    target.lerp_(online, self.config.target_tau)
+        elif self.update_count % self.config.target_update_freq == 0:
             self.target_net.load_state_dict(self.online_net.state_dict())
         return float(loss.item())
 
@@ -971,11 +1628,14 @@ class MouseAgent:
             "update_count": self.update_count,
             "total_env_steps": self.total_env_steps,
             "best_greedy_solve_rate": self.best_greedy_solve_rate,
+            "training_state": self.training_state,
         }
-        torch.save(payload, path)
+        if self.config.checkpoint_replay:
+            payload["replay_state"] = self.buffer.state_dict()
+        _atomic_torch_save(payload, path)
 
     def load(self, path: str) -> None:
-        payload = torch.load(path, map_location=self.device)
+        payload = torch.load(path, map_location=self.device, weights_only=False)
         state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
         if isinstance(payload, dict):
             network_type = payload.get("network_type") or infer_q_network_type(state_dict)
@@ -997,6 +1657,10 @@ class MouseAgent:
             self.best_greedy_solve_rate = float(
                 payload.get("best_greedy_solve_rate", self.best_greedy_solve_rate)
             )
+            self.training_state = dict(payload.get("training_state", {}))
+            replay_state = payload.get("replay_state")
+            if replay_state is not None:
+                self.buffer.load_state_dict(replay_state)
 
     @staticmethod
     def _normalize_action_masks(
@@ -1043,6 +1707,7 @@ class MaskedPPOAgent:
         self.update_count = 0
         self.total_env_steps = 0
         self.best_greedy_solve_rate = -1.0
+        self.training_state: dict[str, object] = {}
 
     def _logits_and_values(
         self,
@@ -1135,11 +1800,12 @@ class MaskedPPOAgent:
             "update_count": self.update_count,
             "total_env_steps": self.total_env_steps,
             "best_greedy_solve_rate": self.best_greedy_solve_rate,
+            "training_state": self.training_state,
         }
-        torch.save(payload, path)
+        _atomic_torch_save(payload, path)
 
     def load(self, path: str) -> None:
-        payload = torch.load(path, map_location=self.device)
+        payload = torch.load(path, map_location=self.device, weights_only=False)
         state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
         self.policy_net.load_state_dict(state_dict)
         if isinstance(payload, dict) and "optimizer_state_dict" in payload:
@@ -1150,9 +1816,89 @@ class MaskedPPOAgent:
             self.best_greedy_solve_rate = float(
                 payload.get("best_greedy_solve_rate", self.best_greedy_solve_rate)
             )
+            self.training_state = dict(payload.get("training_state", {}))
 
 
 Agent = MouseAgent | MaskedPPOAgent
+
+
+def collect_maze_expert_examples(
+    config: TrainConfig,
+    rng: random.Random,
+    maze_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Collect full-map observations and shortest-path targets from tasks.
+
+    The collector is deliberately isolated from DQN so another environment can
+    replace it with demonstrations implementing the same three returned arrays.
+    """
+
+    if maze_count < 1:
+        raise ValueError("maze_count must be >= 1")
+    states: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    for _ in range(maze_count):
+        environment = make_maze(config, rng=rng, episode=None)
+        for row, col in np.argwhere(environment.bfs_distances >= 0):
+            position = (int(row), int(col))
+            environment.current_position = position
+            states.append(environment.observation())
+            masks.append(environment.valid_action_mask(position))
+            targets.append(environment.expert_action_distribution(position))
+        environment.reset()
+    return (
+        np.stack(states).astype(np.float32),
+        np.stack(masks).astype(np.bool_),
+        np.stack(targets).astype(np.float32),
+    )
+
+
+def pretrain_with_expert(
+    agent: Agent,
+    config: TrainConfig,
+) -> float | None:
+    """Optionally initialize an agent from environment-provided demonstrations."""
+
+    if config.expert_pretrain_mazes == 0 or config.expert_pretrain_epochs == 0:
+        return None
+    if config.observation_mode != "full":
+        raise ValueError("expert pretraining currently requires full observations")
+    states, masks, targets = collect_maze_expert_examples(
+        config,
+        random.Random(config.seed + 17),
+        config.expert_pretrain_mazes,
+    )
+    rng = np.random.default_rng(config.seed + 31)
+    batch_size = min(config.batch_size, len(states))
+    losses: list[float] = []
+    for _ in range(config.expert_pretrain_epochs):
+        for indices in np.array_split(rng.permutation(len(states)), math.ceil(len(states) / batch_size)):
+            state_batch = torch.as_tensor(states[indices], dtype=torch.float32, device=agent.device)
+            mask_batch = torch.as_tensor(masks[indices], dtype=torch.bool, device=agent.device)
+            target_batch = torch.as_tensor(targets[indices], dtype=torch.float32, device=agent.device)
+            if isinstance(agent, MouseAgent):
+                logits = agent.online_net(state_batch)
+            else:
+                logits, _values = agent.policy_net(state_batch)
+            logits = logits.masked_fill(~mask_batch, -torch.inf)
+            log_probabilities = torch.log_softmax(logits, dim=1)
+            positive_targets = target_batch > 0
+            loss = -(
+                target_batch[positive_targets] * log_probabilities[positive_targets]
+            ).sum() / len(indices)
+            agent.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(
+                agent.online_net.parameters() if isinstance(agent, MouseAgent) else agent.policy_net.parameters(),
+                config.ppo_max_grad_norm if isinstance(agent, MaskedPPOAgent) else 10.0,
+            )
+            agent.optimizer.step()
+            agent.update_count += 1
+            losses.append(float(loss.item()))
+    if isinstance(agent, MouseAgent):
+        agent.target_net.load_state_dict(agent.online_net.state_dict())
+    return sum(losses) / len(losses)
 
 
 # ---------------------------------------------------------------------------
@@ -1238,9 +1984,18 @@ class MetricsTracker:
         return value
 
 
-def linear_epsilon(episode: int, config: TrainConfig) -> float:
-    progress = min(episode / max(config.epsilon_decay_episodes, 1), 1.0)
-    return config.epsilon_start + (config.epsilon_end - config.epsilon_start) * progress
+def linear_epsilon(total_env_steps: int, config: TrainConfig) -> float:
+    """Return the transition-indexed two-stage exploration rate."""
+
+    if total_env_steps <= config.epsilon_decay_steps:
+        progress = total_env_steps / config.epsilon_decay_steps
+        return config.epsilon_start + (config.epsilon_mid - config.epsilon_start) * progress
+    if total_env_steps <= config.epsilon_final_steps:
+        progress = (total_env_steps - config.epsilon_decay_steps) / (
+            config.epsilon_final_steps - config.epsilon_decay_steps
+        )
+        return config.epsilon_mid + (config.epsilon_end - config.epsilon_mid) * progress
+    return config.epsilon_end
 
 
 def build_n_step_transition(
@@ -1306,6 +2061,32 @@ def episode_stats_from_env(env: Maze) -> EpisodeStats:
     )
 
 
+def difficulty_bucket(optimal_steps: int) -> str:
+    """Map a task difficulty value into a stable benchmark bucket label."""
+
+    if optimal_steps <= 8:
+        return "1-8"
+    if optimal_steps <= 16:
+        return "9-16"
+    if optimal_steps <= 24:
+        return "17-24"
+    return "25+"
+
+
+def _wilson_lower_bound(successes: int, total: int, z_score: float = 1.96) -> float:
+    """Return a conservative two-sided 95% binomial lower confidence bound."""
+
+    if total < 1:
+        return 0.0
+    rate = successes / total
+    denominator = 1.0 + z_score**2 / total
+    centre = rate + z_score**2 / (2.0 * total)
+    spread = z_score * math.sqrt(
+        rate * (1.0 - rate) / total + z_score**2 / (4.0 * total**2)
+    )
+    return max(0.0, (centre - spread) / denominator)
+
+
 def _agent_greedy_actions(
     agent: Agent,
     states: np.ndarray,
@@ -1334,10 +2115,15 @@ def _eval_greedy(
     loop_episodes = 0
     repeated_state_action_episodes = 0
     failed_final_distances: list[float] = []
+    bucket_totals: dict[str, int] = {}
+    bucket_solves: dict[str, int] = {}
     eval_rng = random.Random(resolved_eval_seed(config))
     make_env = maze_factory or (lambda: make_maze(config, rng=eval_rng))
 
     envs = [make_env() for _ in range(config.eval_episodes)]
+    buckets = [difficulty_bucket(env.optimal_start_steps) for env in envs]
+    for bucket in buckets:
+        bucket_totals[bucket] = bucket_totals.get(bucket, 0) + 1
     states = [env.reset() for env in envs]
     active = np.ones(len(envs), dtype=np.bool_)
     position_traces = [[env.current_position] for env in envs]
@@ -1379,6 +2165,8 @@ def _eval_greedy(
                 if env.current_position == env.goal:
                     solved_steps.append(env.steps)
                     optimality.append(env.optimal_start_steps / max(env.steps, 1))
+                    bucket = buckets[env_idx]
+                    bucket_solves[bucket] = bucket_solves.get(bucket, 0) + 1
                 else:
                     timeouts += 1
                     loop_episodes += int(has_loop[env_idx])
@@ -1392,6 +2180,7 @@ def _eval_greedy(
     total = max(config.eval_episodes, 1)
     return EvalMetrics(
         solve_rate=len(solved_steps) / total,
+        solve_rate_lower_bound=_wilson_lower_bound(len(solved_steps), total),
         avg_steps=sum(solved_steps) / len(solved_steps) if solved_steps else 0.0,
         optimality_ratio=sum(optimality) / len(optimality) if optimality else 0.0,
         timeout_rate=timeouts / total,
@@ -1403,6 +2192,39 @@ def _eval_greedy(
             if failed_final_distances
             else 0.0
         ),
+        difficulty_solve_rates={
+            bucket: bucket_solves.get(bucket, 0) / count
+            for bucket, count in sorted(bucket_totals.items())
+        },
+    )
+
+
+def run_benchmark(
+    agent: Agent,
+    config: TrainConfig,
+    episodes: int = 2_000,
+) -> BenchmarkResult:
+    """Evaluate one policy on deterministic, disjoint benchmark suites."""
+
+    if episodes < 1:
+        raise ValueError("benchmark episodes must be >= 1")
+    root_seed = resolved_eval_seed(config)
+    suites = {
+        "validation": root_seed,
+        "final_test": root_seed + 1,
+        "stress_test": root_seed + 2,
+    }
+    metrics = {
+        name: _eval_greedy(
+            agent,
+            replace(config, eval_seed=seed, eval_episodes=episodes),
+        )
+        for name, seed in suites.items()
+    }
+    return BenchmarkResult(
+        validation=metrics["validation"],
+        final_test=metrics["final_test"],
+        stress_test=metrics["stress_test"],
     )
 
 
@@ -1906,9 +2728,10 @@ def _training_environment_payload(device: torch.device) -> dict[str, object]:
     }
 
 
-def _eval_metrics_payload(metrics: EvalMetrics) -> dict[str, float]:
+def _eval_metrics_payload(metrics: EvalMetrics) -> dict[str, object]:
     return {
         "solve_rate": metrics.solve_rate,
+        "solve_rate_lower_bound": metrics.solve_rate_lower_bound,
         "avg_steps": metrics.avg_steps,
         "optimality_ratio": metrics.optimality_ratio,
         "timeout_rate": metrics.timeout_rate,
@@ -1916,6 +2739,7 @@ def _eval_metrics_payload(metrics: EvalMetrics) -> dict[str, float]:
         "loop_rate": metrics.loop_rate,
         "repeated_state_action_rate": metrics.repeated_state_action_rate,
         "failed_final_distance": metrics.failed_final_distance,
+        "difficulty_solve_rates": metrics.difficulty_solve_rates or {},
     }
 
 
@@ -2110,7 +2934,7 @@ def create_agent(
 
 
 def checkpoint_algorithm(path: str) -> str:
-    payload = torch.load(path, map_location=torch.device("cpu"))
+    payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
     if isinstance(payload, dict):
         return str(payload.get("algorithm", "dqn"))
     return "dqn"
@@ -2124,6 +2948,77 @@ def ensure_agent_matches_config(agent: Agent, config: TrainConfig) -> None:
         )
 
 
+def _restore_rng_state(training_state: dict[str, object]) -> None:
+    """Restore process RNGs from an optional training checkpoint snapshot."""
+
+    if not training_state:
+        return
+    python_state = training_state.get("python_rng_state")
+    numpy_state = training_state.get("numpy_rng_state")
+    torch_state = training_state.get("torch_rng_state")
+    cuda_states = training_state.get("cuda_rng_states")
+    if python_state is not None:
+        random.setstate(python_state)
+    if isinstance(numpy_state, dict):
+        np.random.set_state(
+            (
+                str(numpy_state["bit_generator"]),
+                np.asarray(numpy_state["keys"], dtype=np.uint32),
+                int(numpy_state["position"]),
+                int(numpy_state["has_gauss"]),
+                float(numpy_state["cached_gaussian"]),
+            )
+        )
+    if torch_state is not None:
+        torch.set_rng_state(torch_state)
+    if cuda_states is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _serialized_numpy_rng_state() -> dict[str, object]:
+    """Return NumPy RNG state using only safe checkpoint value types."""
+
+    bit_generator, keys, position, has_gauss, cached_gaussian = np.random.get_state()
+    return {
+        "bit_generator": bit_generator,
+        "keys": keys.tolist(),
+        "position": int(position),
+        "has_gauss": int(has_gauss),
+        "cached_gaussian": float(cached_gaussian),
+    }
+
+
+def _update_training_state(
+    agent: Agent,
+    completed: int,
+    total_steps: int,
+    last_eval_step: int,
+    train_rng: random.Random,
+    update_budget: float = 0.0,
+    curriculum: CurriculumController | None = None,
+) -> None:
+    """Attach restart metadata immediately before a checkpoint can be saved."""
+
+    state: dict[str, object] = {
+        "completed_episodes": completed,
+        "total_steps": total_steps,
+        "last_eval_step": last_eval_step,
+        "update_budget": update_budget,
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": _serialized_numpy_rng_state(),
+        "torch_rng_state": torch.get_rng_state(),
+        "train_rng_state": train_rng.getstate(),
+    }
+    if torch.cuda.is_available():
+        state["cuda_rng_states"] = torch.cuda.get_rng_state_all()
+    if curriculum is not None:
+        state["curriculum"] = {
+            "level": curriculum.level,
+            "success_streak": curriculum.success_streak,
+        }
+    agent.training_state = state
+
+
 def _maybe_run_eval(
     agent: Agent,
     config: TrainConfig,
@@ -2134,21 +3029,24 @@ def _maybe_run_eval(
     epsilon: float,
     best_eval_rate: float,
     best_weights: dict[str, torch.Tensor] | None,
-    last_eval_episode: int,
+    last_eval_step: int,
     start_time: float,
     process_start_cpu: float,
+    on_evaluation: Callable[[EvalMetrics], None] | None = None,
 ) -> tuple[EvalMetrics | None, int, float, dict[str, torch.Tensor] | None]:
-    should_eval = completed > last_eval_episode and (
-        last_eval_episode == 0
+    should_eval = completed > 0 and (
+        last_eval_step == 0
         or completed >= config.episodes
-        or completed - last_eval_episode >= config.eval_every
+        or total_steps - last_eval_step >= config.eval_every_steps
     )
     if not should_eval:
-        return None, last_eval_episode, best_eval_rate, best_weights
+        return None, last_eval_step, best_eval_rate, best_weights
 
     greedy = _eval_greedy(agent, config)
     tracker.record_eval(greedy, completed)
-    last_eval_episode = completed
+    last_eval_step = total_steps
+    if on_evaluation is not None:
+        on_evaluation(greedy)
     is_new_best = False
     if greedy.solve_rate > best_eval_rate:
         is_new_best = True
@@ -2206,7 +3104,7 @@ def _maybe_run_eval(
                 process_start_cpu,
             ),
         )
-    return greedy, last_eval_episode, best_eval_rate, best_weights
+    return greedy, last_eval_step, best_eval_rate, best_weights
 
 
 def _maybe_draw_dashboard(
@@ -2276,7 +3174,7 @@ def _finish_training(
                 **_training_snapshot_payload(
                     completed,
                     total_steps,
-                    linear_epsilon(completed, config),
+                    linear_epsilon(total_steps, config),
                     agent,
                     tracker,
                     last_eval,
@@ -2297,7 +3195,7 @@ def _finish_training(
             **_training_snapshot_payload(
                 completed,
                 total_steps,
-                linear_epsilon(completed, config),
+                linear_epsilon(total_steps, config),
                 agent,
                 tracker,
                 last_eval,
@@ -2364,6 +3262,7 @@ def train(
     if config.save_path and os.path.exists(config.save_path) and config.resume:
         agent.load(config.save_path)
         resumed = True
+        _restore_rng_state(agent.training_state)
         print(f"[train] resumed weights from {config.save_path}")
         if logger.enabled:
             logger.log(
@@ -2387,6 +3286,18 @@ def train(
             agent_total_env_steps=agent.total_env_steps,
             best_greedy_solve_rate=agent.best_greedy_solve_rate,
         )
+
+    if not resumed:
+        expert_loss = pretrain_with_expert(agent, config)
+        if expert_loss is not None:
+            print(f"[train] expert pretraining complete | loss={expert_loss:.4f}")
+            if logger.enabled:
+                logger.log(
+                    "expert_pretrain",
+                    maze_count=config.expert_pretrain_mazes,
+                    epochs=config.expert_pretrain_epochs,
+                    loss=expert_loss,
+                )
 
     if config.algorithm == "dqn":
         assert isinstance(agent, MouseAgent)
@@ -2414,25 +3325,64 @@ def _train_dqn(
     start_time: float,
     process_start_cpu: float,
 ) -> MetricsTracker:
+    """Train DQN with a vectorized collector when the task supports it."""
+
+    if config.vectorized_envs and config.observation_mode == "full":
+        return _train_dqn_vectorized(
+            agent,
+            config,
+            logger,
+            start_time,
+            process_start_cpu,
+        )
+    return _train_dqn_sequential(
+        agent,
+        config,
+        logger,
+        start_time,
+        process_start_cpu,
+    )
+
+
+def _train_dqn_sequential(
+    agent: MouseAgent,
+    config: TrainConfig,
+    logger: _TrainingLogger,
+    start_time: float,
+    process_start_cpu: float,
+    initial_envs: list[object] | None = None,
+) -> MetricsTracker:
     tracker = MetricsTracker()
     dashboard = Dashboard() if config.dashboard_flag else None
     best_eval_rate = agent.best_greedy_solve_rate
     best_weights = clone_agent_weights(agent) if best_eval_rate >= 0.0 else None
 
-    env_count = min(config.num_envs, config.episodes)
+    saved_state = agent.training_state
+    completed = min(int(saved_state.get("completed_episodes", 0)), config.episodes)
+    total_steps = max(int(saved_state.get("total_steps", 0)), agent.total_env_steps)
+    last_eval_step = int(saved_state.get("last_eval_step", 0))
+    update_budget = float(saved_state.get("update_budget", 0.0))
+    env_count = min(config.num_envs, max(config.episodes - completed, 1))
     train_rng = random.Random(config.seed)
-    envs = [make_training_maze(config, train_rng, 1) for _ in range(env_count)]
+    if "train_rng_state" in saved_state:
+        train_rng.setstate(saved_state["train_rng_state"])
+    sampler = MazeTaskSampler(config, train_rng)
+    curriculum_state = saved_state.get("curriculum")
+    if isinstance(curriculum_state, dict):
+        sampler.curriculum.level = int(curriculum_state.get("level", 0))
+        sampler.curriculum.success_streak = int(curriculum_state.get("success_streak", 0))
+    envs = initial_envs or [
+        make_training_maze(config, train_rng, completed + 1, sampler=sampler)
+        for _ in range(env_count)
+    ]
     states = [env.reset() for env in envs]
     n_step_queues: list[deque[RawTransition]] = [deque() for _ in envs]
 
-    completed = 0
-    total_steps = 0
     last_eval = EvalMetrics()
-    last_eval_episode = 0
     last_dashboard_episode = -config.dashboard_every
 
     while completed < config.episodes:
-        epsilon = linear_epsilon(completed, config)
+        epsilon = linear_epsilon(total_steps, config)
         state_batch = np.stack(states)
         action_masks = np.stack([env.valid_action_mask() for env in envs])
         actions = agent.get_actions(
@@ -2441,6 +3391,7 @@ def _train_dqn(
             action_masks=action_masks,
         )
 
+        collected_steps = 0
         for idx, env in enumerate(envs):
             if completed >= config.episodes:
                 break
@@ -2460,6 +3411,7 @@ def _train_dqn(
             store_ready_n_step_transition(agent, n_step_queues[idx], config)
             total_steps += 1
             agent.total_env_steps += 1
+            collected_steps += 1
             states[idx] = next_state
 
             if done:
@@ -2467,13 +3419,33 @@ def _train_dqn(
                 completed += 1
                 tracker.record_episode(episode_stats_from_env(env), completed)
                 if completed < config.episodes:
-                    envs[idx] = make_training_maze(config, train_rng, completed + 1)
+                    envs[idx] = make_training_maze(
+                        config,
+                        train_rng,
+                        completed + 1,
+                        sampler=sampler,
+                    )
                     states[idx] = envs[idx].reset()
 
-        for _ in range(config.train_updates_per_step):
-            tracker.record_loss(agent.train_step(), completed)
+        if total_steps >= config.warmup_steps:
+            update_budget += collected_steps * config.updates_per_transition
+            while update_budget >= 1.0:
+                tracker.record_loss(agent.train_step(), completed)
+                update_budget -= 1.0
 
-        eval_result, last_eval_episode, best_eval_rate, best_weights = _maybe_run_eval(
+        def record_evaluation(metrics: EvalMetrics) -> None:
+            sampler.curriculum.record_validation(metrics)
+            _update_training_state(
+                agent,
+                completed,
+                total_steps,
+                total_steps,
+                train_rng,
+                update_budget,
+                sampler.curriculum,
+            )
+
+        eval_result, last_eval_step, best_eval_rate, best_weights = _maybe_run_eval(
             agent,
             config,
             logger,
@@ -2483,9 +3455,10 @@ def _train_dqn(
             epsilon,
             best_eval_rate,
             best_weights,
-            last_eval_episode,
+            last_eval_step,
             start_time,
             process_start_cpu,
+            on_evaluation=record_evaluation,
         )
         if eval_result is not None:
             last_eval = eval_result
@@ -2504,6 +3477,178 @@ def _train_dqn(
             last_dashboard_episode,
         )
 
+    _update_training_state(
+        agent,
+        completed,
+        total_steps,
+        last_eval_step,
+        train_rng,
+        update_budget,
+        sampler.curriculum,
+    )
+    return _finish_training(
+        agent,
+        config,
+        logger,
+        tracker,
+        dashboard,
+        completed,
+        total_steps,
+        last_eval,
+        best_eval_rate,
+        best_weights,
+        start_time,
+        process_start_cpu,
+    )
+
+
+def _train_dqn_vectorized(
+    agent: MouseAgent,
+    config: TrainConfig,
+    logger: _TrainingLogger,
+    start_time: float,
+    process_start_cpu: float,
+) -> MetricsTracker:
+    """Train DQN with batched full-map Maze transitions and transition clocks."""
+
+    tracker = MetricsTracker()
+    dashboard = Dashboard() if config.dashboard_flag else None
+    best_eval_rate = agent.best_greedy_solve_rate
+    best_weights = clone_agent_weights(agent) if best_eval_rate >= 0.0 else None
+    saved_state = agent.training_state
+    completed = min(int(saved_state.get("completed_episodes", 0)), config.episodes)
+    total_steps = max(int(saved_state.get("total_steps", 0)), agent.total_env_steps)
+    last_eval_step = int(saved_state.get("last_eval_step", 0))
+    update_budget = float(saved_state.get("update_budget", 0.0))
+    train_rng = random.Random(config.seed)
+    if "train_rng_state" in saved_state:
+        train_rng.setstate(saved_state["train_rng_state"])
+    sampler = MazeTaskSampler(config, train_rng)
+    curriculum_state = saved_state.get("curriculum")
+    if isinstance(curriculum_state, dict):
+        sampler.curriculum.level = int(curriculum_state.get("level", 0))
+        sampler.curriculum.success_streak = int(curriculum_state.get("success_streak", 0))
+
+    remaining_episodes = max(config.episodes - completed, 1)
+    env_count = min(config.num_envs, remaining_episodes)
+    environments = [
+        make_training_maze(config, train_rng, completed + 1, sampler=sampler)
+        for _ in range(env_count)
+    ]
+    if not all(isinstance(environment, Maze) for environment in environments):
+        return _train_dqn_sequential(
+            agent,
+            config,
+            logger,
+            start_time,
+            process_start_cpu,
+            initial_envs=environments,
+        )
+    environment_batch = MazeBatch(environments)
+    states = environment_batch.observations()
+    n_step_queues: list[deque[RawTransition]] = [deque() for _ in range(env_count)]
+    last_eval = EvalMetrics()
+    last_dashboard_episode = -config.dashboard_every
+
+    while completed < config.episodes:
+        epsilon = linear_epsilon(total_steps, config)
+        action_masks = environment_batch.valid_action_masks()
+        actions = agent.get_actions(states, epsilon=epsilon, action_masks=action_masks)
+        step_result = environment_batch.step(actions)
+        next_states = step_result.states
+
+        for index in range(env_count):
+            n_step_queues[index].append(
+                (
+                    states[index],
+                    int(actions[index]),
+                    float(step_result.rewards[index]),
+                    next_states[index],
+                    bool(step_result.dones[index]),
+                    step_result.action_masks[index],
+                )
+            )
+            store_ready_n_step_transition(agent, n_step_queues[index], config)
+            if not step_result.dones[index]:
+                continue
+            flush_n_step_transitions(agent, n_step_queues[index], config)
+            if completed >= config.episodes:
+                continue
+            completed += 1
+            tracker.record_episode(environment_batch.episode_stats(index), completed)
+            if completed < config.episodes:
+                replacement = make_training_maze(
+                    config,
+                    train_rng,
+                    completed + 1,
+                    sampler=sampler,
+                )
+                environment_batch.replace(index, replacement)
+
+        collected_steps = env_count
+        total_steps += collected_steps
+        agent.total_env_steps += collected_steps
+        if total_steps >= config.warmup_steps:
+            update_budget += collected_steps * config.updates_per_transition
+            while update_budget >= 1.0:
+                tracker.record_loss(agent.train_step(), completed)
+                update_budget -= 1.0
+
+        states = environment_batch.observations()
+
+        def record_evaluation(metrics: EvalMetrics) -> None:
+            sampler.curriculum.record_validation(metrics)
+            _update_training_state(
+                agent,
+                completed,
+                total_steps,
+                total_steps,
+                train_rng,
+                update_budget,
+                sampler.curriculum,
+            )
+
+        eval_result, last_eval_step, best_eval_rate, best_weights = _maybe_run_eval(
+            agent,
+            config,
+            logger,
+            tracker,
+            completed,
+            total_steps,
+            epsilon,
+            best_eval_rate,
+            best_weights,
+            last_eval_step,
+            start_time,
+            process_start_cpu,
+            on_evaluation=record_evaluation,
+        )
+        if eval_result is not None:
+            last_eval = eval_result
+
+        last_dashboard_episode = _maybe_draw_dashboard(
+            dashboard,
+            completed,
+            total_steps,
+            epsilon,
+            agent,
+            config,
+            tracker,
+            last_eval,
+            best_eval_rate,
+            start_time,
+            last_dashboard_episode,
+        )
+
+    _update_training_state(
+        agent,
+        completed,
+        total_steps,
+        last_eval_step,
+        train_rng,
+        update_budget,
+        sampler.curriculum,
+    )
     return _finish_training(
         agent,
         config,
@@ -2615,15 +3760,26 @@ def _train_ppo(
     best_eval_rate = agent.best_greedy_solve_rate
     best_weights = clone_agent_weights(agent) if best_eval_rate >= 0.0 else None
 
-    env_count = min(config.num_envs, config.episodes)
+    saved_state = agent.training_state
+    completed = min(int(saved_state.get("completed_episodes", 0)), config.episodes)
+    total_steps = max(int(saved_state.get("total_steps", 0)), agent.total_env_steps)
+    last_eval_step = int(saved_state.get("last_eval_step", 0))
+    env_count = min(config.num_envs, max(config.episodes - completed, 1))
     train_rng = random.Random(config.seed)
-    envs = [make_training_maze(config, train_rng, 1) for _ in range(env_count)]
+    if "train_rng_state" in saved_state:
+        train_rng.setstate(saved_state["train_rng_state"])
+    sampler = MazeTaskSampler(config, train_rng)
+    curriculum_state = saved_state.get("curriculum")
+    if isinstance(curriculum_state, dict):
+        sampler.curriculum.level = int(curriculum_state.get("level", 0))
+        sampler.curriculum.success_streak = int(curriculum_state.get("success_streak", 0))
+    envs = [
+        make_training_maze(config, train_rng, completed + 1, sampler=sampler)
+        for _ in range(env_count)
+    ]
     states = [env.reset() for env in envs]
 
-    completed = 0
-    total_steps = 0
     last_eval = EvalMetrics()
-    last_eval_episode = 0
     last_dashboard_episode = -config.dashboard_every
 
     while completed < config.episodes:
@@ -2662,7 +3818,12 @@ def _train_ppo(
                     completed += 1
                     tracker.record_episode(episode_stats_from_env(env), completed)
                     if completed < config.episodes:
-                        envs[idx] = make_training_maze(config, train_rng, completed + 1)
+                        envs[idx] = make_training_maze(
+                            config,
+                            train_rng,
+                            completed + 1,
+                            sampler=sampler,
+                        )
                         states[idx] = envs[idx].reset()
 
             rollout_rewards.append(rewards)
@@ -2702,7 +3863,18 @@ def _train_ppo(
         tracker.record_loss(loss, completed)
 
         epsilon = 0.0
-        eval_result, last_eval_episode, best_eval_rate, best_weights = _maybe_run_eval(
+        def record_evaluation(metrics: EvalMetrics) -> None:
+            sampler.curriculum.record_validation(metrics)
+            _update_training_state(
+                agent,
+                completed,
+                total_steps,
+                total_steps,
+                train_rng,
+                curriculum=sampler.curriculum,
+            )
+
+        eval_result, last_eval_step, best_eval_rate, best_weights = _maybe_run_eval(
             agent,
             config,
             logger,
@@ -2712,9 +3884,10 @@ def _train_ppo(
             epsilon,
             best_eval_rate,
             best_weights,
-            last_eval_episode,
+            last_eval_step,
             start_time,
             process_start_cpu,
+            on_evaluation=record_evaluation,
         )
         if eval_result is not None:
             last_eval = eval_result
@@ -2733,6 +3906,14 @@ def _train_ppo(
             last_dashboard_episode,
         )
 
+    _update_training_state(
+        agent,
+        completed,
+        total_steps,
+        last_eval_step,
+        train_rng,
+        curriculum=sampler.curriculum,
+    )
     return _finish_training(
         agent,
         config,
@@ -2846,23 +4027,25 @@ def _draw_cheese_icon(pg, screen, center_x: int, center_y: int, cell_size: int) 
 
 
 def visualize_inference(
-    agent: MouseAgent,
+    agent: Agent | Planner,
     maze_grid: np.ndarray,
     fps: int = 5,
     observation_mode: str | None = None,
+    config: TrainConfig | None = None,
 ) -> None:
-    """Render greedy inference on a single maze."""
+    """Render learned-policy or planner inference on a single maze."""
 
     import pygame
 
-    mode = observation_mode or agent.observation_mode
+    agent_config = config or getattr(agent, "config", TrainConfig())
+    mode = observation_mode or agent_config.observation_mode
     env = Maze(
         maze_grid.copy(),
         observation_mode=mode,
-        view_size=agent.view_size,
-        max_episode_steps=agent.config.max_episode_steps,
-        timeout_step_factor=agent.config.timeout_step_factor,
-        min_episode_steps=agent.config.min_episode_steps,
+        view_size=getattr(agent, "view_size", agent_config.view_size),
+        max_episode_steps=agent_config.max_episode_steps,
+        timeout_step_factor=agent_config.timeout_step_factor,
+        min_episode_steps=agent_config.min_episode_steps,
     )
 
     os.environ["SDL_VIDEO_CENTERED"] = "1"
@@ -2883,11 +4066,8 @@ def visualize_inference(
 
     trail = [env.start]
     state = env.reset()
-    q_vals = agent.q_values(state)
     action_mask = env.valid_action_mask()
-    masked_q_vals = q_vals.copy()
-    masked_q_vals[~action_mask] = -np.inf
-    action = int(np.argmax(masked_q_vals))
+    action, q_vals = _inference_action(agent, state, action_mask)
     done = False
     last_blocked = False
 
@@ -2945,13 +4125,18 @@ def visualize_inference(
         hud_y = rows * cell_size
         pygame.draw.rect(screen, (226, 230, 235), (0, hud_y, window_w, hud_h))
         action_name, arrow = Maze.ACTION_NAMES[action]
-        best_action = int(np.argmax(masked_q_vals))
-        best_name, best_arrow = Maze.ACTION_NAMES[best_action]
         blocked = " blocked" if last_blocked else ""
-        hud = (
-            f"Steps {env.steps:>3} | Last {action_name} {arrow}{blocked} | "
-            f"Q-max {best_name} {best_arrow} ({q_vals[best_action]:.2f}) | {mode}"
-        )
+        if q_vals is None:
+            hud = f"Steps {env.steps:>3} | Planner {action_name} {arrow}{blocked} | {mode}"
+        else:
+            masked_q_vals = q_vals.copy()
+            masked_q_vals[~action_mask] = -np.inf
+            best_action = int(np.argmax(masked_q_vals))
+            best_name, best_arrow = Maze.ACTION_NAMES[best_action]
+            hud = (
+                f"Steps {env.steps:>3} | Last {action_name} {arrow}{blocked} | "
+                f"Q-max {best_name} {best_arrow} ({q_vals[best_action]:.2f}) | {mode}"
+            )
         screen.blit(font.render(hud, True, (30, 35, 42)), (8, hud_y + 11))
         pygame.display.flip()
         clock.tick(fps)
@@ -2963,15 +4148,29 @@ def visualize_inference(
         next_state, _reward, done, step_info = env.step(action)
         last_blocked = not bool(step_info["moved"])
         state = next_state
-        q_vals = agent.q_values(state)
         action_mask = env.valid_action_mask()
-        masked_q_vals = q_vals.copy()
-        masked_q_vals[~action_mask] = -np.inf
-        action = int(np.argmax(masked_q_vals))
+        action, q_vals = _inference_action(agent, state, action_mask)
 
     label = "SOLVED" if env.current_position == env.goal else "TIMEOUT"
     print(f"Steps: {env.steps} -- {label}")
     pygame.quit()
+
+
+def _inference_action(
+    policy: Agent | Planner,
+    state: np.ndarray,
+    action_mask: np.ndarray,
+) -> tuple[int, np.ndarray | None]:
+    """Choose a legal action and optionally return learned action values."""
+
+    q_values = getattr(policy, "q_values", None)
+    if callable(q_values):
+        values = q_values(state)
+        masked_values = values.copy()
+        masked_values[~action_mask] = -np.inf
+        return int(np.argmax(masked_values)), values
+    actions = policy.get_actions(state, action_masks=action_mask)
+    return int(actions[0]), None
 
 
 # ---------------------------------------------------------------------------
@@ -3044,10 +4243,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=None)
     parser.add_argument("--n-step-returns", type=int, default=None)
     parser.add_argument("--epsilon-start", type=float, default=None)
+    parser.add_argument("--epsilon-mid", type=float, default=None)
     parser.add_argument("--epsilon-end", type=float, default=None)
     parser.add_argument("--epsilon-decay-episodes", type=int, default=None)
+    parser.add_argument("--epsilon-decay-steps", type=int, default=None)
+    parser.add_argument("--epsilon-final-steps", type=int, default=None)
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--train-updates-per-step", type=int, default=None)
+    parser.add_argument("--updates-per-transition", type=float, default=None)
+    parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument("--target-tau", type=float, default=None)
+    parser.add_argument(
+        "--prioritized-replay",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--priority-alpha", type=float, default=None)
+    parser.add_argument("--priority-beta-start", type=float, default=None)
+    parser.add_argument("--priority-beta-steps", type=int, default=None)
     parser.add_argument("--ppo-rollout-steps", type=int, default=None)
     parser.add_argument("--ppo-epochs", type=int, default=None)
     parser.add_argument("--ppo-clip-range", type=float, default=None)
@@ -3057,7 +4270,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ppo-max-grad-norm", type=float, default=None)
     parser.add_argument("--eval-episodes", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None)
+    parser.add_argument("--eval-every-steps", type=int, default=None)
     parser.add_argument("--dashboard-every", type=int, default=None)
+    parser.add_argument("--curriculum-promotion-rate", type=float, default=None)
+    parser.add_argument("--curriculum-promotion-evals", type=int, default=None)
+    parser.add_argument("--curriculum-previous-fraction", type=float, default=None)
+    parser.add_argument("--curriculum-uniform-fraction", type=float, default=None)
+    parser.add_argument(
+        "--vectorized-envs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--checkpoint-replay",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--expert-pretrain-mazes", type=int, default=None)
+    parser.add_argument("--expert-pretrain-epochs", type=int, default=None)
+    parser.add_argument(
+        "--planner-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the exact full-map planner for inference instead of the learned policy.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Evaluate the saved policy on disjoint deterministic suites and exit.",
+    )
+    parser.add_argument("--benchmark-episodes", type=int, default=2_000)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
     parser.add_argument(
         "--require-cuda",
@@ -3124,10 +4366,20 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "gamma",
         "n_step_returns",
         "epsilon_start",
+        "epsilon_mid",
         "epsilon_end",
         "epsilon_decay_episodes",
+        "epsilon_decay_steps",
+        "epsilon_final_steps",
         "num_envs",
         "train_updates_per_step",
+        "updates_per_transition",
+        "warmup_steps",
+        "target_tau",
+        "prioritized_replay",
+        "priority_alpha",
+        "priority_beta_start",
+        "priority_beta_steps",
         "ppo_rollout_steps",
         "ppo_epochs",
         "ppo_clip_range",
@@ -3137,7 +4389,17 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "ppo_max_grad_norm",
         "eval_episodes",
         "eval_every",
+        "eval_every_steps",
         "dashboard_every",
+        "curriculum_promotion_rate",
+        "curriculum_promotion_evals",
+        "curriculum_previous_fraction",
+        "curriculum_uniform_fraction",
+        "vectorized_envs",
+        "checkpoint_replay",
+        "expert_pretrain_mazes",
+        "expert_pretrain_epochs",
+        "planner_fallback",
         "dashboard_flag",
         "save_path",
         "training_log_path",
@@ -3163,6 +4425,29 @@ def main(argv: list[str] | None = None) -> None:
     expected_shape = observation_shape(config.maze_size, config.observation_mode, config.view_size)
     agent = create_agent(config, expected_shape, device)
 
+    if args.benchmark:
+        if not config.save_path or not os.path.exists(config.save_path):
+            raise FileNotFoundError("--benchmark requires an existing --save-path checkpoint")
+        checkpoint_algo = checkpoint_algorithm(config.save_path)
+        if checkpoint_algo != agent.algorithm:
+            values = {field_.name: getattr(config, field_.name) for field_ in fields(config)}
+            values["algorithm"] = checkpoint_algo
+            config = TrainConfig(**values)
+            agent = create_agent(config, expected_shape, device)
+        agent.load(config.save_path)
+        result = run_benchmark(agent, config, episodes=args.benchmark_episodes)
+        print(
+            json.dumps(
+                {
+                    "validation": _eval_metrics_payload(result.validation),
+                    "final_test": _eval_metrics_payload(result.final_test),
+                    "stress_test": _eval_metrics_payload(result.stress_test),
+                },
+                sort_keys=True,
+            )
+        )
+        return
+
     if _optional_bool(args.train_flag, DEFAULT_TRAIN_FLAG):
         train(agent=agent, config=config)
     elif config.save_path and os.path.exists(config.save_path):
@@ -3177,7 +4462,13 @@ def main(argv: list[str] | None = None) -> None:
     if _optional_bool(args.infer_flag, DEFAULT_INFER_FLAG):
         maze_grid = generate_random_maze(config.maze_size[0], config.maze_size[1])
         print("Inference on a fresh maze:")
-        visualize_inference(agent, maze_grid.copy(), observation_mode=config.observation_mode)
+        inference_policy: Agent | Planner = BfsPlanner() if config.planner_fallback else agent
+        visualize_inference(
+            inference_policy,
+            maze_grid.copy(),
+            observation_mode=config.observation_mode,
+            config=config,
+        )
 
 
 if __name__ == "__main__":
