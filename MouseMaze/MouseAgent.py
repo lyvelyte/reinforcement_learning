@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
+import os
 import pygame
 import time
 from collections import deque
@@ -646,15 +647,27 @@ def _draw_cheese_icon(screen, center_x, center_y, cell_size):
 # ---------------------------------------------------------------------------
 def visualize_inference(agent, maze_grid, fps=15):
     env = Maze(maze_grid.copy())
+
+    # Centre the window on screen (must be set *before* pygame.init).
+    os.environ["SDL_VIDEO_CENTERED"] = "1"
     pygame.init()
+    info = pygame.display.Info()
     rows, cols = env.grid.shape[0], env.grid.shape[1]
-    # Scale so the window comfortably fits a standard monitor regardless of
-    # what pygame reports (WSLg virtual desktops can be misleadingly large).
-    max_window_px = 960           # hard cap; ~⅔ of a 1080p screen
-    cell_size = max(4, min(max_window_px // max(rows, cols), 40))
-    width = cols * cell_size
-    height = rows * cell_size
-    screen = pygame.display.set_mode((width, height))
+
+    hud_h = 36                                                    # status bar at bottom
+    window_h = info.current_h // 2                                 # half display height
+    raw_cell_size = (window_h - hud_h) // max(rows, cols)         # fill vertical space
+    cell_size = max(4, min(raw_cell_size, 80))                    # keep it readable
+    # Safety net: WSLg may report a huge virtual desktop; cap the window so it
+    # never overflows an actual physical monitor.
+    SAFE_MAX_H = 860
+    while rows * cell_size + hud_h > SAFE_MAX_H and cell_size > 4:
+        cell_size -= 1
+    # Tight fit around content (maze grid + HUD bar).
+    window_w = cols * cell_size
+    window_h_safe = rows * cell_size + hud_h
+
+    screen = pygame.display.set_mode((window_w, window_h_safe))
     pygame.display.set_caption("Mouse Maze - Inference")
     clock = pygame.time.Clock()
 
@@ -710,11 +723,12 @@ def visualize_inference(agent, maze_grid, fps=15):
         )
 
         # Trail
+        inset = max(2, cell_size // 5)
         for r, c in trail[:-1]:
             pygame.draw.rect(
                 screen, (80, 80, 220),
-                (c * cell_size + 5, r * cell_size + 5,
-                 cell_size - 10, cell_size - 10),
+                (c * cell_size + inset, r * cell_size + inset,
+                 cell_size - 2 * inset, cell_size - 2 * inset),
                 1,
             )
 
@@ -725,8 +739,8 @@ def visualize_inference(agent, maze_grid, fps=15):
         )
 
         # --- HUD: step count + last action ---
-        hud_h = 28
-        pygame.draw.rect(screen, (200, 200, 210), (0, height - hud_h, width, hud_h))
+        hud_y = rows * cell_size
+        pygame.draw.rect(screen, (200, 200, 210), (0, hud_y, window_w, hud_h))
         hud_font = pygame.font.SysFont("mono", 16)
 
         action_name, arrow = Maze.ACTION_NAMES[action]
@@ -739,7 +753,7 @@ def visualize_inference(agent, maze_grid, fps=15):
             f"  |  Q-max: [{best_name} {best_arrow}] ({q_vals[best_action]:.2f})"
         )
         hud_surf = hud_font.render(hud_text, True, (30, 30, 40))
-        screen.blit(hud_surf, (8, height - hud_h + 2))
+        screen.blit(hud_surf, (8, hud_y + 2))
 
         pygame.display.flip()
         clock.tick(fps)
