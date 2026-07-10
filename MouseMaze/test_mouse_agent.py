@@ -26,6 +26,7 @@ from MouseAgent import (
     MaskedPPOAgent,
     MetricsTracker,
     MouseAgent,
+    RNDModule,
     RecurrentPPOAgent,
     SumTree,
     ReplayBuffer,
@@ -1453,6 +1454,19 @@ def test_local_recurrent_agent_uses_rnd_without_distance_shaping():
     assert bonuses.shape == (2, 1)
     assert torch.isfinite(bonuses).all()
     assert (bonuses >= 0).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_rnd_running_variance_uses_configured_cuda_device():
+    device = torch.device("cuda")
+    rnd = RNDModule((4, 5, 5), device)
+    observations = torch.zeros((2, 1, 4, 5, 5), device=device)
+
+    bonuses = rnd.bonus_and_update(observations, clip=5.0)
+
+    assert rnd.error_variance.device == observations.device
+    assert bonuses.device == observations.device
+    assert torch.isfinite(bonuses).all()
 
 
 def test_prefetched_generation_is_seed_deterministic():

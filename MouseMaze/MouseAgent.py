@@ -52,7 +52,7 @@ DEFAULT_EPISODES = 1_000_000
 # Seed used for training maze generation and other random operations.
 DEFAULT_SEED = 0
 # Observation representation used by default for training and inference.
-DEFAULT_OBSERVATION_MODE = "full"
+DEFAULT_OBSERVATION_MODE = "local"
 # Agent algorithm selected when no checkpoint metadata or CLI override exists.
 DEFAULT_ALGORITHM = "recurrent_ppo"
 # Network layout used by default for algorithms that support both layouts.
@@ -101,7 +101,7 @@ DEFAULT_PRIORITY_BETA_START = 0.4
 # Number of transitions over which replay correction reaches full strength.
 DEFAULT_PRIORITY_BETA_STEPS = 1_500_000
 # Hard cap on steps in one maze episode.
-MAX_EPISODE_STEPS = 200
+MAX_EPISODE_STEPS = 300
 # Multiplier used to derive a maze-size-aware timeout when enabled.
 DEFAULT_TIMEOUT_STEP_FACTOR = 4.0
 # Minimum episode length used by timeout and curriculum safeguards.
@@ -127,9 +127,9 @@ DEFAULT_DEVICE = "auto"
 # Whether a missing CUDA device should be treated as an error in auto mode.
 DEFAULT_REQUIRE_CUDA = True
 # Training is opt-in so launching the script does not alter a checkpoint.
-DEFAULT_TRAIN_FLAG = False
+DEFAULT_TRAIN_FLAG = True
 # Inference is enabled by default after optional training/checkpoint loading.
-DEFAULT_INFER_FLAG = True
+DEFAULT_INFER_FLAG = False
 # Number of fresh mazes rendered for inference; zero means run indefinitely.
 DEFAULT_INFERENCE_MAZES = 0
 
@@ -2308,17 +2308,18 @@ class RNDModule(nn.Module):
             nn.Linear(input_size, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
-        ).to(device)
+        )
         self.predictor = nn.Sequential(
             nn.Flatten(),
             nn.Linear(input_size, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
-        ).to(device)
+        )
         for parameter in self.target.parameters():
             parameter.requires_grad_(False)
-        self.optimizer = optim.Adam(self.predictor.parameters(), lr=1e-4)
         self.register_buffer("error_variance", torch.ones(()))
+        self.to(device)
+        self.optimizer = optim.Adam(self.predictor.parameters(), lr=1e-4)
 
     def bonus_and_update(self, observations: torch.Tensor, clip: float) -> torch.Tensor:
         bonuses: list[torch.Tensor] = []
