@@ -1,6 +1,8 @@
 import json
 import random
 from collections import deque
+from dataclasses import fields
+from datetime import datetime, timezone
 
 import numpy as np
 import pytest
@@ -37,6 +39,11 @@ from MouseAgent import (
     _optional_bool,
     _rects_overlap,
     _train_config_from_args,
+    _training_environment_payload,
+    default_artifact_paths,
+    invocation_timestamp,
+    latest_model_path,
+    resolve_cli_artifacts,
     build_n_step_transition,
     curriculum_distance_range,
     dashboard_layout,
@@ -718,6 +725,60 @@ def test_cli_omitted_args_use_top_level_train_config_defaults():
     assert args.inference_mazes == DEFAULT_INFERENCE_MAZES
 
 
+def test_default_artifacts_share_timestamp_and_use_results_folders():
+    timestamp = invocation_timestamp(
+        datetime(2026, 7, 10, 12, 34, 56, 123456, tzinfo=timezone.utc)
+    )
+    model_path, log_path = default_artifact_paths(timestamp)
+
+    assert timestamp == "20260710T123456123456Z"
+    assert model_path.endswith(f"results/models/{timestamp}_mousemaze.pth")
+    assert log_path.endswith(f"results/logs/{timestamp}_mousemaze.jsonl")
+
+
+def test_cli_artifact_resolution_honors_explicit_paths():
+    args = parse_args(
+        [
+            "--train",
+            "--save-path",
+            "chosen/model.pth",
+            "--training-log-path",
+            "chosen/log.jsonl",
+        ]
+    )
+    config = resolve_cli_artifacts(
+        _train_config_from_args(args), args, "20260710T123456123456Z"
+    )
+
+    assert config.save_path == "chosen/model.pth"
+    assert config.training_log_path == "chosen/log.jsonl"
+
+
+def test_latest_model_path_is_deterministic_and_ignores_unrelated_files(tmp_path):
+    older = tmp_path / "20260710T123456000001Z_mousemaze.pth"
+    newer = tmp_path / "20260710T123456000002Z_mousemaze.pth"
+    unrelated = (tmp_path / "latest_mousemaze.pth", tmp_path / "notes.txt")
+    for path in (newer, older, *unrelated):
+        path.write_text("test")
+
+    assert latest_model_path(str(tmp_path)) == str(newer)
+
+
+def test_latest_model_path_reports_actionable_error(tmp_path):
+    with pytest.raises(FileNotFoundError, match="pass --save-path explicitly"):
+        latest_model_path(str(tmp_path))
+
+
+def test_environment_provenance_tolerates_unavailable_git(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(mouse_agent_module.subprocess, "run", unavailable)
+    payload = _training_environment_payload(torch.device("cpu"))
+
+    assert payload["git"] == {"commit": None, "branch": None, "dirty": None}
+
+
 def test_cli_inference_maze_count_accepts_finite_and_infinite_values():
     assert parse_args(["--inference-mazes", "4"]).inference_mazes == 4
     assert parse_args(["--inference-mazes", "infinite"]).inference_mazes == 0
@@ -1211,7 +1272,15 @@ def test_training_writes_jsonl_log_with_metrics_speed_and_utilization(tmp_path):
     assert "eval" in events
     assert events[-1] == "train_end"
     assert records[0]["config"]["episodes"] == 1
+    assert set(records[0]["config"]) == {field.name for field in fields(config)}
+    assert records[0]["artifact_timestamp"]
+    assert records[0]["artifact_paths"]["log"] == str(log_path)
     assert records[0]["environment"]["selected_device"] == "cpu"
+    assert "command_line" in records[0]["environment"]
+    assert "working_directory" in records[0]["environment"]
+    assert "hostname" in records[0]["environment"]
+    assert "packages" in records[0]["environment"]
+    assert "git" in records[0]["environment"]
     assert "metrics" in eval_record
     assert "greedy" in eval_record
     assert "steps_per_second" in eval_record["speed"]

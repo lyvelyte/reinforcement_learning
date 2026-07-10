@@ -30,9 +30,7 @@ Full-map training, capped at three million transitions:
 conda run -n ml python MouseMaze/MouseAgent.py \
   --train --no-infer --no-dashboard \
   --algorithm recurrent_ppo --observation-mode full \
-  --performance-profile rtx3090-fast --max-env-steps 3000000 \
-  --save-path MouseMaze/agent_weights_v2.pth \
-  --training-log-path MouseMaze/training_log_v2.jsonl
+  --performance-profile rtx3090-fast --max-env-steps 3000000
 ```
 
 Local 7×7 training, capped at five million transitions:
@@ -41,10 +39,14 @@ Local 7×7 training, capped at five million transitions:
 conda run -n ml python MouseMaze/MouseAgent.py \
   --train --no-infer --no-dashboard \
   --algorithm recurrent_ppo --observation-mode local --view-size 7 \
-  --performance-profile rtx3090-fast --max-env-steps 5000000 \
-  --save-path MouseMaze/local_agent_weights_v2.pth \
-  --training-log-path MouseMaze/local_training_log_v2.jsonl
+  --performance-profile rtx3090-fast --max-env-steps 5000000
 ```
+
+Each training invocation uses one UTC timestamp for paired artifacts under
+`MouseMaze/results/models/` and `MouseMaze/results/logs/`. The JSONL log records
+the full resolved configuration, runtime and Git provenance, training metrics,
+evaluation results, utilization, and checkpoint events. Explicit `--save-path`
+and `--training-log-path` values are honored exactly.
 
 For deterministic debugging, replace the performance profile with `strict`
 and normally reduce `--num-envs`.
@@ -55,8 +57,7 @@ Render one fresh maze with the saved policy (the default is one maze):
 
 ```bash
 conda run -n ml python MouseMaze/MouseAgent.py \
-  --no-train --inference-mazes 1 \
-  --save-path MouseMaze/agent_weights_v2.pth
+  --no-train --inference-mazes 1
 ```
 
 Render several fresh mazes in sequence, or use `0`/`infinite` to continue
@@ -64,12 +65,10 @@ until the inference window is closed:
 
 ```bash
 conda run -n ml python MouseMaze/MouseAgent.py \
-  --no-train --inference-mazes 10 \
-  --save-path MouseMaze/agent_weights_v2.pth
+  --no-train --inference-mazes 10
 
 conda run -n ml python MouseMaze/MouseAgent.py \
-  --no-train --inference-mazes infinite \
-  --save-path MouseMaze/agent_weights_v2.pth
+  --no-train --inference-mazes infinite
 ```
 
 Run the three deterministic held-out suites without training:
@@ -77,13 +76,15 @@ Run the three deterministic held-out suites without training:
 ```bash
 conda run -n ml python MouseMaze/MouseAgent.py \
   --no-train --no-infer --benchmark --benchmark-episodes 2000 \
-  --algorithm recurrent_ppo --observation-mode full \
-  --save-path MouseMaze/agent_weights_v2.pth
+  --algorithm recurrent_ppo --observation-mode full
 ```
 
-Checkpoints use schema v2. Earlier `agent_weights*.pth` files and their JSONL
-logs remain archived experiments and are intentionally rejected by the new
-loader.
+Inference and benchmark commands without `--save-path` select the newest valid
+timestamped model. Pass an explicit path to load an archived or specific model.
+
+Checkpoints use schema v2. Earlier root-level `agent_weights*.pth` files and
+their JSONL logs remain archived experiments; compatible checkpoints can still
+be loaded with an explicit path.
 
 The exact full-map BFS planner remains available only as an environment sanity
 check:

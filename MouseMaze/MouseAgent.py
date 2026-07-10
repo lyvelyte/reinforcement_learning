@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.metadata
 import json
 import math
 import multiprocessing
 import os
 import platform
 import random
+import socket
 import subprocess
+import sys
 import time
 import uuid
 from collections import deque
@@ -115,10 +118,10 @@ EVAL_SEED_OFFSET = 1_000_003
 DEFAULT_DASHBOARD_FLAG = True
 # Number of episodes between dashboard refreshes.
 DEFAULT_DASHBOARD_EVERY = EVAL_PERIOD
-# Default checkpoint file written and loaded by the CLI.
-DEFAULT_SAVE_PATH = "agent_weights_v2.pth"
-# Default JSONL file receiving training metrics.
-DEFAULT_TRAINING_LOG_PATH = "training_log_v2.jsonl"
+# Checkpoint path before the CLI assigns an invocation-specific default.
+DEFAULT_SAVE_PATH = None
+# Training-log path before the CLI assigns an invocation-specific default.
+DEFAULT_TRAINING_LOG_PATH = None
 # Device selection mode; auto chooses CUDA when it is available.
 DEFAULT_DEVICE = "auto"
 # Whether a missing CUDA device should be treated as an error in auto mode.
@@ -128,7 +131,13 @@ DEFAULT_TRAIN_FLAG = False
 # Inference is enabled by default after optional training/checkpoint loading.
 DEFAULT_INFER_FLAG = True
 # Number of fresh mazes rendered for inference; zero means run indefinitely.
-DEFAULT_INFERENCE_MAZES = 1
+DEFAULT_INFERENCE_MAZES = 0
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
+MODEL_RESULTS_DIR = os.path.join(RESULTS_DIR, "models")
+LOG_RESULTS_DIR = os.path.join(RESULTS_DIR, "logs")
+ARTIFACT_BASENAME = "mousemaze"
 
 # Small per-step reward encouraging shorter solutions.
 STEP_PENALTY = -0.05
@@ -3440,6 +3449,74 @@ def _rects_overlap(a: Rect, b: Rect) -> bool:
 # ---------------------------------------------------------------------------
 # Training log
 # ---------------------------------------------------------------------------
+def invocation_timestamp(now: datetime | None = None) -> str:
+    """Return a precise, filesystem-safe UTC timestamp for run artifacts."""
+
+    instant = now or datetime.now(timezone.utc)
+    return instant.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def default_artifact_paths(timestamp: str) -> tuple[str, str]:
+    """Return paired default model and log paths for an invocation."""
+
+    filename = f"{timestamp}_{ARTIFACT_BASENAME}"
+    return (
+        os.path.join(MODEL_RESULTS_DIR, f"{filename}.pth"),
+        os.path.join(LOG_RESULTS_DIR, f"{filename}.jsonl"),
+    )
+
+
+def latest_model_path(model_directory: str = MODEL_RESULTS_DIR) -> str:
+    """Return the latest timestamp-named MouseMaze model in a directory."""
+
+    suffix = f"_{ARTIFACT_BASENAME}.pth"
+    candidates: list[str] = []
+    try:
+        for name in os.listdir(model_directory):
+            if not name.endswith(suffix):
+                continue
+            timestamp = name[: -len(suffix)]
+            try:
+                datetime.strptime(timestamp, "%Y%m%dT%H%M%S%fZ")
+            except ValueError:
+                continue
+            candidates.append(os.path.join(model_directory, name))
+    except FileNotFoundError:
+        pass
+    candidates.sort()
+    if not candidates:
+        raise FileNotFoundError(
+            "no timestamped MouseMaze model found in "
+            f"{model_directory!r}; train a model or pass --save-path explicitly"
+        )
+    return candidates[-1]
+
+
+def resolve_cli_artifacts(
+    config: TrainConfig,
+    args: argparse.Namespace,
+    timestamp: str,
+) -> TrainConfig:
+    """Resolve invocation-specific CLI artifact paths without changing overrides."""
+
+    values = {field_.name: getattr(config, field_.name) for field_ in fields(config)}
+    default_model, default_log = default_artifact_paths(timestamp)
+    training = _optional_bool(args.train_flag, DEFAULT_TRAIN_FLAG)
+    if training:
+        if args.save_path is None:
+            values["save_path"] = default_model
+        if args.training_log_path is None:
+            values["training_log_path"] = default_log
+    inference = _optional_bool(args.infer_flag, DEFAULT_INFER_FLAG)
+    if (
+        not training
+        and args.save_path is None
+        and (args.benchmark or (inference and not config.planner_fallback))
+    ):
+        values["save_path"] = latest_model_path()
+    return TrainConfig(**values)
+
+
 class _TrainingLogger:
     """Append-only JSONL logger for later training analysis."""
 
@@ -3480,6 +3557,43 @@ def _train_config_payload(config: TrainConfig) -> dict[str, object]:
     return {field_.name: getattr(config, field_.name) for field_ in fields(config)}
 
 
+def _safe_command_output(command: list[str], *, allow_empty: bool = False) -> str | None:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    output = result.stdout.strip()
+    return output if output or allow_empty else None
+
+
+def _package_versions() -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for package in ("numpy", "torch", "pygame", "psutil"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
+def _git_provenance() -> dict[str, object]:
+    status = _safe_command_output(
+        ["git", "status", "--porcelain"], allow_empty=True
+    )
+    return {
+        "commit": _safe_command_output(["git", "rev-parse", "HEAD"]),
+        "branch": _safe_command_output(["git", "branch", "--show-current"]),
+        "dirty": None if status is None else bool(status),
+    }
+
+
 def _training_environment_payload(device: torch.device) -> dict[str, object]:
     cuda_available = torch.cuda.is_available()
     cuda_devices = torch.cuda.device_count() if cuda_available else 0
@@ -3493,6 +3607,12 @@ def _training_environment_payload(device: torch.device) -> dict[str, object]:
         "cuda_devices": cuda_devices,
         "selected_device": str(device),
         "gpu_name": gpu_name,
+        "hostname": socket.gethostname(),
+        "process_id": os.getpid(),
+        "command_line": sys.argv,
+        "working_directory": os.getcwd(),
+        "packages": _package_versions(),
+        "git": _git_provenance(),
     }
 
 
@@ -3991,6 +4111,7 @@ def train(
     dashboard_flag: bool | None = None,
     training_log_path: str | None = None,
     config: TrainConfig | None = None,
+    run_timestamp: str | None = None,
 ) -> MetricsTracker:
     """Train a MouseMaze agent and return the collected metrics."""
 
@@ -4007,6 +4128,7 @@ def train(
     resolved_profile = configure_performance(config.performance_profile, device)
     config.performance_profile = resolved_profile
     logger = _TrainingLogger(config.training_log_path)
+    run_timestamp = run_timestamp or invocation_timestamp()
     start_time = time.perf_counter()
     process_start_cpu = time.process_time()
     print(f"[train] {device_diagnostics(device)}")
@@ -4047,6 +4169,11 @@ def train(
     if logger.enabled:
         logger.log(
             "train_start",
+            artifact_timestamp=run_timestamp,
+            artifact_paths={
+                "model": config.save_path,
+                "log": config.training_log_path,
+            },
             config=_train_config_payload(config),
             environment=_training_environment_payload(device),
             checkpoint_path=config.save_path,
@@ -5858,6 +5985,8 @@ def _optional_bool(value: bool | None, default: bool) -> bool:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     config = _train_config_from_args(args)
+    run_timestamp = invocation_timestamp()
+    config = resolve_cli_artifacts(config, args, run_timestamp)
     device = select_device(config.device, config.require_cuda)
     config.performance_profile = configure_performance(config.performance_profile, device)
     expected_shape = observation_shape(config.maze_size, config.observation_mode, config.view_size)
@@ -5887,7 +6016,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if _optional_bool(args.train_flag, DEFAULT_TRAIN_FLAG):
-        train(agent=agent, config=config)
+        train(agent=agent, config=config, run_timestamp=run_timestamp)
     elif config.save_path and os.path.exists(config.save_path):
         checkpoint_algo = checkpoint_algorithm(config.save_path)
         if checkpoint_algo != agent.algorithm:
