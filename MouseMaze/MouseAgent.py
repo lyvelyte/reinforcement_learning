@@ -58,7 +58,7 @@ DEFAULT_ALGORITHM = "recurrent_ppo"
 # Network layout used by default for algorithms that support both layouts.
 DEFAULT_NETWORK_TYPE = "spatial"
 # Whether training resumes from the checkpoint instead of starting fresh.
-DEFAULT_RESUME = True
+DEFAULT_RESUME = False
 # Whether recurrent PPO ignores episode and transition caps until it reaches its target.
 DEFAULT_TARGET_ONLY_STOP: bool | None = None
 
@@ -160,6 +160,9 @@ DEFAULT_CURRICULUM_ENABLED = True
 DEFAULT_CURRICULUM_EASY_RANGE = (6, 10)
 # Goal-distance range used for the medium curriculum stage.
 DEFAULT_CURRICULUM_MEDIUM_RANGE = (8, 16)
+# Episode cutoffs retained for callers of the legacy episode-indexed helper.
+LEGACY_CURRICULUM_EASY_EPISODES = 5_000
+LEGACY_CURRICULUM_MEDIUM_EPISODES = 15_000
 # Maximum attempts to generate a maze matching a requested difficulty.
 DEFAULT_CURRICULUM_MAX_RETRIES = 200
 # Validation solve rate required before promoting curriculum difficulty.
@@ -1247,6 +1250,26 @@ def _bfs_distances_from_observation(
     return distances
 
 
+def curriculum_distance_range(
+    config: TrainConfig,
+    episode: int | None,
+) -> tuple[int, int] | None:
+    """Return a size-scaled legacy curriculum range for a training episode.
+
+    New training uses :class:`CurriculumController`; this helper remains for
+    callers that rely on a deterministic episode-indexed schedule.
+    """
+
+    if not config.curriculum_enabled or episode is None:
+        return None
+    scale = max(config.maze_size) / max(DEFAULT_MAZE_SIZE)
+    if episode <= LEGACY_CURRICULUM_EASY_EPISODES:
+        return _scale_distance_range(config.curriculum_easy_range, scale)
+    if episode <= LEGACY_CURRICULUM_MEDIUM_EPISODES:
+        return _scale_distance_range(config.curriculum_medium_range, scale)
+    return None
+
+
 def _scale_distance_range(
     value: tuple[int, int],
     scale: float,
@@ -1460,7 +1483,8 @@ def make_maze(
     episode: int | None = None,
     target_range: tuple[int, int] | None = None,
 ) -> Maze:
-    del episode
+    if target_range is None:
+        target_range = curriculum_distance_range(config, episode)
     if target_range is None:
         grid = generate_random_maze(config.maze_size[0], config.maze_size[1], rng=rng)
         return _maze_from_grid(config, grid)
@@ -5492,35 +5516,266 @@ def _print_progress(
 # ---------------------------------------------------------------------------
 # Inference visualization
 # ---------------------------------------------------------------------------
-def _draw_mouse_icon(pg, screen, center_x: int, center_y: int, cell_size: int) -> None:
-    cx, cy = center_x + cell_size // 2, center_y + cell_size // 2
-    body_r = cell_size // 4
-    head_r = cell_size // 5
-    pg.draw.circle(screen, (160, 160, 160), (cx, cy + 2), body_r)
-    pg.draw.circle(screen, (160, 160, 160), (cx, cy - body_r + 2), head_r)
-    ear_r = max(2, cell_size // 8)
-    pg.draw.circle(screen, (220, 180, 180), (cx - head_r // 2, cy - body_r), ear_r)
-    pg.draw.circle(screen, (220, 180, 180), (cx + head_r // 2, cy - body_r), ear_r)
-    eye_r = max(1, cell_size // 16)
-    pg.draw.circle(screen, (0, 0, 0), (cx - 3, cy - body_r), eye_r)
-    pg.draw.circle(screen, (0, 0, 0), (cx + 3, cy - body_r), eye_r)
-    tail_points = [
-        (cx + body_r, cy + 2),
-        (cx + body_r + cell_size // 4, cy - cell_size // 6),
-        (cx + body_r + cell_size // 3, cy - cell_size // 3),
+@dataclass(frozen=True, slots=True)
+class InferenceLayout:
+    """Pixel geometry for a responsive inference frame."""
+
+    maze_rect: Rect
+    hud_rect: Rect
+    cell_size: int
+
+
+def inference_layout(
+    window_size: tuple[int, int],
+    maze_shape: tuple[int, int],
+) -> InferenceLayout:
+    """Fit a centered, square-celled maze above a two-line status HUD."""
+
+    width, height = (max(1, int(value)) for value in window_size)
+    rows, cols = (int(value) for value in maze_shape)
+    if rows <= 0 or cols <= 0:
+        raise ValueError("maze dimensions must be positive")
+
+    margin = max(4, min(16, min(width, height) // 30))
+    hud_height = max(44, min(68, height // 7))
+    hud_y = max(margin, height - hud_height - margin)
+    available_width = max(1, width - margin * 2)
+    available_height = max(1, hud_y - margin * 2)
+    cell_size = max(
+        1,
+        min(80, available_width // cols, available_height // rows),
+    )
+    maze_width = cols * cell_size
+    maze_height = rows * cell_size
+    maze_x = max(0, (width - maze_width) // 2)
+    maze_y = margin + max(0, (available_height - maze_height) // 2)
+    return InferenceLayout(
+        maze_rect=(maze_x, maze_y, maze_width, maze_height),
+        hud_rect=(margin, hud_y, max(1, width - margin * 2), hud_height),
+        cell_size=cell_size,
+    )
+
+
+def local_observation_bounds(
+    position: tuple[int, int],
+    view_size: int,
+    maze_shape: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Return clipped, exclusive grid bounds for a centered local observation."""
+
+    if view_size <= 0 or view_size % 2 == 0:
+        raise ValueError("view_size must be a positive odd integer")
+    rows, cols = maze_shape
+    half = view_size // 2
+    top = max(0, position[0] - half)
+    left = max(0, position[1] - half)
+    bottom = min(rows, position[0] + half + 1)
+    right = min(cols, position[1] + half + 1)
+    return top, left, bottom, right
+
+
+def _draw_start_icon(pg, screen, cell_x: int, cell_y: int, cell_size: int) -> None:
+    """Draw a scalable start marker that remains visible under the mouse."""
+
+    cx = cell_x + cell_size // 2
+    cy = cell_y + cell_size // 2
+    radius = max(1, cell_size * 2 // 5)
+    outline = max(1, cell_size // 18)
+    pg.draw.circle(screen, (50, 112, 72), (cx, cy), radius)
+    pg.draw.circle(screen, (126, 221, 148), (cx, cy), max(1, radius - outline))
+    if cell_size < 10:
+        return
+    pole_x = cx - cell_size // 8
+    pole_top = cy - cell_size // 4
+    pole_bottom = cy + cell_size // 4
+    pg.draw.line(
+        screen,
+        (244, 249, 242),
+        (pole_x, pole_top),
+        (pole_x, pole_bottom),
+        max(1, cell_size // 14),
+    )
+    flag = [
+        (pole_x, pole_top),
+        (pole_x + cell_size // 3, pole_top + cell_size // 10),
+        (pole_x, cy),
     ]
-    pg.draw.lines(screen, (220, 180, 180), False, tail_points, 2)
+    pg.draw.polygon(screen, (250, 253, 248), flag)
+
+
+def _draw_mouse_icon(pg, screen, center_x: int, center_y: int, cell_size: int) -> None:
+    cx = center_x + cell_size // 2
+    cy = center_y + cell_size // 2
+    outline = max(1, cell_size // 18)
+    fur = (174, 181, 190)
+    dark_fur = (75, 82, 91)
+    pink = (235, 157, 170)
+    if cell_size < 12:
+        pg.draw.circle(screen, dark_fur, (cx, cy), max(1, cell_size // 3))
+        pg.draw.circle(screen, fur, (cx, cy), max(1, cell_size // 3 - 1))
+        return
+
+    tail_rect = (
+        center_x + cell_size // 16,
+        center_y + cell_size // 3,
+        cell_size // 2,
+        cell_size // 2,
+    )
+    pg.draw.arc(screen, pink, tail_rect, math.pi * 0.7, math.pi * 1.8, outline)
+    pg.draw.line(
+        screen,
+        pink,
+        (center_x + cell_size // 5, cy + cell_size // 5),
+        (center_x + cell_size // 3, cy + cell_size // 4),
+        outline,
+    )
+    body_rect = (
+        center_x + cell_size // 5,
+        center_y + cell_size * 2 // 5,
+        cell_size * 3 // 5,
+        cell_size * 2 // 5,
+    )
+    pg.draw.ellipse(screen, dark_fur, body_rect)
+    inner_body = (
+        body_rect[0] + outline,
+        body_rect[1] + outline,
+        max(1, body_rect[2] - outline * 2),
+        max(1, body_rect[3] - outline * 2),
+    )
+    pg.draw.ellipse(screen, fur, inner_body)
+
+    head_center = (cx + cell_size // 7, cy - cell_size // 8)
+    head_radius = max(2, cell_size // 4)
+    ear_radius = max(2, cell_size // 8)
+    for ear_center in (
+        (head_center[0] - cell_size // 8, head_center[1] - cell_size // 5),
+        (head_center[0] + cell_size // 8, head_center[1] - cell_size // 5),
+    ):
+        pg.draw.circle(screen, dark_fur, ear_center, ear_radius)
+        pg.draw.circle(screen, pink, ear_center, max(1, ear_radius - outline))
+    pg.draw.circle(screen, dark_fur, head_center, head_radius)
+    pg.draw.circle(screen, fur, head_center, max(1, head_radius - outline))
+
+    eye = (head_center[0] + cell_size // 10, head_center[1] - cell_size // 16)
+    nose = (head_center[0] + head_radius - outline, head_center[1] + cell_size // 16)
+    pg.draw.circle(screen, (25, 28, 32), eye, max(1, cell_size // 24))
+    pg.draw.circle(screen, (92, 44, 55), nose, max(1, cell_size // 22))
+    whisker_length = cell_size // 5
+    for offset in (-cell_size // 16, cell_size // 16):
+        pg.draw.line(
+            screen,
+            (75, 82, 91),
+            (nose[0] - outline, nose[1] + offset),
+            (nose[0] + whisker_length, nose[1] + offset * 2),
+            1,
+        )
 
 
 def _draw_cheese_icon(pg, screen, center_x: int, center_y: int, cell_size: int) -> None:
-    cx, cy = center_x + cell_size // 2, center_y + cell_size // 2
-    half = cell_size // 3
-    points = [(cx, cy - half), (cx - half, cy + half // 2), (cx + half, cy + half // 2)]
-    pg.draw.polygon(screen, (255, 200, 0), points)
-    hole_r = max(1, cell_size // 10)
-    pg.draw.circle(screen, (200, 150, 0), (cx - 4, cy - 2), hole_r)
-    pg.draw.circle(screen, (200, 150, 0), (cx + 4, cy + 2), hole_r)
-    pg.draw.circle(screen, (200, 150, 0), (cx, cy + 5), max(1, hole_r // 2))
+    cx = center_x + cell_size // 2
+    cy = center_y + cell_size // 2
+    half = max(1, cell_size * 3 // 8)
+    outline = max(1, cell_size // 18)
+    points = [
+        (cx - half, cy + half // 2),
+        (cx + half, cy + half // 2),
+        (cx + half // 2, cy - half),
+    ]
+    pg.draw.polygon(screen, (127, 83, 12), points)
+    if cell_size < 8:
+        return
+    inner = [
+        (cx - half + outline, cy + half // 2 - outline),
+        (cx + half - outline, cy + half // 2 - outline),
+        (cx + half // 2, cy - half + outline * 2),
+    ]
+    pg.draw.polygon(screen, (255, 201, 45), inner)
+    rind_y = cy + half // 3
+    pg.draw.line(
+        screen,
+        (226, 145, 20),
+        (cx - half + outline, rind_y),
+        (cx + half - outline, rind_y),
+        max(1, cell_size // 12),
+    )
+    hole_radius = max(1, cell_size // 12)
+    for hole_x, hole_y, scale in (
+        (cx, cy - cell_size // 8, 1),
+        (cx + cell_size // 5, cy + cell_size // 10, 1),
+        (cx - cell_size // 5, cy + cell_size // 8, 0),
+    ):
+        pg.draw.circle(
+            screen,
+            (202, 128, 12),
+            (hole_x, hole_y),
+            max(1, hole_radius - scale),
+        )
+
+
+def _initial_inference_window(pg, rows: int, cols: int) -> tuple[int, int]:
+    """Choose a useful initial size while staying within the active display."""
+
+    info = pg.display.Info()
+    display_width = info.current_w if info.current_w > 0 else 1280
+    display_height = info.current_h if info.current_h > 0 else 720
+    target_cell = max(16, min(48, (display_height // 2 - 96) // max(rows, 1)))
+    width = max(360, cols * target_cell + 32)
+    height = max(260, rows * target_cell + 100)
+    return min(width, max(320, display_width - 80)), min(
+        height,
+        max(240, display_height - 80),
+    )
+
+
+def _draw_local_observation_highlight(
+    pg,
+    screen,
+    layout: InferenceLayout,
+    position: tuple[int, int],
+    view_size: int,
+    maze_shape: tuple[int, int],
+) -> None:
+    """Dim cells outside the policy's current local observation footprint."""
+
+    maze_x, maze_y, maze_width, maze_height = layout.maze_rect
+    cell_size = layout.cell_size
+    top, left, bottom, right = local_observation_bounds(
+        position,
+        view_size,
+        maze_shape,
+    )
+    visible_rect = (
+        left * cell_size,
+        top * cell_size,
+        (right - left) * cell_size,
+        (bottom - top) * cell_size,
+    )
+    overlay = pg.Surface((maze_width, maze_height), pg.SRCALPHA)
+    overlay.fill((12, 17, 23, 168))
+    overlay.fill((0, 0, 0, 0), visible_rect)
+    screen.blit(overlay, (maze_x, maze_y))
+    border_rect = (
+        maze_x + visible_rect[0],
+        maze_y + visible_rect[1],
+        visible_rect[2],
+        visible_rect[3],
+    )
+    pg.draw.rect(
+        screen,
+        (75, 167, 232),
+        border_rect,
+        width=max(1, min(4, cell_size // 8)),
+    )
+
+
+def _fitted_font(pg, text: str, maximum_width: int, preferred_size: int):
+    """Return a readable font whose rendered text fits the HUD width."""
+
+    for size in range(preferred_size, 9, -1):
+        font = pg.font.SysFont("arial", size)
+        if font.size(text)[0] <= maximum_width:
+            return font
+    return pg.font.SysFont("arial", 10)
 
 
 def visualize_inference(
@@ -5547,19 +5802,11 @@ def visualize_inference(
 
     os.environ["SDL_VIDEO_CENTERED"] = "1"
     pygame.init()
-    info = pygame.display.Info()
     rows, cols = env.grid.shape
-    hud_h = 42
-    raw_cell_size = (info.current_h // 2 - hud_h) // max(rows, cols)
-    cell_size = max(4, min(raw_cell_size, 80))
-    while rows * cell_size + hud_h > 860 and cell_size > 4:
-        cell_size -= 1
-    window_w = cols * cell_size
-    window_h = rows * cell_size + hud_h
-    screen = pygame.display.set_mode((window_w, window_h))
+    window_size = _initial_inference_window(pygame, rows, cols)
+    screen = pygame.display.set_mode(window_size, pygame.RESIZABLE)
     pygame.display.set_caption("MouseMaze Inference")
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont("arial", 16)
 
     trail = [env.start]
     state = env.reset()
@@ -5587,68 +5834,140 @@ def visualize_inference(
             if event.type == pygame.QUIT:
                 pygame.quit()
                 return False
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                pygame.quit()
+                return False
+            if event.type == pygame.VIDEORESIZE:
+                resized = (max(320, event.w), max(240, event.h))
+                screen = pygame.display.set_mode(resized, pygame.RESIZABLE)
 
-        screen.fill((247, 248, 245))
+        window_w, window_h = screen.get_size()
+        layout = inference_layout((window_w, window_h), (rows, cols))
+        maze_x, maze_y, maze_width, maze_height = layout.maze_rect
+        cell_size = layout.cell_size
+        screen.fill((26, 31, 38))
+        pygame.draw.rect(
+            screen,
+            (239, 242, 237),
+            layout.maze_rect,
+            border_radius=max(0, min(7, cell_size // 5)),
+        )
         for r in range(rows):
             for c in range(cols):
+                cell_rect = (
+                    maze_x + c * cell_size,
+                    maze_y + r * cell_size,
+                    cell_size,
+                    cell_size,
+                )
                 if env.grid[r, c] == 1:
                     pygame.draw.rect(
                         screen,
                         (25, 28, 32),
-                        (c * cell_size, r * cell_size, cell_size, cell_size),
+                        cell_rect,
                     )
+                elif cell_size >= 14:
+                    pygame.draw.rect(screen, (218, 224, 217), cell_rect, width=1)
 
-        pygame.draw.rect(
+        _draw_start_icon(
+            pygame,
             screen,
-            (142, 214, 128),
-            (env.start[1] * cell_size, env.start[0] * cell_size, cell_size, cell_size),
+            maze_x + env.start[1] * cell_size,
+            maze_y + env.start[0] * cell_size,
+            cell_size,
         )
         _draw_cheese_icon(
             pygame,
             screen,
-            env.goal[1] * cell_size,
-            env.goal[0] * cell_size,
+            maze_x + env.goal[1] * cell_size,
+            maze_y + env.goal[0] * cell_size,
             cell_size,
         )
 
-        inset = max(2, cell_size // 5)
+        inset = max(1, cell_size // 4)
         for r, c in trail[:-1]:
-            pygame.draw.rect(
+            trail_rect = (
+                maze_x + c * cell_size + inset,
+                maze_y + r * cell_size + inset,
+                max(1, cell_size - 2 * inset),
+                max(1, cell_size - 2 * inset),
+            )
+            pygame.draw.ellipse(
                 screen,
-                (76, 128, 224),
-                (
-                    c * cell_size + inset,
-                    r * cell_size + inset,
-                    cell_size - 2 * inset,
-                    cell_size - 2 * inset,
-                ),
-                1,
+                (91, 142, 222),
+                trail_rect,
+                max(1, cell_size // 24),
             )
 
         _draw_mouse_icon(
             pygame,
             screen,
-            env.current_position[1] * cell_size,
-            env.current_position[0] * cell_size,
+            maze_x + env.current_position[1] * cell_size,
+            maze_y + env.current_position[0] * cell_size,
             cell_size,
         )
+        if mode == "local":
+            _draw_local_observation_highlight(
+                pygame,
+                screen,
+                layout,
+                env.current_position,
+                env.view_size,
+                env.grid.shape,
+            )
 
-        hud_y = rows * cell_size
-        pygame.draw.rect(screen, (226, 230, 235), (0, hud_y, window_w, hud_h))
+        hud_x, hud_y, hud_width, hud_height = layout.hud_rect
+        pygame.draw.rect(
+            screen,
+            (231, 235, 240),
+            layout.hud_rect,
+            border_radius=max(3, min(8, hud_height // 7)),
+        )
         action_name, arrow = Maze.ACTION_NAMES[action]
         blocked = " blocked" if last_blocked else ""
+        outcome = ""
+        if done:
+            outcome = " | SOLVED" if env.current_position == env.goal else " | TIMEOUT"
+        view_status = f"{mode} observation"
+        if mode == "local":
+            view_status += f" ({env.view_size}x{env.view_size} highlighted)"
+        status_line = f"Steps {env.steps:>3} | {view_status}{outcome}"
         if q_vals is None:
-            hud = f"Steps {env.steps:>3} | Planner {action_name} {arrow}{blocked} | {mode}"
+            action_line = f"Planner action: {action_name} {arrow}{blocked}"
         else:
             masked_q_vals = q_vals.copy()
             masked_q_vals[~action_mask] = -np.inf
             best_action = int(np.argmax(masked_q_vals))
             best_name, best_arrow = Maze.ACTION_NAMES[best_action]
-            hud = (
-                f"Steps {env.steps:>3} | Last {action_name} {arrow}{blocked} | "
-                f"Q-max {best_name} {best_arrow} ({q_vals[best_action]:.2f}) | {mode}"
+            action_line = (
+                f"Last action: {action_name} {arrow}{blocked} | "
+                f"Q-max: {best_name} {best_arrow} ({q_vals[best_action]:.2f})"
             )
-        screen.blit(font.render(hud, True, (30, 35, 42)), (8, hud_y + 11))
+        text_width = max(1, hud_width - 20)
+        preferred_font_size = max(12, min(17, hud_height // 3))
+        status_font = _fitted_font(
+            pygame,
+            status_line,
+            text_width,
+            preferred_font_size,
+        )
+        action_font = _fitted_font(
+            pygame,
+            action_line,
+            text_width,
+            preferred_font_size,
+        )
+        line_gap = max(1, hud_height // 14)
+        total_text_height = status_font.get_linesize() + action_font.get_linesize() + line_gap
+        text_y = hud_y + max(3, (hud_height - total_text_height) // 2)
+        screen.blit(
+            status_font.render(status_line, True, (30, 35, 42)),
+            (hud_x + 10, text_y),
+        )
+        screen.blit(
+            action_font.render(action_line, True, (72, 82, 94)),
+            (hud_x + 10, text_y + status_font.get_linesize() + line_gap),
+        )
         pygame.display.flip()
         clock.tick(fps)
 

@@ -33,6 +33,9 @@ from MouseAgent import (
     TrainConfig,
     _chart_x_max,
     _dashboard_tooltip_at,
+    _draw_cheese_icon,
+    _draw_mouse_icon,
+    _draw_start_icon,
     _episode_tick_values,
     _eval_greedy,
     _format_chart_tick,
@@ -49,7 +52,9 @@ from MouseAgent import (
     build_n_step_transition,
     curriculum_distance_range,
     dashboard_layout,
+    inference_layout,
     linear_epsilon,
+    local_observation_bounds,
     make_maze,
     parse_args,
     pretrain_with_expert,
@@ -70,6 +75,64 @@ def fixed_grid():
         ],
         dtype=np.uint8,
     )
+
+
+@pytest.mark.parametrize(
+    ("window_size", "maze_shape"),
+    [
+        ((1200, 500), (11, 21)),
+        ((500, 900), (21, 11)),
+        ((240, 180), (11, 11)),
+        ((1600, 1200), (5, 9)),
+    ],
+)
+def test_inference_layout_centers_square_cells_within_viewport(
+    window_size,
+    maze_shape,
+):
+    layout = inference_layout(window_size, maze_shape)
+    maze_x, maze_y, maze_width, maze_height = layout.maze_rect
+    hud_x, hud_y, hud_width, hud_height = layout.hud_rect
+    rows, cols = maze_shape
+
+    assert layout.cell_size >= 1
+    assert layout.cell_size <= 80
+    assert maze_width == cols * layout.cell_size
+    assert maze_height == rows * layout.cell_size
+    assert 0 <= maze_x
+    assert 0 <= maze_y
+    assert maze_x + maze_width <= window_size[0]
+    assert maze_y + maze_height <= hud_y
+    assert abs((maze_x + maze_width / 2) - window_size[0] / 2) <= 0.5
+    assert hud_x >= 0
+    assert hud_y + hud_height <= window_size[1]
+    assert hud_width > 0
+
+
+def test_local_observation_bounds_cover_center_and_clip_at_edges():
+    assert local_observation_bounds((5, 5), 7, (11, 11)) == (2, 2, 9, 9)
+    assert local_observation_bounds((1, 1), 7, (11, 11)) == (0, 0, 5, 5)
+    assert local_observation_bounds((9, 9), 7, (11, 11)) == (6, 6, 11, 11)
+
+    with pytest.raises(ValueError, match="positive odd"):
+        local_observation_bounds((1, 1), 6, (11, 11))
+
+
+@pytest.mark.parametrize("cell_size", [4, 48])
+@pytest.mark.parametrize(
+    "draw_icon",
+    [_draw_start_icon, _draw_cheese_icon, _draw_mouse_icon],
+)
+def test_inference_vector_icons_render_on_headless_surface(draw_icon, cell_size):
+    pygame = pytest.importorskip("pygame")
+    surface = pygame.Surface((cell_size, cell_size))
+    background = (11, 13, 17)
+    surface.fill(background)
+
+    draw_icon(pygame, surface, 0, 0, cell_size)
+
+    pixels = pygame.surfarray.array3d(surface)
+    assert np.any(pixels != np.asarray(background, dtype=np.uint8))
 
 
 def test_full_observation_channels():

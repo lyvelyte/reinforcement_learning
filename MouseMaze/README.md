@@ -82,6 +82,11 @@ conda run -n ml python MouseMaze/MouseAgent.py \
   --no-train --inference-mazes infinite
 ```
 
+The inference window is resizable and keeps the maze centered with square
+cells. In `local` observation mode, the policy's current observation footprint
+is outlined while the rest of the maze is dimmed. Press Escape or close the
+window to stop inference.
+
 Run the three deterministic held-out suites without training:
 
 ```bash
