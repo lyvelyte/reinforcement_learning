@@ -44,6 +44,7 @@ from MouseAgent import (
     default_artifact_paths,
     invocation_timestamp,
     latest_model_path,
+    paired_log_path,
     resolve_cli_artifacts,
     build_n_step_transition,
     curriculum_distance_range,
@@ -726,6 +727,19 @@ def test_cli_omitted_args_use_top_level_train_config_defaults():
     assert args.inference_mazes == DEFAULT_INFERENCE_MAZES
 
 
+def test_target_only_stop_defaults_to_recurrent_ppo_and_can_be_disabled():
+    assert TrainConfig(algorithm="recurrent_ppo").target_only_stop is True
+    assert TrainConfig(algorithm="dqn").target_only_stop is False
+    assert TrainConfig(algorithm="ppo").target_only_stop is False
+
+    args = parse_args(["--algorithm", "recurrent_ppo", "--no-target-only-stop"])
+
+    assert _train_config_from_args(args).target_only_stop is False
+
+    with pytest.raises(ValueError, match="recurrent_ppo"):
+        TrainConfig(algorithm="dqn", target_only_stop=True)
+
+
 def test_default_artifacts_share_timestamp_and_use_results_folders():
     timestamp = invocation_timestamp(
         datetime(2026, 7, 10, 12, 34, 56, 123456, tzinfo=timezone.utc)
@@ -768,6 +782,62 @@ def test_latest_model_path_is_deterministic_and_ignores_unrelated_files(tmp_path
 def test_latest_model_path_reports_actionable_error(tmp_path):
     with pytest.raises(FileNotFoundError, match="pass --save-path explicitly"):
         latest_model_path(str(tmp_path))
+
+
+def test_paired_log_path_uses_model_timestamp(tmp_path):
+    model_path = tmp_path / "20260710T123456000002Z_mousemaze.pth"
+
+    assert paired_log_path(str(model_path), str(tmp_path / "logs")) == str(
+        tmp_path / "logs" / "20260710T123456000002Z_mousemaze.jsonl"
+    )
+
+
+def test_resume_artifact_resolution_reuses_latest_model_and_log(tmp_path, monkeypatch):
+    model_path = tmp_path / "models" / "20260710T123456000002Z_mousemaze.pth"
+    log_directory = tmp_path / "logs"
+    log_path = log_directory / "20260710T123456000002Z_mousemaze.jsonl"
+    model_path.parent.mkdir()
+    log_directory.mkdir()
+    model_path.write_bytes(b"checkpoint")
+    log_path.write_text('{"event": "train_end"}\n')
+    monkeypatch.setattr(mouse_agent_module, "LOG_RESULTS_DIR", str(log_directory))
+    monkeypatch.setattr(mouse_agent_module, "latest_model_path", lambda: str(model_path))
+    args = parse_args(["--train"])
+
+    config = resolve_cli_artifacts(
+        _train_config_from_args(args), args, "20260710T123456123456Z"
+    )
+
+    assert config.save_path == str(model_path)
+    assert config.training_log_path == str(log_path)
+
+
+def test_resume_artifact_resolution_falls_back_when_no_model_exists(monkeypatch):
+    def no_model():
+        raise FileNotFoundError("no model")
+
+    monkeypatch.setattr(mouse_agent_module, "latest_model_path", no_model)
+    args = parse_args(["--train"])
+
+    config = resolve_cli_artifacts(
+        _train_config_from_args(args), args, "20260710T123456123456Z"
+    )
+
+    assert config.save_path.endswith("20260710T123456123456Z_mousemaze.pth")
+    assert config.training_log_path.endswith("20260710T123456123456Z_mousemaze.jsonl")
+
+
+def test_resume_artifact_resolution_requires_matching_log(tmp_path, monkeypatch):
+    model_path = tmp_path / "20260710T123456000002Z_mousemaze.pth"
+    model_path.write_bytes(b"checkpoint")
+    monkeypatch.setattr(mouse_agent_module, "LOG_RESULTS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(mouse_agent_module, "latest_model_path", lambda: str(model_path))
+    args = parse_args(["--train"])
+
+    with pytest.raises(FileNotFoundError, match="matching training log"):
+        resolve_cli_artifacts(
+            _train_config_from_args(args), args, "20260710T123456123456Z"
+        )
 
 
 def test_environment_provenance_tolerates_unavailable_git(monkeypatch):
@@ -1286,6 +1356,8 @@ def test_training_writes_jsonl_log_with_metrics_speed_and_utilization(tmp_path):
     assert "greedy" in eval_record
     assert "steps_per_second" in eval_record["speed"]
     assert "process_cpu_percent" in eval_record["utilization"]
+    assert all(record["timestamp"].endswith("+00:00") for record in records)
+    assert all(isinstance(record["time_unix"], float) for record in records)
 
 
 def test_training_saves_new_best_weights_to_configured_path(tmp_path, capsys):
@@ -1559,6 +1631,7 @@ def test_short_local_recurrent_training_smoke():
         recurrent_sequence_length=2,
         recurrent_sequence_minibatch_size=2,
         ppo_epochs=1,
+        target_only_stop=False,
         eval_every_steps=1_000,
         eval_episodes=1,
         curriculum_enabled=False,
@@ -1576,3 +1649,47 @@ def test_short_local_recurrent_training_smoke():
 
     assert agent.update_count > 0
     assert len(tracker.solved) == 3
+
+
+def test_target_only_recurrent_ppo_ignores_caps_until_curriculum_completes(monkeypatch):
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_eval_greedy",
+        lambda agent, config, **kwargs: EvalMetrics(solve_rate=1.0),
+    )
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        observation_mode="local",
+        view_size=5,
+        episodes=1,
+        max_env_steps=1,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        eval_every_steps=1,
+        eval_episodes=1,
+        target_solve_rate=0.9,
+        target_solve_evals=2,
+        curriculum_enabled=True,
+        curriculum_promotion_rate=0.9,
+        curriculum_promotion_evals=3,
+        curriculum_eval_episodes=1,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+
+    train(agent=agent, config=config)
+
+    assert config.target_only_stop is True
+    assert agent.total_env_steps >= 6

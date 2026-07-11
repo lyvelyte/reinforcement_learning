@@ -24,29 +24,40 @@ rollouts, and eight deterministic maze-generation workers. A newly encountered
 model/batch shape can spend roughly 1–2 minutes compiling; the compiled kernels
 are cached and subsequent launches are much faster.
 
-Full-map training, capped at three million transitions:
+Recurrent PPO defaults to target-only stopping: it trains until the configured
+solve-rate streak is reached after the curriculum completes. It also resumes
+the newest timestamped checkpoint and appends to its paired JSONL log when one
+exists. The learning-rate and RND schedules still use the configured transition
+budget, so pass a cap when you want those schedules to reach their endpoint.
+
+Full-map target-only training:
 
 ```bash
 conda run -n ml python MouseMaze/MouseAgent.py \
   --train --no-infer --no-dashboard \
   --algorithm recurrent_ppo --observation-mode full \
-  --performance-profile rtx3090-fast --max-env-steps 3000000
+  --performance-profile rtx3090-fast
 ```
 
-Local 7×7 training, capped at five million transitions:
+Local 7×7 target-only training:
 
 ```bash
 conda run -n ml python MouseMaze/MouseAgent.py \
   --train --no-infer --no-dashboard \
   --algorithm recurrent_ppo --observation-mode local --view-size 7 \
-  --performance-profile rtx3090-fast --max-env-steps 5000000
+  --performance-profile rtx3090-fast
 ```
 
-Each training invocation uses one UTC timestamp for paired artifacts under
-`MouseMaze/results/models/` and `MouseMaze/results/logs/`. The JSONL log records
-the full resolved configuration, runtime and Git provenance, training metrics,
-evaluation results, utilization, and checkpoint events. Explicit `--save-path`
-and `--training-log-path` values are honored exactly.
+To restore the episode/transition caps, pass `--no-target-only-stop` with
+`--episodes` and/or `--max-env-steps`. DQN and feed-forward PPO always retain
+their existing caps.
+
+Fresh training uses one UTC timestamp for paired artifacts under
+`MouseMaze/results/models/` and `MouseMaze/results/logs/`. A default resumed
+run reuses the newest model and its matching log instead. Each JSONL record
+contains UTC `timestamp` and `time_unix` fields alongside resolved configuration,
+runtime and Git provenance, metrics, utilization, and checkpoint events.
+Explicit `--save-path` and `--training-log-path` values are honored exactly.
 
 For deterministic debugging, replace the performance profile with `strict`
 and normally reduce `--num-envs`.

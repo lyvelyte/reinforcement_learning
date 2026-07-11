@@ -28,14 +28,14 @@ Two independent RL projects live side-by-side under this repo root:
 - `marioppo/alveybj/models/best_model.zip` — CNN-PPO weights.
 - `marioppo/alveybj/lstm_models/best_model.zip` — RecurrentPPO weights.
 - `marioppo/clarity_coder/ppo_level_1_1.zip` — PPO level-1 model.
-- `MouseMaze/results/models/<timestamp>_mousemaze.pth` — Default schema-v2 training checkpoints; inference and benchmarks select the latest timestamp by default.
+- `MouseMaze/results/models/<timestamp>_mousemaze.pth` — Schema-v2 checkpoints. Recurrent PPO resumes the newest one by default; inference and benchmarks also select the latest timestamp by default.
 - `MouseMaze/agent_weights*.pth` — Earlier DQN artifacts are archived and incompatible with the schema-v2 loader.
 
 ### Logs & telemetry
 - `marioppo/alveybj/tensorboard_logs/` — TensorBoard runs for PPO training.
 - `marioppo/alveybj/logs/monitor.csv` — OpenAI monitor data.
 - `marioppo/alveybj/evaluations.npz` — Saved evaluation metrics.
-- `MouseMaze/results/logs/<timestamp>_mousemaze.jsonl` — Paired rich training logs containing resolved configuration, provenance, metrics, utilization, and checkpoint events.
+- `MouseMaze/results/logs/<timestamp>_mousemaze.jsonl` — Paired rich training logs containing resolved configuration, provenance, metrics, utilization, and checkpoint events. Default recurrent-PPO resume appends to the matching existing log.
 
 ## Environment & Commands
 - Use the shared conda environment named `ml`.

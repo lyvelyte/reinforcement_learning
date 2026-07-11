@@ -58,7 +58,9 @@ DEFAULT_ALGORITHM = "recurrent_ppo"
 # Network layout used by default for algorithms that support both layouts.
 DEFAULT_NETWORK_TYPE = "spatial"
 # Whether training resumes from the checkpoint instead of starting fresh.
-DEFAULT_RESUME = False
+DEFAULT_RESUME = True
+# Whether recurrent PPO ignores episode and transition caps until it reaches its target.
+DEFAULT_TARGET_ONLY_STOP: bool | None = None
 
 # Maximum number of transitions retained by the DQN replay buffer.
 BUFFER_SIZE = 200_000
@@ -240,6 +242,7 @@ class TrainConfig:
     algorithm: str = DEFAULT_ALGORITHM
     network_type: str = DEFAULT_NETWORK_TYPE
     resume: bool = DEFAULT_RESUME
+    target_only_stop: bool | None = DEFAULT_TARGET_ONLY_STOP
     observation_mode: str = DEFAULT_OBSERVATION_MODE
     view_size: int = VIEW_SIZE
     max_episode_steps: int = MAX_EPISODE_STEPS
@@ -319,6 +322,10 @@ class TrainConfig:
             self.training_log_path = None
         if self.algorithm not in ALGORITHMS:
             raise ValueError(f"algorithm must be one of {ALGORITHMS}; got {self.algorithm!r}")
+        if self.target_only_stop is None:
+            self.target_only_stop = self.algorithm == "recurrent_ppo"
+        elif self.target_only_stop and self.algorithm != "recurrent_ppo":
+            raise ValueError("target_only_stop is supported only by recurrent_ppo")
         if self.network_type not in NETWORK_TYPES:
             raise ValueError(
                 f"network_type must be one of {NETWORK_TYPES}; got {self.network_type!r}"
@@ -3467,6 +3474,29 @@ def default_artifact_paths(timestamp: str) -> tuple[str, str]:
     )
 
 
+def paired_log_path(model_path: str, log_directory: str | None = None) -> str:
+    """Return the timestamp-matched JSONL path for a model artifact."""
+
+    suffix = f"_{ARTIFACT_BASENAME}.pth"
+    name = os.path.basename(model_path)
+    if not name.endswith(suffix):
+        raise ValueError(
+            f"model path must end with {suffix!r} to derive its paired training log"
+        )
+    timestamp = name[: -len(suffix)]
+    try:
+        datetime.strptime(timestamp, "%Y%m%dT%H%M%S%fZ")
+    except ValueError as error:
+        raise ValueError(
+            "model path does not use a timestamped MouseMaze artifact name: "
+            f"{model_path!r}"
+        ) from error
+    return os.path.join(
+        log_directory or LOG_RESULTS_DIR,
+        f"{timestamp}_{ARTIFACT_BASENAME}.jsonl",
+    )
+
+
 def latest_model_path(model_directory: str = MODEL_RESULTS_DIR) -> str:
     """Return the latest timestamp-named MouseMaze model in a directory."""
 
@@ -3504,10 +3534,27 @@ def resolve_cli_artifacts(
     default_model, default_log = default_artifact_paths(timestamp)
     training = _optional_bool(args.train_flag, DEFAULT_TRAIN_FLAG)
     if training:
-        if args.save_path is None:
-            values["save_path"] = default_model
-        if args.training_log_path is None:
-            values["training_log_path"] = default_log
+        resumed_model: str | None = None
+        if config.resume and args.save_path is None:
+            try:
+                resumed_model = latest_model_path()
+            except FileNotFoundError:
+                pass
+        if resumed_model is not None:
+            values["save_path"] = resumed_model
+            if args.training_log_path is None:
+                resumed_log = paired_log_path(resumed_model)
+                if not os.path.exists(resumed_log):
+                    raise FileNotFoundError(
+                        "latest MouseMaze model has no matching training log: "
+                        f"{resumed_log!r}; pass --training-log-path explicitly"
+                    )
+                values["training_log_path"] = resumed_log
+        else:
+            if args.save_path is None:
+                values["save_path"] = default_model
+            if args.training_log_path is None:
+                values["training_log_path"] = default_log
     inference = _optional_bool(args.infer_flag, DEFAULT_INFER_FLAG)
     if (
         not training
@@ -4845,7 +4892,12 @@ def _train_recurrent_ppo(
     best_eval_rate = agent.best_greedy_solve_rate
     best_weights = clone_agent_weights(agent) if best_eval_rate >= 0 else None
     saved_state = agent.training_state
-    completed = min(int(saved_state.get("completed_episodes", 0)), config.episodes)
+    saved_completed = int(saved_state.get("completed_episodes", 0))
+    completed = (
+        saved_completed
+        if config.target_only_stop
+        else min(saved_completed, config.episodes)
+    )
     total_steps = max(int(saved_state.get("total_steps", 0)), agent.total_env_steps)
     last_eval_step = int(saved_state.get("last_eval_step", 0))
     target_streak = int(saved_state.get("target_streak", 0))
@@ -4861,7 +4913,12 @@ def _train_recurrent_ppo(
         config.maze_workers if config.performance_profile == "rtx3090-fast" else 0
     )
     prefetcher = DeterministicMazePrefetcher(sampler, maze_workers)
-    env_count = min(config.num_envs, max(config.episodes - completed, 1))
+    limits_enabled = not config.target_only_stop
+    env_count = (
+        config.num_envs
+        if not limits_enabled
+        else min(config.num_envs, max(config.episodes - completed, 1))
+    )
     environments = [prefetcher.next() for _ in range(env_count)]
     environment_batch = MazeBatch(environments)
     states = environment_batch.observations()
@@ -4880,7 +4937,10 @@ def _train_recurrent_ppo(
     last_eval = EvalMetrics()
     last_dashboard_episode = -config.dashboard_every
 
-    while total_steps < config.max_env_steps and completed < config.episodes:
+    while (
+        (not limits_enabled or total_steps < config.max_env_steps)
+        and (not limits_enabled or completed < config.episodes)
+    ):
         collector_started = time.perf_counter()
         rollout_steps = config.ppo_rollout_steps
         shape = (rollout_steps, env_count)
@@ -4910,7 +4970,9 @@ def _train_recurrent_ppo(
         maze_generation_seconds = 0.0
 
         for step in range(rollout_steps):
-            if total_steps >= config.max_env_steps or completed >= config.episodes:
+            if limits_enabled and (
+                total_steps >= config.max_env_steps or completed >= config.episodes
+            ):
                 break
             transfer_started = time.perf_counter()
             state_staging.copy_(torch.from_numpy(states))
@@ -4964,11 +5026,11 @@ def _train_recurrent_ppo(
                 torch.as_tensor(result.dones, dtype=torch.float32, device=agent.device)
             )
             for index in np.flatnonzero(result.dones):
-                if completed >= config.episodes:
+                if limits_enabled and completed >= config.episodes:
                     break
                 completed += 1
                 tracker.record_episode(environment_batch.episode_stats(int(index)), completed)
-                if completed < config.episodes:
+                if not limits_enabled or completed < config.episodes:
                     generation_started = time.perf_counter()
                     replacement = prefetcher.next()
                     maze_generation_seconds += time.perf_counter() - generation_started
@@ -5723,6 +5785,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument(
+        "--target-only-stop",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "For recurrent PPO, ignore episode and transition caps until the "
+            "target solve streak is reached after curriculum completion."
+        ),
+    )
     parser.add_argument("--observation-mode", choices=OBSERVATION_MODES, default=None)
     parser.add_argument("--view-size", type=int, default=None)
     parser.add_argument("--max-episode-steps", type=int, default=None)
@@ -5896,6 +5967,7 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "algorithm",
         "network_type",
         "resume",
+        "target_only_stop",
         "observation_mode",
         "view_size",
         "max_episode_steps",
@@ -5976,6 +6048,8 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
             values[name] = value
     if args.eval_every is not None and args.dashboard_every is None:
         values["dashboard_every"] = args.eval_every
+    if args.target_only_stop is None and args.algorithm is not None:
+        values["target_only_stop"] = None
     return TrainConfig(**values)
 
 
