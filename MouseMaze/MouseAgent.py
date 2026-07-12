@@ -1483,21 +1483,41 @@ def make_maze(
     episode: int | None = None,
     target_range: tuple[int, int] | None = None,
 ) -> Maze:
+    """Generate a maze that can be completed within its episode budget.
+
+    The generator produces connected mazes, but a connected maze can still
+    have a shortest path longer than the effective episode limit.  Such a
+    candidate must be discarded before it reaches training or inference.
+    """
+
     if target_range is None:
         target_range = curriculum_distance_range(config, episode)
-    if target_range is None:
-        grid = generate_random_maze(config.maze_size[0], config.maze_size[1], rng=rng)
-        return _maze_from_grid(config, grid)
 
-    low, high = target_range
     for _ in range(config.curriculum_max_retries):
         grid = generate_random_maze(config.maze_size[0], config.maze_size[1], rng=rng)
         env = _maze_from_grid(config, grid)
+        if env.optimal_start_steps > env.max_episode_steps:
+            continue
+        if target_range is None:
+            return env
+        low, high = target_range
         if low <= env.optimal_start_steps <= high:
             return env
 
-    grid = generate_random_maze(config.maze_size[0], config.maze_size[1], rng=rng)
-    return _maze_from_grid(config, grid)
+    if target_range is not None:
+        # Preserve the previous behavior of relaxing an unavailable
+        # curriculum distance range, while retaining the episode-budget
+        # guarantee for the fallback maze.
+        for _ in range(config.curriculum_max_retries):
+            grid = generate_random_maze(config.maze_size[0], config.maze_size[1], rng=rng)
+            env = _maze_from_grid(config, grid)
+            if env.optimal_start_steps <= env.max_episode_steps:
+                return env
+
+    raise RuntimeError(
+        "could not generate a maze solvable within the effective episode "
+        f"limit after {config.curriculum_max_retries} attempts"
+    )
 
 
 def make_training_maze(
@@ -6078,7 +6098,7 @@ def run_inference_loop(
     completed = 0
     while maze_count == 0 or completed < maze_count:
         completed += 1
-        maze_grid = generate_random_maze(config.maze_size[0], config.maze_size[1])
+        maze_grid = make_maze(config).grid
         limit = "infinite" if maze_count == 0 else str(maze_count)
         print(f"Inference on fresh maze {completed}/{limit}:")
         if not visualize_inference(

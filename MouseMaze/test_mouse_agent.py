@@ -328,6 +328,68 @@ def test_curriculum_distance_ranges_and_sampling_are_deterministic():
     assert all(8 <= steps <= 16 for steps in medium)
 
 
+def test_make_maze_retries_candidates_that_exceed_episode_budget(monkeypatch):
+    config = TrainConfig(
+        maze_size=(5, 5),
+        max_episode_steps=1,
+        timeout_step_factor=None,
+        curriculum_enabled=False,
+        curriculum_max_retries=3,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    one_step_grid = np.array(
+        [
+            [1, 1, 1, 1, 1],
+            [1, 2, 3, 0, 1],
+            [1, 1, 1, 0, 1],
+            [1, 0, 0, 0, 1],
+            [1, 1, 1, 1, 1],
+        ],
+        dtype=np.uint8,
+    )
+    generated = [fixed_grid(), one_step_grid]
+    calls = 0
+
+    def fake_generate(rows, cols, rng=None):
+        nonlocal calls
+        assert (rows, cols) == config.maze_size
+        calls += 1
+        return generated.pop(0)
+
+    monkeypatch.setattr(mouse_agent_module, "generate_random_maze", fake_generate)
+
+    env = make_maze(config)
+
+    assert calls == 2
+    assert env.optimal_start_steps == 1
+    assert env.optimal_start_steps <= env.max_episode_steps
+
+
+def test_make_maze_raises_instead_of_returning_unsolvable_budget_candidate(monkeypatch):
+    config = TrainConfig(
+        maze_size=(5, 5),
+        max_episode_steps=1,
+        timeout_step_factor=None,
+        curriculum_enabled=False,
+        curriculum_max_retries=2,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "generate_random_maze",
+        lambda rows, cols, rng=None: fixed_grid(),
+    )
+
+    with pytest.raises(RuntimeError, match="solvable within the effective episode limit"):
+        make_maze(config)
+
+
 def test_curriculum_promotes_only_after_repeated_validation_success():
     config = TrainConfig(
         maze_size=(5, 5),
@@ -978,9 +1040,9 @@ def test_inference_loop_generates_requested_number_of_fresh_mazes(monkeypatch):
     generated_sizes = []
     rendered_mazes = []
 
-    def fake_generate(rows, cols):
+    def fake_generate(rows, cols, rng=None):
         generated_sizes.append((rows, cols))
-        return np.zeros((rows, cols), dtype=np.uint8)
+        return fixed_grid()
 
     def fake_visualize(agent, maze_grid, *, observation_mode, config):
         rendered_mazes.append(maze_grid)
@@ -1001,7 +1063,7 @@ def test_inference_loop_infinite_mode_stops_when_window_closes(monkeypatch):
     monkeypatch.setattr(
         mouse_agent_module,
         "generate_random_maze",
-        lambda rows, cols: np.zeros((rows, cols), dtype=np.uint8),
+        lambda rows, cols, rng=None: fixed_grid(),
     )
 
     def fake_visualize(*args, **kwargs):
