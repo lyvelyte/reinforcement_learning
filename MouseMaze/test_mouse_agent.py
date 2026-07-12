@@ -14,6 +14,7 @@ from MouseAgent import (
     DEFAULT_INFER_FLAG,
     DEFAULT_INFERENCE_MAZES,
     DEFAULT_TRAIN_FLAG,
+    EVAL_SEED_OFFSET,
     BfsPlanner,
     CurriculumController,
     Dashboard,
@@ -32,6 +33,7 @@ from MouseAgent import (
     ReplayBuffer,
     TrainConfig,
     _chart_x_max,
+    _confirm_target_candidate,
     _dashboard_tooltip_at,
     _draw_cheese_icon,
     _draw_mouse_icon,
@@ -42,6 +44,7 @@ from MouseAgent import (
     _generate_prefetched_grid,
     _optional_bool,
     _rects_overlap,
+    _recurrent_ppo_precision_schedule,
     _restore_rng_state,
     _train_config_from_args,
     _training_environment_payload,
@@ -300,6 +303,96 @@ def test_dynamic_timeout_uses_optimal_steps_with_cap():
     assert env.optimal_start_steps == 2
     assert env.max_episode_steps == 8
     assert capped_env.max_episode_steps == 6
+
+
+def test_default_timeout_provides_local_recovery_budget(monkeypatch):
+    config = TrainConfig(
+        maze_size=(5, 5),
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "generate_random_maze",
+        lambda rows, cols, rng=None: fixed_grid(),
+    )
+
+    env = make_maze(config)
+
+    assert config.min_episode_steps == 40
+    assert config.timeout_step_factor == 6.0
+    assert env.optimal_start_steps == 2
+    assert env.max_episode_steps == 40
+
+
+def test_recurrent_precision_schedule_decays_after_budget_to_floors():
+    config = TrainConfig(
+        max_env_steps=100,
+        learning_rate=1e-3,
+        ppo_entropy_coef=2e-2,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+
+    assert _recurrent_ppo_precision_schedule(0, config) == (1e-3, 2e-2)
+    learning_rate, entropy = _recurrent_ppo_precision_schedule(100, config)
+    assert np.isclose(learning_rate, 1e-4)
+    assert np.isclose(entropy, 2e-2)
+    learning_rate, entropy = _recurrent_ppo_precision_schedule(200, config)
+    assert np.isclose(learning_rate, 5e-5)
+    assert np.isclose(entropy, 1e-2)
+    learning_rate, entropy = _recurrent_ppo_precision_schedule(1_000, config)
+    assert np.isclose(learning_rate, 1e-5)
+    assert np.isclose(entropy, 2e-3)
+
+
+@pytest.mark.parametrize(
+    ("additional_rates", "confirmed"),
+    [([1.0, 1.0], True), ([1.0, 0.99], False)],
+)
+def test_target_confirmation_uses_disjoint_suites_without_updates(
+    monkeypatch,
+    additional_rates,
+    confirmed,
+):
+    config = TrainConfig(
+        eval_seed=123,
+        target_solve_rate=1.0,
+        target_solve_evals=3,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    policy = type("FrozenPolicy", (), {"update_count": 7})()
+    rates = iter(additional_rates)
+    observed_seeds = []
+
+    def fake_eval(agent, suite_config, **kwargs):
+        assert agent is policy
+        observed_seeds.append(suite_config.eval_seed)
+        return EvalMetrics(solve_rate=next(rates))
+
+    monkeypatch.setattr(mouse_agent_module, "_eval_greedy", fake_eval)
+
+    result = _confirm_target_candidate(policy, config, EvalMetrics(solve_rate=1.0))
+
+    assert result.confirmed is confirmed
+    assert [seed for seed, _metrics in result.suites] == [
+        123,
+        123 + EVAL_SEED_OFFSET,
+        123 + 2 * EVAL_SEED_OFFSET,
+    ]
+    assert observed_seeds == [
+        123 + EVAL_SEED_OFFSET,
+        123 + 2 * EVAL_SEED_OFFSET,
+    ]
+    assert policy.update_count == 7
 
 
 def test_curriculum_distance_ranges_and_sampling_are_deterministic():
@@ -1827,7 +1920,10 @@ def test_short_local_recurrent_training_smoke():
     assert len(tracker.solved) == 3
 
 
-def test_target_only_recurrent_ppo_ignores_caps_until_curriculum_completes(monkeypatch):
+def test_target_only_recurrent_ppo_confirms_frozen_candidate_and_ignores_legacy_streak(
+    monkeypatch,
+    tmp_path,
+):
     monkeypatch.setattr(
         mouse_agent_module,
         "_eval_greedy",
@@ -1856,6 +1952,71 @@ def test_target_only_recurrent_ppo_ignores_caps_until_curriculum_completes(monke
         curriculum_promotion_evals=3,
         curriculum_eval_episodes=1,
         dashboard_flag=False,
+        save_path=str(tmp_path / "confirmed.pth"),
+        training_log_path=str(tmp_path / "training.jsonl"),
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    agent.best_greedy_solve_rate = 1.0
+    agent.training_state = {"target_streak": 99}
+
+    train(agent=agent, config=config)
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "training.jsonl").read_text().splitlines()
+    ]
+
+    assert config.target_only_stop is True
+    assert agent.total_env_steps >= 6
+    assert agent.training_state["target_confirmed"] is True
+    assert "target_streak" not in agent.training_state
+    assert any(
+        record["event"] == "target_confirmation" and record["confirmed"] is True
+        for record in records
+    )
+    assert any(
+        record["event"] == "checkpoint"
+        and record["reason"] == "target_confirmed"
+        for record in records
+    )
+    assert all(
+        "entropy_coefficient" in record
+        for record in records
+        if record["event"] == "learner"
+    )
+
+
+def test_failed_target_confirmation_resumes_training(monkeypatch):
+    rates = deque([1.0, 0.0, 1.0, 1.0])
+
+    def fake_eval(agent, config, **kwargs):
+        del agent, config, kwargs
+        return EvalMetrics(solve_rate=rates.popleft() if rates else 1.0)
+
+    monkeypatch.setattr(mouse_agent_module, "_eval_greedy", fake_eval)
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        observation_mode="local",
+        view_size=5,
+        episodes=1,
+        max_env_steps=1,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        eval_every_steps=1,
+        eval_episodes=1,
+        target_solve_rate=1.0,
+        target_solve_evals=2,
+        curriculum_enabled=False,
+        dashboard_flag=False,
         save_path=None,
         training_log_path=None,
         device="cpu",
@@ -1867,5 +2028,6 @@ def test_target_only_recurrent_ppo_ignores_caps_until_curriculum_completes(monke
 
     train(agent=agent, config=config)
 
-    assert config.target_only_stop is True
-    assert agent.total_env_steps >= 6
+    assert agent.training_state["target_confirmed"] is True
+    assert agent.total_env_steps >= 2
+    assert not rates

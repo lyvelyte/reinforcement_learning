@@ -24,11 +24,20 @@ rollouts, and eight deterministic maze-generation workers. A newly encountered
 model/batch shape can spend roughly 1–2 minutes compiling; the compiled kernels
 are cached and subsequent launches are much faster.
 
-Recurrent PPO defaults to target-only stopping: it trains until the configured
-solve-rate streak is reached after the curriculum completes. It also resumes
-the newest timestamped checkpoint and appends to its paired JSONL log when one
-exists. The learning-rate and RND schedules still use the configured transition
-budget, so pass a cap when you want those schedules to reach their endpoint.
+Recurrent PPO defaults to target-only stopping. After the curriculum completes,
+a policy that reaches the target solve rate is frozen and checked on three
+deterministic, seed-separated suites. Training stops only when that unchanged
+candidate passes every suite. It also resumes the newest timestamped checkpoint
+and appends to its paired JSONL log when one exists.
+
+The configured transition budget controls the main learning-rate and RND
+schedules. RND reaches zero at that budget. Target-only training beyond the
+budget enters a precision phase that progressively halves the learning rate and
+entropy coefficient down to stable floors, reducing late policy drift.
+
+Episode limits default to at least 40 steps or six times the maze's shortest
+path, whichever is larger, capped by `--max-episode-steps`. This gives the local
+agent time to recover from a wrong turn while retaining a finite task budget.
 
 Full-map target-only training:
 

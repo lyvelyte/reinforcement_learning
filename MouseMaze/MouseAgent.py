@@ -104,10 +104,10 @@ DEFAULT_PRIORITY_BETA_START = 0.4
 DEFAULT_PRIORITY_BETA_STEPS = 1_500_000
 # Hard cap on steps in one maze episode.
 MAX_EPISODE_STEPS = 300
-# Multiplier used to derive a maze-size-aware timeout when enabled.
-DEFAULT_TIMEOUT_STEP_FACTOR = 4.0
-# Minimum episode length used by timeout and curriculum safeguards.
-DEFAULT_MIN_EPISODE_STEPS = 20
+# Multiplier used to provide a maze-size-aware recovery budget when enabled.
+DEFAULT_TIMEOUT_STEP_FACTOR = 6.0
+# Minimum episode length allowing local agents to recover from short wrong turns.
+DEFAULT_MIN_EPISODE_STEPS = 40
 # Number of episodes in each standard evaluation pass during training.
 NUM_EVAL_EPISODES = 500
 # Episode-based dashboard/evaluation cadence compatibility default.
@@ -193,7 +193,7 @@ DEFAULT_LOCAL_MAX_ENV_STEPS = 5_000_000
 DEFAULT_FULL_TARGET_SOLVE_RATE = 1.00
 # Target validation solve rate for local-observation training.
 DEFAULT_LOCAL_TARGET_SOLVE_RATE = 1.00
-# Number of target-solve evaluations used for stopping/promotion decisions.
+# Number of deterministic suites used to confirm one frozen target candidate.
 DEFAULT_TARGET_SOLVE_EVALS = 3
 # Number of mazes used to evaluate a curriculum stage.
 DEFAULT_CURRICULUM_EVAL_EPISODES = 200
@@ -509,6 +509,14 @@ class PPOUpdateMetrics:
     entropy: float = 0.0
     approx_kl: float = 0.0
     epochs: int = 0
+
+
+@dataclass(slots=True)
+class TargetConfirmationResult:
+    """Results from deterministic validation of one frozen policy candidate."""
+
+    confirmed: bool
+    suites: list[tuple[int, EvalMetrics]]
 
 
 @dataclass(slots=True)
@@ -2890,6 +2898,36 @@ def _agent_greedy_actions(
     )
 
 
+def _recurrent_ppo_precision_schedule(
+    total_steps: int,
+    config: TrainConfig,
+) -> tuple[float, float]:
+    """Return late-training learning-rate and entropy coefficients.
+
+    The original linear schedule is preserved through the configured budget.
+    Target-only training then enters a precision phase that halves both sources
+    of policy movement once per additional transition budget.
+    """
+
+    budget = max(config.max_env_steps, 1)
+    if total_steps <= budget:
+        progress = max(total_steps, 0) / budget
+        learning_rate = config.learning_rate * (1.0 - 0.9 * progress)
+        return learning_rate, config.ppo_entropy_coef
+
+    overflow_budgets = (total_steps - budget) / budget
+    decay = 0.5**overflow_budgets
+    learning_rate = max(
+        config.learning_rate * 0.01,
+        config.learning_rate * 0.10 * decay,
+    )
+    entropy_coefficient = max(
+        config.ppo_entropy_coef * 0.10,
+        config.ppo_entropy_coef * decay,
+    )
+    return learning_rate, entropy_coefficient
+
+
 def _eval_greedy(
     agent: Agent,
     config: TrainConfig,
@@ -3015,6 +3053,28 @@ def _eval_greedy(
             for bucket, count in sorted(bucket_totals.items())
         },
         difficulty_counts=dict(sorted(bucket_totals.items())),
+    )
+
+
+def _confirm_target_candidate(
+    agent: Agent,
+    config: TrainConfig,
+    regular_metrics: EvalMetrics,
+) -> TargetConfirmationResult:
+    """Evaluate one unchanged policy on deterministic, disjoint maze suites."""
+
+    base_seed = resolved_eval_seed(config)
+    suites = [(base_seed, regular_metrics)]
+    for suite_index in range(1, config.target_solve_evals):
+        suite_seed = base_seed + suite_index * EVAL_SEED_OFFSET
+        suite_config = replace(config, eval_seed=suite_seed)
+        suites.append((suite_seed, _eval_greedy(agent, suite_config)))
+    return TargetConfirmationResult(
+        confirmed=all(
+            metrics.solve_rate >= config.target_solve_rate
+            for _seed, metrics in suites
+        ),
+        suites=suites,
     )
 
 
@@ -4791,10 +4851,16 @@ def _recurrent_ppo_update(
     old_values: torch.Tensor,
     advantages: torch.Tensor,
     returns: torch.Tensor,
+    entropy_coefficient: float | None = None,
 ) -> PPOUpdateMetrics:
     """Optimize recurrent PPO using intact truncated-BPTT sequences."""
 
     time_steps, env_count = actions.shape
+    effective_entropy_coefficient = (
+        config.ppo_entropy_coef
+        if entropy_coefficient is None
+        else float(entropy_coefficient)
+    )
     sequence_length = config.recurrent_sequence_length
     chunks = [
         (env_index, start)
@@ -4885,7 +4951,11 @@ def _recurrent_ppo_update(
                 (clipped_values - return_batch).square(),
             )[valid].mean()
             entropy = distribution.entropy()[valid].mean()
-            loss = policy_loss + config.ppo_value_coef * value_loss - config.ppo_entropy_coef * entropy
+            loss = (
+                policy_loss
+                + config.ppo_value_coef * value_loss
+                - effective_entropy_coefficient * entropy
+            )
             agent.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(agent.policy_net.parameters(), config.ppo_max_grad_norm)
@@ -4955,7 +5025,9 @@ def _train_recurrent_ppo(
     )
     total_steps = max(int(saved_state.get("total_steps", 0)), agent.total_env_steps)
     last_eval_step = int(saved_state.get("last_eval_step", 0))
-    target_streak = int(saved_state.get("target_streak", 0))
+    # Legacy checkpoints may contain target_streak. Confirmation now validates
+    # one frozen candidate, so an evolving-policy streak is intentionally ignored.
+    target_confirmed = bool(saved_state.get("target_confirmed", False))
     train_rng = random.Random(config.seed)
     if "train_rng_state" in saved_state:
         train_rng.setstate(saved_state["train_rng_state"])
@@ -4995,6 +5067,7 @@ def _train_recurrent_ppo(
     while (
         (not limits_enabled or total_steps < config.max_env_steps)
         and (not limits_enabled or completed < config.episodes)
+        and not target_confirmed
     ):
         collector_started = time.perf_counter()
         rollout_steps = config.ppo_rollout_steps
@@ -5149,8 +5222,10 @@ def _train_recurrent_ppo(
             config.gamma,
             config.ppo_gae_lambda,
         )
-        progress = min(total_steps / config.max_env_steps, 1.0)
-        learning_rate = config.learning_rate * (1.0 - 0.9 * progress)
+        learning_rate, entropy_coefficient = _recurrent_ppo_precision_schedule(
+            total_steps,
+            config,
+        )
         for group in agent.optimizer.param_groups:
             group["lr"] = learning_rate
         update_metrics = _recurrent_ppo_update(
@@ -5167,6 +5242,7 @@ def _train_recurrent_ppo(
             rollout_values,
             advantages,
             returns,
+            entropy_coefficient=entropy_coefficient,
         )
         tracker.record_loss(update_metrics.loss, completed)
         learner_seconds = time.perf_counter() - learner_started
@@ -5180,6 +5256,7 @@ def _train_recurrent_ppo(
                 total_steps=total_steps,
                 update_count=agent.update_count,
                 learning_rate=learning_rate,
+                entropy_coefficient=entropy_coefficient,
                 rnd_coefficient=rnd_coefficient,
                 extrinsic_reward_mean=float(rollout_rewards.mean().item()),
                 intrinsic_reward_mean=float(intrinsic_rewards.mean().item()),
@@ -5203,7 +5280,6 @@ def _train_recurrent_ppo(
             )
 
         def record_evaluation(metrics: EvalMetrics) -> None:
-            nonlocal target_streak
             promoted = False
             stage_metrics = metrics
             if config.curriculum_enabled and not sampler.curriculum.complete:
@@ -5211,7 +5287,6 @@ def _train_recurrent_ppo(
                 promoted = sampler.curriculum.record_validation(stage_metrics)
                 if promoted:
                     prefetcher.reset()
-            target_streak = target_streak + 1 if metrics.solve_rate >= config.target_solve_rate else 0
             _update_training_state(
                 agent,
                 completed,
@@ -5220,7 +5295,7 @@ def _train_recurrent_ppo(
                 train_rng,
                 curriculum=sampler.curriculum,
             )
-            agent.training_state["target_streak"] = target_streak
+            agent.training_state["target_confirmed"] = False
             if logger.enabled:
                 logger.log(
                     "curriculum",
@@ -5256,10 +5331,64 @@ def _train_recurrent_ppo(
                     total_steps=total_steps,
                     evaluation_seconds=evaluation_seconds,
                 )
-        if target_streak >= config.target_solve_evals and (
-            not config.curriculum_enabled or sampler.curriculum.complete
-        ):
-            break
+            curriculum_complete = (
+                not config.curriculum_enabled or sampler.curriculum.complete
+            )
+            if (
+                curriculum_complete
+                and eval_result.solve_rate >= config.target_solve_rate
+            ):
+                confirmation = _confirm_target_candidate(agent, config, eval_result)
+                for suite_index, (suite_seed, suite_metrics) in enumerate(
+                    confirmation.suites,
+                    start=1,
+                ):
+                    if logger.enabled:
+                        logger.log(
+                            "target_confirmation_suite",
+                            suite_index=suite_index,
+                            suite_count=len(confirmation.suites),
+                            eval_seed=suite_seed,
+                            passed=suite_metrics.solve_rate >= config.target_solve_rate,
+                            metrics=_eval_metrics_payload(suite_metrics),
+                        )
+                target_confirmed = confirmation.confirmed
+                agent.training_state["target_confirmed"] = target_confirmed
+                if logger.enabled:
+                    logger.log(
+                        "target_confirmation",
+                        confirmed=target_confirmed,
+                        target_solve_rate=config.target_solve_rate,
+                        suite_count=len(confirmation.suites),
+                    )
+                if target_confirmed:
+                    best_eval_rate = max(best_eval_rate, eval_result.solve_rate)
+                    agent.best_greedy_solve_rate = best_eval_rate
+                    best_weights = clone_agent_weights(agent)
+                    if config.save_path:
+                        agent.save(config.save_path)
+                        print(
+                            "[train] confirmed target weights saved to "
+                            f"{config.save_path} ({best_eval_rate:.1%})."
+                        )
+                        if logger.enabled:
+                            logger.log(
+                                "checkpoint",
+                                checkpoint_path=config.save_path,
+                                reason="target_confirmed",
+                                **_training_snapshot_payload(
+                                    completed,
+                                    total_steps,
+                                    0.0,
+                                    agent,
+                                    tracker,
+                                    eval_result,
+                                    best_eval_rate,
+                                    start_time,
+                                    process_start_cpu,
+                                ),
+                            )
+                    break
         last_dashboard_episode = _maybe_draw_dashboard(
             dashboard,
             completed,
@@ -5282,7 +5411,7 @@ def _train_recurrent_ppo(
         train_rng,
         curriculum=sampler.curriculum,
     )
-    agent.training_state["target_streak"] = target_streak
+    agent.training_state["target_confirmed"] = target_confirmed
     prefetcher.close()
     return _finish_training(
         agent,
@@ -6141,7 +6270,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "For recurrent PPO, ignore episode and transition caps until the "
-            "target solve streak is reached after curriculum completion."
+            "target is confirmed on independent suites after curriculum completion."
         ),
     )
     parser.add_argument("--observation-mode", choices=OBSERVATION_MODES, default=None)
@@ -6244,7 +6373,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expert-pretrain-mazes", type=int, default=None)
     parser.add_argument("--expert-pretrain-epochs", type=int, default=None)
     parser.add_argument("--target-solve-rate", type=float, default=None)
-    parser.add_argument("--target-solve-evals", type=int, default=None)
+    parser.add_argument(
+        "--target-solve-evals",
+        type=int,
+        default=None,
+        help=(
+            "Number of deterministic, seed-separated suites that one frozen "
+            "policy must pass before target-only training stops."
+        ),
+    )
     parser.add_argument(
         "--performance-profile",
         choices=PERFORMANCE_PROFILES,
