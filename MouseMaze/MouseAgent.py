@@ -58,7 +58,7 @@ DEFAULT_ALGORITHM = "recurrent_ppo"
 # Network layout used by default for algorithms that support both layouts.
 DEFAULT_NETWORK_TYPE = "spatial"
 # Whether training resumes from the checkpoint instead of starting fresh.
-DEFAULT_RESUME = False
+DEFAULT_RESUME = True
 # Whether recurrent PPO ignores episode and transition caps until it reaches its target.
 DEFAULT_TARGET_ONLY_STOP: bool | None = None
 
@@ -190,9 +190,9 @@ DEFAULT_FULL_MAX_ENV_STEPS = 3_000_000
 # Default transition budget for local-observation training.
 DEFAULT_LOCAL_MAX_ENV_STEPS = 5_000_000
 # Target validation solve rate for full-map training.
-DEFAULT_FULL_TARGET_SOLVE_RATE = 0.95
+DEFAULT_FULL_TARGET_SOLVE_RATE = 1.00
 # Target validation solve rate for local-observation training.
-DEFAULT_LOCAL_TARGET_SOLVE_RATE = 0.95
+DEFAULT_LOCAL_TARGET_SOLVE_RATE = 1.00
 # Number of target-solve evaluations used for stopping/promotion decisions.
 DEFAULT_TARGET_SOLVE_EVALS = 3
 # Number of mazes used to evaluate a curriculum stage.
@@ -3909,6 +3909,14 @@ def ensure_agent_matches_config(agent: Agent, config: TrainConfig) -> None:
         )
 
 
+def _cpu_rng_state(state: object) -> torch.Tensor:
+    """Convert a serialized RNG state to the CPU byte tensor PyTorch expects."""
+
+    if isinstance(state, torch.Tensor):
+        return state.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    return torch.as_tensor(state, dtype=torch.uint8, device="cpu").contiguous()
+
+
 def _restore_rng_state(training_state: dict[str, object]) -> None:
     """Restore process RNGs from an optional training checkpoint snapshot."""
 
@@ -3931,9 +3939,12 @@ def _restore_rng_state(training_state: dict[str, object]) -> None:
             )
         )
     if torch_state is not None:
-        torch.set_rng_state(torch_state)
+        # ``Agent.load`` maps checkpoint tensors to the agent device.  The
+        # PyTorch generators expect CPU byte tensors for their state, even
+        # when the model and the CUDA generators are used on the GPU.
+        torch.set_rng_state(_cpu_rng_state(torch_state))
     if cuda_states is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(cuda_states)
+        torch.cuda.set_rng_state_all(_cpu_rng_state(state) for state in cuda_states)
 
 
 def _serialized_numpy_rng_state() -> dict[str, object]:

@@ -42,6 +42,7 @@ from MouseAgent import (
     _generate_prefetched_grid,
     _optional_bool,
     _rects_overlap,
+    _restore_rng_state,
     _train_config_from_args,
     _training_environment_payload,
     default_artifact_paths,
@@ -75,6 +76,56 @@ def fixed_grid():
         ],
         dtype=np.uint8,
     )
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+def test_restore_rng_state_normalizes_torch_state_to_cpu(device, monkeypatch):
+    expected = torch.get_rng_state()
+    saved_state = expected.to(device)
+    restored = []
+    cuda_restored = []
+
+    monkeypatch.setattr(
+        mouse_agent_module.torch,
+        "set_rng_state",
+        lambda state: restored.append(state),
+    )
+    if torch.cuda.is_available():
+        cuda_expected = torch.cuda.get_rng_state()
+        monkeypatch.setattr(
+            mouse_agent_module.torch.cuda,
+            "set_rng_state_all",
+            lambda states: cuda_restored.extend(states),
+        )
+        training_state = {
+            "torch_rng_state": saved_state,
+            "cuda_rng_states": [cuda_expected.to(device)],
+        }
+    else:
+        training_state = {"torch_rng_state": saved_state}
+
+    _restore_rng_state(training_state)
+
+    assert len(restored) == 1
+    assert restored[0].device == torch.device("cpu")
+    assert restored[0].dtype == torch.uint8
+    assert torch.equal(restored[0], expected)
+    if torch.cuda.is_available():
+        assert len(cuda_restored) == 1
+        assert cuda_restored[0].device == torch.device("cpu")
+        assert cuda_restored[0].dtype == torch.uint8
+        assert torch.equal(cuda_restored[0], cuda_expected)
 
 
 @pytest.mark.parametrize(
