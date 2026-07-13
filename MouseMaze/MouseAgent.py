@@ -59,7 +59,7 @@ DEFAULT_ALGORITHM = "recurrent_ppo"
 # Network layout used by default for algorithms that support both layouts.
 DEFAULT_NETWORK_TYPE = "spatial"
 # Whether training resumes from the checkpoint instead of starting fresh.
-DEFAULT_RESUME = False
+DEFAULT_RESUME = True
 # Whether recurrent PPO ignores episode and transition caps until it reaches its target.
 DEFAULT_TARGET_ONLY_STOP: bool | None = None
 
