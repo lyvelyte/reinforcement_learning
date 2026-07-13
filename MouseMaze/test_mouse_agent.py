@@ -50,11 +50,15 @@ from MouseAgent import (
     _recurrent_ppo_precision_schedule,
     _restore_rng_state,
     _should_run_eval,
+    _apply_legacy_cli_aliases,
+    _save_latest_checkpoint,
     _train_config_from_args,
+    _training_speed_payload,
     _training_environment_payload,
     default_artifact_paths,
     invocation_timestamp,
     latest_model_path,
+    latest_checkpoint_path,
     paired_log_path,
     resolve_cli_artifacts,
     resolve_num_envs,
@@ -327,14 +331,21 @@ def test_default_timeout_provides_local_recovery_budget(monkeypatch):
 
     env = make_maze(config)
 
-    assert config.min_episode_steps == 60
-    assert config.timeout_step_factor == 6.0
+    assert config.min_episode_steps == 20
+    assert config.timeout_step_factor == 4.0
+    assert config.max_episode_steps == 300
     assert config.recurrent_sequence_length == 64
+    assert config.recurrent_sequence_minibatch_size == 32
+    assert config.recurrent_hidden_size == 128
+    assert config.hard_maze_fraction == 0.0
+    assert config.precision_recovery_enabled is False
+    assert config.target_solve_rate == 1.0
+    assert config.target_solve_evals == 3
     assert env.optimal_start_steps == 2
-    assert env.max_episode_steps == 60
+    assert env.max_episode_steps == 20
 
 
-def test_recurrent_precision_schedule_decays_after_budget_to_floors():
+def test_recurrent_precision_schedule_holds_lr_and_entropy_floors_after_budget():
     config = TrainConfig(
         max_env_steps=100,
         learning_rate=1e-3,
@@ -350,11 +361,28 @@ def test_recurrent_precision_schedule_decays_after_budget_to_floors():
     assert np.isclose(learning_rate, 1e-4)
     assert np.isclose(entropy, 2e-2)
     learning_rate, entropy = _recurrent_ppo_precision_schedule(200, config)
-    assert np.isclose(learning_rate, 5e-5)
-    assert np.isclose(entropy, 1e-2)
+    assert np.isclose(learning_rate, 1e-4)
+    assert np.isclose(entropy, 2e-2)
     learning_rate, entropy = _recurrent_ppo_precision_schedule(1_000, config)
-    assert np.isclose(learning_rate, 1e-5)
-    assert np.isclose(entropy, 2e-3)
+    assert np.isclose(learning_rate, 1e-4)
+    assert np.isclose(entropy, 2e-2)
+
+
+def test_default_recurrent_minibatch_preserves_2048_transition_density():
+    config = TrainConfig(
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+
+    assert config.recurrent_sequence_length == 64
+    assert config.recurrent_sequence_minibatch_size == 32
+    assert (
+        config.recurrent_sequence_length
+        * config.recurrent_sequence_minibatch_size
+        == 2_048
+    )
 
 
 def test_target_only_evaluation_ignores_episode_cap_until_step_interval():
@@ -807,6 +835,7 @@ def test_expert_pretraining_updates_a_full_map_dqn():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="dqn",
+        observation_mode="full",
         network_type="flat",
         batch_size=4,
         expert_pretrain_mazes=1,
@@ -829,6 +858,7 @@ def test_agent_masks_invalid_greedy_and_random_actions():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="dqn",
+        observation_mode="full",
         network_type="flat",
         dashboard_flag=False,
         save_path=None,
@@ -860,6 +890,7 @@ def test_spatial_q_network_masks_actions_and_saves_metadata(tmp_path):
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="dqn",
+        observation_mode="full",
         save_path=str(save_path),
         dashboard_flag=False,
         training_log_path=None,
@@ -1245,6 +1276,15 @@ def test_cli_omitted_args_use_top_level_train_config_defaults():
     assert args.inference_mazes == DEFAULT_INFERENCE_MAZES
 
 
+def test_cli_help_renders_all_percentage_descriptions(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["--help"])
+
+    assert exit_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "90%" in help_text
+
+
 def test_target_only_stop_defaults_to_recurrent_ppo_and_can_be_disabled():
     assert TrainConfig(algorithm="recurrent_ppo").target_only_stop is True
     assert TrainConfig(algorithm="dqn").target_only_stop is False
@@ -1290,11 +1330,19 @@ def test_cli_artifact_resolution_honors_explicit_paths():
 def test_latest_model_path_is_deterministic_and_ignores_unrelated_files(tmp_path):
     older = tmp_path / "20260710T123456000001Z_mousemaze.pth"
     newer = tmp_path / "20260710T123456000002Z_mousemaze.pth"
-    unrelated = (tmp_path / "latest_mousemaze.pth", tmp_path / "notes.txt")
+    latest_sidecar = tmp_path / "20260710T123456000003Z_mousemaze.latest.pth"
+    unrelated = (
+        tmp_path / "latest_mousemaze.pth",
+        latest_sidecar,
+        tmp_path / "notes.txt",
+    )
     for path in (newer, older, *unrelated):
         path.write_text("test")
 
     assert latest_model_path(str(tmp_path)) == str(newer)
+    assert latest_checkpoint_path(str(newer)) == str(
+        tmp_path / "20260710T123456000002Z_mousemaze.latest.pth"
+    )
 
 
 def test_latest_model_path_reports_actionable_error(tmp_path):
@@ -1473,7 +1521,6 @@ def test_cli_args_override_top_level_train_config_defaults():
     assert config.max_env_steps == 1234
     assert config.maze_size == (7, 9)
     assert config.dashboard_flag is False
-    assert config.eval_every == 3
     assert config.dashboard_every == 3
     assert config.eval_seed == 99
     assert config.algorithm == "ppo"
@@ -1500,14 +1547,45 @@ def test_cli_dashboard_every_can_override_eval_every():
 
     config = _train_config_from_args(args)
 
-    assert config.eval_every == 3
     assert config.dashboard_every == 5
+
+
+def test_legacy_train_updates_alias_uses_resolved_environment_count():
+    args = parse_args(
+        [
+            "--algorithm",
+            "dqn",
+            "--num-envs",
+            "8",
+            "--train-updates-per-step",
+            "2",
+        ]
+    )
+    config = _apply_legacy_cli_aliases(_train_config_from_args(args), args)
+
+    assert config.num_envs == 8
+    assert config.updates_per_transition == 0.25
+
+
+def test_cli_rejects_both_update_rate_interfaces():
+    args = parse_args(
+        [
+            "--train-updates-per-step",
+            "2",
+            "--updates-per-transition",
+            "0.25",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="cannot be used together"):
+        _train_config_from_args(args)
 
 
 def test_small_cpu_training_smoke_runs_without_dashboard():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="dqn",
+        observation_mode="full",
         episodes=3,
         seed=123,
         max_episode_steps=10,
@@ -1516,8 +1594,8 @@ def test_small_cpu_training_smoke_runs_without_dashboard():
         min_replay_size=4,
         target_update_freq=2,
         num_envs=1,
-        train_updates_per_step=1,
-        eval_every=2,
+        updates_per_transition=1.0,
+        eval_every_steps=2,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=None,
@@ -1570,6 +1648,7 @@ def test_ppo_masked_sampling_never_chooses_invalid_actions():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="ppo",
+        observation_mode="full",
         dashboard_flag=False,
         save_path=None,
         training_log_path=None,
@@ -1593,6 +1672,7 @@ def test_small_cpu_ppo_training_smoke_runs_without_dashboard():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="ppo",
+        observation_mode="full",
         episodes=3,
         seed=123,
         max_episode_steps=10,
@@ -1600,7 +1680,7 @@ def test_small_cpu_ppo_training_smoke_runs_without_dashboard():
         batch_size=4,
         ppo_rollout_steps=4,
         ppo_epochs=1,
-        eval_every=2,
+        eval_every_steps=2,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=None,
@@ -1647,6 +1727,7 @@ def test_checkpoint_can_restore_optional_replay_contents(tmp_path):
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="dqn",
+        observation_mode="full",
         buffer_size=16,
         min_replay_size=4,
         checkpoint_replay=True,
@@ -1668,6 +1749,156 @@ def test_checkpoint_can_restore_optional_replay_contents(tmp_path):
     assert resumed.buffer.rewards[0] == 1.0
 
 
+def test_periodic_latest_checkpoint_uses_sidecar_and_cadence(tmp_path):
+    save_path = tmp_path / "best.pth"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="dqn",
+        observation_mode="full",
+        latest_checkpoint_every_steps=10,
+        save_path=str(save_path),
+        dashboard_flag=False,
+        training_log_path=None,
+        device="cpu",
+    )
+    agent = MouseAgent(config=config, device=torch.device("cpu"))
+    logger = mouse_agent_module._TrainingLogger(None)
+
+    assert not _save_latest_checkpoint(agent, config, logger, 9, "periodic")
+    assert not save_path.exists()
+    agent.total_env_steps = 10
+    agent.training_state = {"total_steps": 10, "completed_episodes": 2}
+    assert _save_latest_checkpoint(agent, config, logger, 10, "periodic")
+
+    sidecar = tmp_path / "best.latest.pth"
+    payload = torch.load(sidecar, map_location=torch.device("cpu"), weights_only=False)
+    assert sidecar.exists()
+    assert not save_path.exists()
+    assert payload["total_env_steps"] == 10
+    assert payload["training_state"]["last_latest_checkpoint_step"] == 10
+    assert not _save_latest_checkpoint(agent, config, logger, 19, "periodic")
+
+
+def test_interruption_saves_latest_sidecar(monkeypatch, tmp_path):
+    save_path = tmp_path / "interrupted.pth"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="dqn",
+        observation_mode="full",
+        episodes=1,
+        num_envs=1,
+        resume=False,
+        save_path=str(save_path),
+        dashboard_flag=False,
+        training_log_path=None,
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+    )
+    agent = MouseAgent(config=config, device=torch.device("cpu"))
+
+    def interrupt_training(agent, *_args):
+        agent.total_env_steps = 37
+        agent.training_state = {"total_steps": 37, "completed_episodes": 3}
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(mouse_agent_module, "_train_dqn", interrupt_training)
+
+    with pytest.raises(KeyboardInterrupt):
+        train(agent=agent, config=config)
+
+    payload = torch.load(
+        tmp_path / "interrupted.latest.pth",
+        map_location=torch.device("cpu"),
+        weights_only=False,
+    )
+    assert payload["total_env_steps"] == 37
+    assert payload["training_state"]["total_steps"] == 37
+
+
+def test_sidecar_resume_keeps_current_and_frozen_best_separate(
+    monkeypatch,
+    tmp_path,
+):
+    save_path = tmp_path / "recurrent.pth"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        observation_mode="local",
+        view_size=5,
+        recurrent_hidden_size=16,
+        resume=True,
+        dashboard_flag=False,
+        save_path=str(save_path),
+        training_log_path=None,
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+    best_agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    with torch.no_grad():
+        for parameter in best_agent.policy_net.parameters():
+            parameter.fill_(1.0)
+    best_agent.best_greedy_solve_rate = 0.9
+    best_agent.total_env_steps = 80
+    best_agent.training_state = {"total_steps": 80, "completed_episodes": 8}
+    best_agent.save(str(save_path))
+
+    latest_agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    with torch.no_grad():
+        for parameter in latest_agent.policy_net.parameters():
+            parameter.fill_(2.0)
+    latest_agent.best_greedy_solve_rate = 0.9
+    latest_agent.total_env_steps = 100
+    latest_agent.training_state = {"total_steps": 100, "completed_episodes": 10}
+    latest_agent.save(latest_checkpoint_path(str(save_path)))
+
+    captured = []
+
+    def capture_training(
+        agent,
+        _config,
+        _logger,
+        _start_time,
+        _process_start_cpu,
+        *,
+        initial_best_weights,
+        initial_best_optimizer_state,
+    ):
+        first_parameter_name = next(iter(dict(agent.policy_net.named_parameters())))
+        current_value = float(
+            agent.policy_net.state_dict()[first_parameter_name].mean()
+        )
+        best_value = (
+            None
+            if initial_best_weights is None
+            else float(initial_best_weights[first_parameter_name].mean())
+        )
+        captured.append(
+            (current_value, best_value, initial_best_optimizer_state is not None)
+        )
+        return MetricsTracker()
+
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_train_recurrent_ppo",
+        capture_training,
+    )
+    resumed = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    train(agent=resumed, config=config)
+
+    assert resumed.total_env_steps == 100
+    assert captured[-1] == (2.0, 1.0, True)
+
+    (tmp_path / "recurrent.latest.pth").unlink()
+    legacy_resumed = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    train(agent=legacy_resumed, config=config)
+
+    assert legacy_resumed.total_env_steps == 80
+    assert captured[-1] == (1.0, None, False)
+
+
 def test_train_resumes_existing_save_path_only_when_requested(tmp_path, capsys):
     save_path = tmp_path / "resume_weights.pth"
     config = TrainConfig(
@@ -1681,8 +1912,8 @@ def test_train_resumes_existing_save_path_only_when_requested(tmp_path, capsys):
         min_replay_size=128,
         target_update_freq=2,
         num_envs=1,
-        train_updates_per_step=1,
-        eval_every=1,
+        updates_per_transition=1.0,
+        eval_every_steps=1,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=str(save_path),
@@ -1699,7 +1930,7 @@ def test_train_resumes_existing_save_path_only_when_requested(tmp_path, capsys):
     train(agent=resumed_agent, config=config)
     output = capsys.readouterr().out
 
-    assert "[train] resumed weights from" in output
+    assert "[train] resumed training state from" in output
     assert str(save_path) in output
     assert resumed_agent.update_count == 11
     assert resumed_agent.total_env_steps >= 99
@@ -1715,8 +1946,8 @@ def test_train_resumes_existing_save_path_only_when_requested(tmp_path, capsys):
         min_replay_size=128,
         target_update_freq=2,
         num_envs=1,
-        train_updates_per_step=1,
-        eval_every=1,
+        updates_per_transition=1.0,
+        eval_every_steps=1,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=str(save_path),
@@ -1729,7 +1960,7 @@ def test_train_resumes_existing_save_path_only_when_requested(tmp_path, capsys):
     train(agent=fresh_agent, config=fresh_config)
     output = capsys.readouterr().out
 
-    assert "[train] starting fresh" in output
+    assert "[train] starting a fresh experiment" in output
     assert fresh_agent.update_count != 11
 
 
@@ -1801,6 +2032,7 @@ def test_training_does_not_log_duplicate_eval_episodes(tmp_path, monkeypatch):
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="dqn",
+        observation_mode="full",
         episodes=2,
         seed=123,
         max_episode_steps=10,
@@ -1809,8 +2041,8 @@ def test_training_does_not_log_duplicate_eval_episodes(tmp_path, monkeypatch):
         min_replay_size=128,
         target_update_freq=2,
         num_envs=2,
-        train_updates_per_step=1,
-        eval_every=100,
+        updates_per_transition=1.0,
+        eval_every_steps=100,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=None,
@@ -1842,8 +2074,8 @@ def test_training_writes_jsonl_log_with_metrics_speed_and_utilization(tmp_path):
         min_replay_size=128,
         target_update_freq=2,
         num_envs=1,
-        train_updates_per_step=1,
-        eval_every=1,
+        updates_per_transition=1.0,
+        eval_every_steps=1,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=None,
@@ -1878,6 +2110,23 @@ def test_training_writes_jsonl_log_with_metrics_speed_and_utilization(tmp_path):
     assert all(isinstance(record["time_unix"], float) for record in records)
 
 
+def test_resumed_speed_uses_process_local_counter_deltas(monkeypatch):
+    monkeypatch.setattr(mouse_agent_module.time, "perf_counter", lambda: 110.0)
+
+    speed = _training_speed_payload(
+        completed=1_005,
+        total_steps=10_100,
+        start_time=100.0,
+        start_completed=1_000,
+        start_total_steps=10_000,
+    )
+
+    assert speed["process_steps"] == 100
+    assert speed["process_episodes"] == 5
+    assert speed["steps_per_second"] == 10.0
+    assert speed["episodes_per_second"] == 0.5
+
+
 def test_training_saves_new_best_weights_to_configured_path(tmp_path, capsys):
     save_path = tmp_path / "best_weights.pth"
     config = TrainConfig(
@@ -1891,8 +2140,8 @@ def test_training_saves_new_best_weights_to_configured_path(tmp_path, capsys):
         min_replay_size=4,
         target_update_freq=2,
         num_envs=1,
-        train_updates_per_step=1,
-        eval_every=1,
+        updates_per_transition=1.0,
+        eval_every_steps=1,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=str(save_path),
@@ -1951,6 +2200,7 @@ def test_recurrent_sequence_matches_step_unroll_and_resets_hidden_state():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+        observation_mode="full",
         num_envs=2,
         ppo_rollout_steps=4,
         recurrent_sequence_length=2,
@@ -1965,7 +2215,12 @@ def test_recurrent_sequence_matches_step_unroll_and_resets_hidden_state():
     )
     agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
     observation = torch.from_numpy(
-        np.stack([Maze(fixed_grid()).reset(), Maze(fixed_grid()).reset()])
+        np.stack(
+            [
+                Maze(fixed_grid(), observation_mode="full").reset(),
+                Maze(fixed_grid(), observation_mode="full").reset(),
+            ]
+        )
     )
     observations = observation.unsqueeze(0).repeat(2, 1, 1, 1, 1)
     previous_actions = torch.tensor([[-1, -1], [0, 0]])
@@ -2232,7 +2487,7 @@ def test_target_only_recurrent_ppo_confirms_frozen_candidate_and_ignores_legacy_
         recurrent_sequence_minibatch_size=1,
         eval_every_steps=1,
         eval_episodes=1,
-        target_solve_rate=0.9,
+        target_solve_rate=1.0,
         target_solve_evals=2,
         curriculum_enabled=True,
         curriculum_promotion_rate=0.9,
@@ -2271,6 +2526,12 @@ def test_target_only_recurrent_ppo_confirms_frozen_candidate_and_ignores_legacy_
     )
     assert all(
         "entropy_coefficient" in record
+        for record in records
+        if record["event"] == "learner"
+    )
+    assert all(
+        "effective_transition_minibatch_size" in record["ppo"]
+        and "optimizer_updates_this_rollout" in record["ppo"]
         for record in records
         if record["event"] == "learner"
     )
@@ -2321,12 +2582,77 @@ def test_failed_target_confirmation_resumes_training(monkeypatch):
 
     assert agent.training_state["target_confirmed"] is True
     assert agent.total_env_steps >= 2
-    assert agent.training_state["hard_maze_grids"]
-    assert all(
-        not np.array_equal(grid, fixed_grid())
-        for grid in agent.training_state["hard_maze_grids"]
-    )
+    assert "hard_maze_grids" not in agent.training_state
     assert not rates
+
+
+def test_disabled_precision_recovery_clears_legacy_active_state(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_eval_greedy",
+        lambda agent, config, **kwargs: EvalMetrics(solve_rate=1.0),
+    )
+    log_path = tmp_path / "disabled-recovery.jsonl"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        observation_mode="local",
+        view_size=5,
+        episodes=1,
+        max_env_steps=1,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        rnd_reward_coef=0.0,
+        eval_every_steps=1,
+        eval_episodes=1,
+        target_solve_rate=1.0,
+        target_solve_evals=2,
+        precision_recovery_enabled=False,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=str(tmp_path / "legacy-recovery.pth"),
+        training_log_path=str(log_path),
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+    legacy_agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    legacy_agent.training_state = {
+        "total_steps": 0,
+        "completed_episodes": 0,
+        "precision_recovery": {
+            "plateau_evals": 12,
+            "active": True,
+            "end_step": 999,
+            "count": 4,
+        },
+    }
+    legacy_agent.save(config.save_path)
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+
+    train(agent=agent, config=config)
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+
+    assert agent.training_state["precision_recovery"] == {
+        "enabled": False,
+        "plateau_evals": 0,
+        "active": False,
+        "end_step": 0,
+        "count": 0,
+    }
+    assert not any(record["event"] == "precision_recovery" for record in records)
+    learner = next(record for record in records if record["event"] == "learner")
+    assert learner["precision_recovery_active"] is False
+    assert learner["timing"]["estimated_seconds_remaining"] is None
 
 
 @pytest.mark.parametrize(
@@ -2369,6 +2695,7 @@ def test_precision_recovery_handles_improvement_and_rollback(
         precision_plateau_evals=1,
         precision_recovery_steps=1,
         precision_recovery_lr_fraction=0.05,
+        precision_recovery_enabled=True,
         curriculum_enabled=False,
         dashboard_flag=False,
         save_path=None,

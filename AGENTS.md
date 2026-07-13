@@ -28,7 +28,8 @@ Two independent RL projects live side-by-side under this repo root:
 - `marioppo/alveybj/models/best_model.zip` — CNN-PPO weights.
 - `marioppo/alveybj/lstm_models/best_model.zip` — RecurrentPPO weights.
 - `marioppo/clarity_coder/ppo_level_1_1.zip` — PPO level-1 model.
-- `MouseMaze/results/models/<timestamp>_mousemaze.pth` — Schema-v2 checkpoints. Recurrent PPO resumes the newest one by default; inference and benchmarks also select the latest timestamp by default.
+- `MouseMaze/results/models/<timestamp>_mousemaze.pth` — Schema-v2 frozen-best checkpoints selected by inference and benchmarks.
+- `MouseMaze/results/models/<timestamp>_mousemaze.latest.pth` — Atomic resumable sidecars containing the current policy and full training state. Default resume prefers the paired sidecar and falls back to the frozen-best checkpoint.
 - `MouseMaze/agent_weights*.pth` — Earlier DQN artifacts are archived and incompatible with the schema-v2 loader.
 
 ### Logs & telemetry

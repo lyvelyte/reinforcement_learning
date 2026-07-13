@@ -108,9 +108,9 @@ DEFAULT_PRIORITY_BETA_STEPS = 1_500_000
 # Hard cap on steps in one maze episode.
 MAX_EPISODE_STEPS = 300
 # Multiplier used to provide a maze-size-aware recovery budget when enabled.
-DEFAULT_TIMEOUT_STEP_FACTOR = 6.0
+DEFAULT_TIMEOUT_STEP_FACTOR = 4.0
 # Minimum episode length allowing local agents to recover from short wrong turns.
-DEFAULT_MIN_EPISODE_STEPS = 60
+DEFAULT_MIN_EPISODE_STEPS = 20
 # Number of episodes in each standard evaluation pass during training.
 NUM_EVAL_EPISODES = 500
 # Episode-based dashboard/evaluation cadence compatibility default.
@@ -179,7 +179,7 @@ DEFAULT_CURRICULUM_PREVIOUS_FRACTION = 0.20
 # Fraction of curriculum tasks sampled uniformly across available stages.
 DEFAULT_CURRICULUM_UNIFORM_FRACTION = 0.10
 # Fraction of training tasks drawn from transformed held-out failures.
-DEFAULT_HARD_MAZE_FRACTION = 0.15
+DEFAULT_HARD_MAZE_FRACTION = 0.0
 # Maximum number of transformed hard-maze variants retained in memory.
 DEFAULT_HARD_MAZE_POOL_SIZE = 256
 # Validation range over which hard replay ramps to its configured maximum.
@@ -213,6 +213,10 @@ DEFAULT_PRECISION_PLATEAU_EVALS = 20
 DEFAULT_PRECISION_RECOVERY_STEPS = 1_000_000
 # Fraction of the initial learning rate used during precision recovery.
 DEFAULT_PRECISION_RECOVERY_LR_FRACTION = 0.05
+# Whether rollback-based post-budget precision recovery is active.
+DEFAULT_PRECISION_RECOVERY_ENABLED = False
+# Transition cadence for the resumable latest-training sidecar.
+DEFAULT_LATEST_CHECKPOINT_EVERY_STEPS = 1_000_000
 # Number of mazes used to evaluate a curriculum stage.
 DEFAULT_CURRICULUM_EVAL_EPISODES = 200
 # Worker processes used for deterministic background maze generation.
@@ -241,7 +245,7 @@ RECURRENT_HIDDEN_SIZE = 128
 # Number of consecutive steps in a recurrent PPO training sequence.
 RECURRENT_SEQUENCE_LENGTH = 64
 # Number of recurrent sequences processed in one PPO minibatch.
-RECURRENT_SEQUENCE_MINIBATCH_SIZE = 64
+RECURRENT_SEQUENCE_MINIBATCH_SIZE = 32
 # Coefficient for random-network-distillation intrinsic reward.
 RND_REWARD_COEF = 0.10
 # Maximum absolute intrinsic reward contribution from RND.
@@ -332,6 +336,8 @@ class TrainConfig:
     precision_plateau_evals: int = DEFAULT_PRECISION_PLATEAU_EVALS
     precision_recovery_steps: int = DEFAULT_PRECISION_RECOVERY_STEPS
     precision_recovery_lr_fraction: float = DEFAULT_PRECISION_RECOVERY_LR_FRACTION
+    precision_recovery_enabled: bool = DEFAULT_PRECISION_RECOVERY_ENABLED
+    latest_checkpoint_every_steps: int = DEFAULT_LATEST_CHECKPOINT_EVERY_STEPS
     performance_profile: str = DEFAULT_PERFORMANCE_PROFILE
     maze_workers: int = DEFAULT_MAZE_WORKERS
     dashboard_flag: bool = DEFAULT_DASHBOARD_FLAG
@@ -489,6 +495,8 @@ class TrainConfig:
             raise ValueError("precision recovery intervals must be >= 1")
         if not 0 < self.precision_recovery_lr_fraction <= 1:
             raise ValueError("precision_recovery_lr_fraction must be in (0, 1]")
+        if self.latest_checkpoint_every_steps < 1:
+            raise ValueError("latest_checkpoint_every_steps must be >= 1")
         if self.maze_workers < 0:
             raise ValueError("maze_workers must be >= 0")
         if self.expert_pretrain_mazes < 0 or self.expert_pretrain_epochs < 0:
@@ -3136,30 +3144,12 @@ def _recurrent_ppo_precision_schedule(
     total_steps: int,
     config: TrainConfig,
 ) -> tuple[float, float]:
-    """Return late-training learning-rate and entropy coefficients.
-
-    The original linear schedule is preserved through the configured budget.
-    Target-only training then enters a precision phase that halves both sources
-    of policy movement once per additional transition budget.
-    """
+    """Return the proven finite-budget schedule and its stable precision floor."""
 
     budget = max(config.max_env_steps, 1)
-    if total_steps <= budget:
-        progress = max(total_steps, 0) / budget
-        learning_rate = config.learning_rate * (1.0 - 0.9 * progress)
-        return learning_rate, config.ppo_entropy_coef
-
-    overflow_budgets = (total_steps - budget) / budget
-    decay = 0.5**overflow_budgets
-    learning_rate = max(
-        config.learning_rate * 0.01,
-        config.learning_rate * 0.10 * decay,
-    )
-    entropy_coefficient = max(
-        config.ppo_entropy_coef * 0.10,
-        config.ppo_entropy_coef * decay,
-    )
-    return learning_rate, entropy_coefficient
+    progress = min(max(total_steps, 0) / budget, 1.0)
+    learning_rate = config.learning_rate * (1.0 - 0.9 * progress)
+    return learning_rate, config.ppo_entropy_coef
 
 
 def _eval_greedy(
@@ -3891,6 +3881,13 @@ def paired_log_path(model_path: str, log_directory: str | None = None) -> str:
     )
 
 
+def latest_checkpoint_path(save_path: str) -> str:
+    """Return the resumable sidecar path paired with a frozen-best checkpoint."""
+
+    stem, extension = os.path.splitext(save_path)
+    return f"{stem}.latest{extension}"
+
+
 def latest_model_path(model_directory: str = MODEL_RESULTS_DIR) -> str:
     """Return the latest timestamp-named MouseMaze model in a directory."""
 
@@ -4090,12 +4087,18 @@ def _training_speed_payload(
     completed: int,
     total_steps: int,
     start_time: float,
-) -> dict[str, float]:
+    start_completed: int = 0,
+    start_total_steps: int = 0,
+) -> dict[str, float | int]:
     elapsed = max(time.perf_counter() - start_time, 1e-9)
+    process_steps = max(total_steps - start_total_steps, 0)
+    process_episodes = max(completed - start_completed, 0)
     return {
         "elapsed_seconds": elapsed,
-        "steps_per_second": total_steps / elapsed,
-        "episodes_per_second": completed / elapsed,
+        "process_steps": process_steps,
+        "process_episodes": process_episodes,
+        "steps_per_second": process_steps / elapsed,
+        "episodes_per_second": process_episodes / elapsed,
     }
 
 
@@ -4186,6 +4189,8 @@ def _training_snapshot_payload(
     start_time: float,
     process_start_cpu: float,
 ) -> dict[str, object]:
+    process_start_steps = int(getattr(agent, "_process_start_total_steps", 0))
+    process_start_episodes = int(getattr(agent, "_process_start_completed", 0))
     return {
         "episode": completed,
         "total_steps": total_steps,
@@ -4196,7 +4201,13 @@ def _training_snapshot_payload(
         "best_greedy_solve_rate": max(best_eval_rate, 0.0),
         "metrics": _training_metrics_payload(tracker),
         "greedy": _eval_metrics_payload(greedy),
-        "speed": _training_speed_payload(completed, total_steps, start_time),
+        "speed": _training_speed_payload(
+            completed,
+            total_steps,
+            start_time,
+            process_start_episodes,
+            process_start_steps,
+        ),
         "utilization": _runtime_utilization_payload(
             agent.device,
             start_time,
@@ -4260,6 +4271,28 @@ def restore_optimizer_state(agent: Agent, state: dict[str, object]) -> None:
     """Restore optimizer moments without changing training counters or RNGs."""
 
     agent.optimizer.load_state_dict(copy.deepcopy(state))
+
+
+def checkpoint_training_states(
+    path: str,
+) -> tuple[dict[str, torch.Tensor], dict[str, object] | None]:
+    """Load frozen model and optimizer states without mutating the live agent."""
+
+    payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            f"checkpoint {path!r} is not a MouseMaze "
+            f"schema-v{CHECKPOINT_SCHEMA_VERSION} checkpoint"
+        )
+    weights = {
+        key: value.detach().cpu().clone()
+        for key, value in payload["state_dict"].items()
+    }
+    optimizer_state = payload.get("optimizer_state_dict")
+    return weights, copy.deepcopy(optimizer_state)
 
 
 def create_agent(
@@ -4366,6 +4399,10 @@ def _update_training_state(
         "torch_rng_state": torch.get_rng_state(),
         "train_rng_state": train_rng.getstate(),
     }
+    if "last_latest_checkpoint_step" in agent.training_state:
+        state["last_latest_checkpoint_step"] = int(
+            agent.training_state["last_latest_checkpoint_step"]
+        )
     if torch.cuda.is_available():
         state["cuda_rng_states"] = torch.cuda.get_rng_state_all()
     if curriculum is not None:
@@ -4373,7 +4410,7 @@ def _update_training_state(
             "level": curriculum.level,
             "success_streak": curriculum.success_streak,
         }
-    if hard_sampler is not None:
+    if hard_sampler is not None and hard_sampler.config.hard_maze_fraction > 0.0:
         state["hard_maze_grids"] = [
             grid.copy() for grid in hard_sampler.hard_grids
         ]
@@ -4387,6 +4424,46 @@ def _update_training_state(
     if precision_recovery is not None:
         state["precision_recovery"] = dict(precision_recovery)
     agent.training_state = state
+
+
+def _save_latest_checkpoint(
+    agent: Agent,
+    config: TrainConfig,
+    logger: _TrainingLogger,
+    total_steps: int,
+    reason: str,
+    *,
+    force: bool = False,
+) -> bool:
+    """Atomically save resumable training state when its cadence is due."""
+
+    if config.save_path is None:
+        return False
+    last_save_step = int(agent.training_state.get("last_latest_checkpoint_step", 0))
+    if (
+        not force
+        and total_steps - last_save_step < config.latest_checkpoint_every_steps
+    ):
+        return False
+    agent.training_state["total_steps"] = max(
+        int(agent.training_state.get("total_steps", 0)),
+        total_steps,
+        agent.total_env_steps,
+    )
+    agent.training_state["last_latest_checkpoint_step"] = total_steps
+    sidecar_path = latest_checkpoint_path(config.save_path)
+    agent.save(sidecar_path)
+    if logger.enabled:
+        logger.log(
+            "checkpoint",
+            checkpoint_path=sidecar_path,
+            reason=reason,
+            total_steps=total_steps,
+            agent_total_env_steps=agent.total_env_steps,
+            update_count=agent.update_count,
+            best_greedy_solve_rate=agent.best_greedy_solve_rate,
+        )
+    return True
 
 
 def _maybe_run_eval(
@@ -4473,6 +4550,13 @@ def _maybe_run_eval(
                 process_start_cpu,
             ),
         )
+    _save_latest_checkpoint(
+        agent,
+        config,
+        logger,
+        total_steps,
+        "periodic_latest",
+    )
     return greedy, last_eval_step, best_eval_rate, best_weights
 
 
@@ -4540,6 +4624,14 @@ def _finish_training(
     start_time: float,
     process_start_cpu: float,
 ) -> MetricsTracker:
+    _save_latest_checkpoint(
+        agent,
+        config,
+        logger,
+        total_steps,
+        "final_latest",
+        force=True,
+    )
     if best_weights is not None:
         restore_agent_weights(agent, best_weights)
         agent.best_greedy_solve_rate = best_eval_rate
@@ -4646,21 +4738,54 @@ def train(
         ensure_agent_matches_config(agent, config)
 
     resumed = False
-    if config.save_path and os.path.exists(config.save_path) and config.resume:
-        agent.load(config.save_path)
+    resume_checkpoint_path = config.save_path
+    frozen_best_weights: dict[str, torch.Tensor] | None = None
+    frozen_best_optimizer_state: dict[str, object] | None = None
+    if config.save_path and config.resume:
+        sidecar_path = latest_checkpoint_path(config.save_path)
+        if os.path.exists(sidecar_path):
+            resume_checkpoint_path = sidecar_path
+            if os.path.exists(config.save_path):
+                (
+                    frozen_best_weights,
+                    frozen_best_optimizer_state,
+                ) = checkpoint_training_states(config.save_path)
+    if (
+        resume_checkpoint_path
+        and os.path.exists(resume_checkpoint_path)
+        and config.resume
+    ):
+        agent.load(resume_checkpoint_path)
         resumed = True
         _restore_rng_state(agent.training_state)
-        print(f"[train] resumed weights from {config.save_path}")
+        print(f"[train] resumed training state from {resume_checkpoint_path}")
         if logger.enabled:
             logger.log(
                 "resume",
-                checkpoint_path=config.save_path,
+                checkpoint_path=resume_checkpoint_path,
+                frozen_best_checkpoint_path=(
+                    config.save_path if frozen_best_weights is not None else None
+                ),
                 update_count=agent.update_count,
                 agent_total_env_steps=agent.total_env_steps,
                 best_greedy_solve_rate=agent.best_greedy_solve_rate,
             )
     elif config.save_path and os.path.exists(config.save_path):
-        print(f"[train] starting fresh; pass --resume to load {config.save_path}")
+        print(
+            "[train] starting a fresh experiment without loading "
+            f"{config.save_path}"
+        )
+
+    setattr(
+        agent,
+        "_process_start_total_steps",
+        max(int(agent.training_state.get("total_steps", 0)), agent.total_env_steps),
+    )
+    setattr(
+        agent,
+        "_process_start_completed",
+        int(agent.training_state.get("completed_episodes", 0)),
+    )
 
     if logger.enabled:
         logger.log(
@@ -4668,11 +4793,16 @@ def train(
             artifact_timestamp=run_timestamp,
             artifact_paths={
                 "model": config.save_path,
+                "latest": (
+                    latest_checkpoint_path(config.save_path)
+                    if config.save_path is not None
+                    else None
+                ),
                 "log": config.training_log_path,
             },
             config=_train_config_payload(config),
             environment=_training_environment_payload(device),
-            checkpoint_path=config.save_path,
+            checkpoint_path=resume_checkpoint_path if resumed else config.save_path,
             resumed=resumed,
             update_count=agent.update_count,
             agent_total_env_steps=agent.total_env_steps,
@@ -4691,32 +4821,51 @@ def train(
                     loss=expert_loss,
                 )
 
-    if config.algorithm == "dqn":
-        assert isinstance(agent, MouseAgent)
-        return _train_dqn(
+    try:
+        if config.algorithm == "dqn":
+            assert isinstance(agent, MouseAgent)
+            return _train_dqn(
+                agent,
+                config,
+                logger,
+                start_time,
+                process_start_cpu,
+            )
+        if config.algorithm == "ppo":
+            assert isinstance(agent, MaskedPPOAgent)
+            return _train_ppo(
+                agent,
+                config,
+                logger,
+                start_time,
+                process_start_cpu,
+            )
+        assert isinstance(agent, RecurrentPPOAgent)
+        return _train_recurrent_ppo(
             agent,
             config,
             logger,
             start_time,
             process_start_cpu,
+            initial_best_weights=frozen_best_weights,
+            initial_best_optimizer_state=frozen_best_optimizer_state,
         )
-    if config.algorithm == "ppo":
-        assert isinstance(agent, MaskedPPOAgent)
-        return _train_ppo(
+    except KeyboardInterrupt:
+        interrupted_steps = max(
+            int(agent.training_state.get("total_steps", 0)),
+            agent.total_env_steps,
+        )
+        saved_interruption = _save_latest_checkpoint(
             agent,
             config,
             logger,
-            start_time,
-            process_start_cpu,
+            interrupted_steps,
+            "interrupted_latest",
+            force=True,
         )
-    assert isinstance(agent, RecurrentPPOAgent)
-    return _train_recurrent_ppo(
-        agent,
-        config,
-        logger,
-        start_time,
-        process_start_cpu,
-    )
+        if saved_interruption:
+            print("[train] interruption checkpoint saved.")
+        raise
 
 
 def _train_dqn(
@@ -5342,13 +5491,17 @@ def _train_recurrent_ppo(
     logger: _TrainingLogger,
     start_time: float,
     process_start_cpu: float,
+    initial_best_weights: dict[str, torch.Tensor] | None = None,
+    initial_best_optimizer_state: dict[str, object] | None = None,
 ) -> MetricsTracker:
     """Train stateful PPO with GPU-resident rollouts and vectorized mazes."""
 
     tracker = MetricsTracker()
     dashboard = Dashboard() if config.dashboard_flag else None
     best_eval_rate = agent.best_greedy_solve_rate
-    best_weights = clone_agent_weights(agent) if best_eval_rate >= 0 else None
+    best_weights = initial_best_weights
+    if best_weights is None and best_eval_rate >= 0:
+        best_weights = clone_agent_weights(agent)
     saved_state = agent.training_state
     saved_completed = int(saved_state.get("completed_episodes", 0))
     completed = (
@@ -5364,16 +5517,33 @@ def _train_recurrent_ppo(
     recovery_saved = saved_state.get("precision_recovery", {})
     if not isinstance(recovery_saved, dict):
         recovery_saved = {}
-    plateau_evals = max(int(recovery_saved.get("plateau_evals", 0)), 0)
-    recovery_active = bool(recovery_saved.get("active", False))
-    recovery_end_step = max(int(recovery_saved.get("end_step", 0)), 0)
-    recovery_count = max(int(recovery_saved.get("count", 0)), 0)
-    best_optimizer_state = (
-        clone_optimizer_state(agent) if best_weights is not None else None
+    plateau_evals = (
+        max(int(recovery_saved.get("plateau_evals", 0)), 0)
+        if config.precision_recovery_enabled
+        else 0
     )
+    recovery_active = (
+        bool(recovery_saved.get("active", False))
+        if config.precision_recovery_enabled
+        else False
+    )
+    recovery_end_step = (
+        max(int(recovery_saved.get("end_step", 0)), 0)
+        if config.precision_recovery_enabled
+        else 0
+    )
+    recovery_count = (
+        max(int(recovery_saved.get("count", 0)), 0)
+        if config.precision_recovery_enabled
+        else 0
+    )
+    best_optimizer_state = initial_best_optimizer_state
+    if best_optimizer_state is None and best_weights is not None:
+        best_optimizer_state = clone_optimizer_state(agent)
 
     def precision_recovery_payload() -> dict[str, object]:
         return {
+            "enabled": config.precision_recovery_enabled,
             "plateau_evals": plateau_evals,
             "active": recovery_active,
             "end_step": recovery_end_step,
@@ -5383,12 +5553,13 @@ def _train_recurrent_ppo(
     if "train_rng_state" in saved_state:
         train_rng.setstate(saved_state["train_rng_state"])
     sampler = MazeTaskSampler(config, train_rng)
-    sampler.restore_hard_grids(
-        saved_state.get("hard_maze_grids"),
-        saved_state.get("hard_maze_seen_keys"),
-        saved_state.get("hard_maze_candidates_seen"),
-        saved_state.get("hard_maze_validation_solve_rate"),
-    )
+    if config.hard_maze_fraction > 0.0:
+        sampler.restore_hard_grids(
+            saved_state.get("hard_maze_grids"),
+            saved_state.get("hard_maze_seen_keys"),
+            saved_state.get("hard_maze_candidates_seen"),
+            saved_state.get("hard_maze_validation_solve_rate"),
+        )
     curriculum_state = saved_state.get("curriculum")
     if isinstance(curriculum_state, dict):
         sampler.curriculum.level = int(curriculum_state.get("level", 0))
@@ -5598,12 +5769,13 @@ def _train_recurrent_ppo(
             total_steps,
             config,
         )
-        if recovery_active:
+        if config.precision_recovery_enabled and recovery_active:
             learning_rate = (
                 config.learning_rate * config.precision_recovery_lr_fraction
             )
         for group in agent.optimizer.param_groups:
             group["lr"] = learning_rate
+        updates_before_rollout = agent.update_count
         update_metrics = _recurrent_ppo_update(
             agent,
             config,
@@ -5624,8 +5796,16 @@ def _train_recurrent_ppo(
         learner_seconds = time.perf_counter() - learner_started
         if logger.enabled:
             elapsed = max(time.perf_counter() - start_time, 1e-9)
-            steps_per_second = total_steps / elapsed
-            remaining_steps = max(config.max_env_steps - total_steps, 0)
+            process_start_steps = int(
+                getattr(agent, "_process_start_total_steps", 0)
+            )
+            steps_per_second = max(total_steps - process_start_steps, 0) / elapsed
+            estimated_seconds_remaining = (
+                (config.max_env_steps - total_steps)
+                / max(steps_per_second, 1e-9)
+                if total_steps < config.max_env_steps
+                else None
+            )
             logger.log(
                 "learner",
                 episode=completed,
@@ -5644,6 +5824,13 @@ def _train_recurrent_ppo(
                     "entropy": update_metrics.entropy,
                     "approx_kl": update_metrics.approx_kl,
                     "epochs": update_metrics.epochs,
+                    "effective_transition_minibatch_size": (
+                        config.recurrent_sequence_length
+                        * config.recurrent_sequence_minibatch_size
+                    ),
+                    "optimizer_updates_this_rollout": (
+                        agent.update_count - updates_before_rollout
+                    ),
                 },
                 timing={
                     "collector_seconds": collector_seconds,
@@ -5652,9 +5839,28 @@ def _train_recurrent_ppo(
                     "maze_generation_seconds": maze_generation_seconds,
                     "learner_seconds": learner_seconds,
                     "steps_per_second": steps_per_second,
-                    "estimated_seconds_remaining": remaining_steps / max(steps_per_second, 1e-9),
+                    "estimated_seconds_remaining": estimated_seconds_remaining,
                 },
             )
+
+        _update_training_state(
+            agent,
+            completed,
+            total_steps,
+            last_eval_step,
+            train_rng,
+            curriculum=sampler.curriculum,
+            hard_sampler=sampler,
+            precision_recovery=precision_recovery_payload(),
+        )
+        agent.training_state["target_confirmed"] = False
+        _save_latest_checkpoint(
+            agent,
+            config,
+            logger,
+            total_steps,
+            "periodic_latest",
+        )
 
         def record_evaluation(metrics: EvalMetrics) -> None:
             promoted = False
@@ -5668,7 +5874,8 @@ def _train_recurrent_ppo(
                 sampler.record_validation_solve_rate(metrics.solve_rate)
             hard_variants_added = (
                 sampler.add_failed_grids(metrics.failed_grids)
-                if not config.curriculum_enabled or sampler.curriculum.complete
+                if config.hard_maze_fraction > 0.0
+                and (not config.curriculum_enabled or sampler.curriculum.complete)
                 else 0
             )
             _update_training_state(
@@ -5766,9 +5973,13 @@ def _train_recurrent_ppo(
                 and eval_result.solve_rate >= config.target_solve_rate
             ):
                 confirmation = _confirm_target_candidate(agent, config, eval_result)
-                confirmation_variants_added = sum(
-                    sampler.add_failed_grids(suite_metrics.failed_grids)
-                    for _suite_seed, suite_metrics in confirmation.suites[1:]
+                confirmation_variants_added = (
+                    sum(
+                        sampler.add_failed_grids(suite_metrics.failed_grids)
+                        for _suite_seed, suite_metrics in confirmation.suites[1:]
+                    )
+                    if config.hard_maze_fraction > 0.0
+                    else 0
                 )
                 for suite_index, (suite_seed, suite_metrics) in enumerate(
                     confirmation.suites,
@@ -5838,7 +6049,8 @@ def _train_recurrent_ppo(
                             )
                     break
             if (
-                curriculum_complete
+                config.precision_recovery_enabled
+                and curriculum_complete
                 and total_steps >= config.max_env_steps
                 and not evaluation_improved
             ):
@@ -6776,7 +6988,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Resume the selected/latest checkpoint; fresh training is the default.",
+        help=(
+            "Resume the selected/latest checkpoint (default); --no-resume "
+            "starts a fresh timestamped experiment."
+        ),
     )
     parser.add_argument(
         "--target-only-stop",
@@ -6887,8 +7102,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Maximum fraction of recurrent tasks sampled from hard variants; "
-            "ramps from zero at 90% validation solve rate to full at 99%."
+            "Opt-in maximum fraction of recurrent tasks sampled from hard variants; "
+            "ramps from zero at 90%% validation solve rate to full at 99%%."
         ),
     )
     parser.add_argument(
@@ -6920,6 +7135,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--precision-recovery",
+        dest="precision_recovery_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Opt in to rollback-based post-budget precision recovery.",
+    )
+    parser.add_argument(
         "--precision-plateau-evals",
         type=int,
         default=None,
@@ -6936,6 +7158,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Fraction of the initial learning rate used during recovery.",
+    )
+    parser.add_argument(
+        "--latest-checkpoint-every-steps",
+        type=int,
+        default=None,
+        help="Transition cadence for the resumable .latest.pth sidecar.",
     )
     parser.add_argument(
         "--performance-profile",
@@ -6993,6 +7221,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
+    if (
+        args.train_updates_per_step is not None
+        and args.updates_per_transition is not None
+    ):
+        raise ValueError(
+            "--train-updates-per-step and --updates-per-transition cannot be "
+            "used together"
+        )
     config = TrainConfig()
     values = {field_.name: getattr(config, field_.name) for field_ in fields(config)}
     if args.maze_size is not None:
@@ -7022,8 +7258,6 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "distance_shaping_scale",
         "distance_shaping_mode",
         "curriculum_enabled",
-        "curriculum_easy_episodes",
-        "curriculum_medium_episodes",
         "curriculum_max_retries",
         "buffer_size",
         "batch_size",
@@ -7035,11 +7269,9 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "epsilon_start",
         "epsilon_mid",
         "epsilon_end",
-        "epsilon_decay_episodes",
         "epsilon_decay_steps",
         "epsilon_final_steps",
         "num_envs",
-        "train_updates_per_step",
         "updates_per_transition",
         "warmup_steps",
         "target_tau",
@@ -7062,7 +7294,6 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "rnd_reward_coef",
         "rnd_reward_clip",
         "eval_episodes",
-        "eval_every",
         "eval_every_steps",
         "dashboard_every",
         "curriculum_promotion_rate",
@@ -7081,6 +7312,8 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "precision_plateau_evals",
         "precision_recovery_steps",
         "precision_recovery_lr_fraction",
+        "precision_recovery_enabled",
+        "latest_checkpoint_every_steps",
         "performance_profile",
         "maze_workers",
         "planner_fallback",
@@ -7100,6 +7333,28 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
     return TrainConfig(**values)
 
 
+def _apply_legacy_cli_aliases(
+    config: TrainConfig,
+    args: argparse.Namespace,
+) -> TrainConfig:
+    """Resolve aliases that depend on finalized runtime configuration."""
+
+    if args.train_updates_per_step is None:
+        return config
+    if args.updates_per_transition is not None:
+        raise ValueError(
+            "--train-updates-per-step and --updates-per-transition cannot be "
+            "used together"
+        )
+    resolved_num_envs = resolve_num_envs(config)
+    values = {field_.name: getattr(config, field_.name) for field_ in fields(config)}
+    values["num_envs"] = resolved_num_envs
+    values["updates_per_transition"] = (
+        args.train_updates_per_step / resolved_num_envs
+    )
+    return TrainConfig(**values)
+
+
 def _optional_bool(value: bool | None, default: bool) -> bool:
     return default if value is None else value
 
@@ -7112,6 +7367,7 @@ def main(argv: list[str] | None = None) -> None:
     device = select_device(config.device, config.require_cuda)
     config.performance_profile = configure_performance(config.performance_profile, device)
     config.num_envs = resolve_num_envs(config)
+    config = _apply_legacy_cli_aliases(config, args)
     expected_shape = observation_shape(config.maze_size, config.observation_mode, config.view_size)
     agent = create_agent(config, expected_shape, device)
 
