@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import importlib.metadata
 import json
@@ -58,7 +59,7 @@ DEFAULT_ALGORITHM = "recurrent_ppo"
 # Network layout used by default for algorithms that support both layouts.
 DEFAULT_NETWORK_TYPE = "spatial"
 # Whether training resumes from the checkpoint instead of starting fresh.
-DEFAULT_RESUME = True
+DEFAULT_RESUME = False
 # Whether recurrent PPO ignores episode and transition caps until it reaches its target.
 DEFAULT_TARGET_ONLY_STOP: bool | None = None
 
@@ -86,8 +87,10 @@ EPSILON_END = 0.02
 EPSILON_DECAY_STEPS = 500_000
 # Transition at which epsilon reaches EPSILON_END.
 EPSILON_FINAL_STEPS = 1_500_000
-# Number of parallel environments used by vectorized collection.
+# Fallback number of parallel environments used by vectorized collection.
 DEFAULT_NUM_ENVS = 256
+# Recurrent environments used by the RTX 3090 fast profile when auto-sized.
+RTX3090_RECURRENT_NUM_ENVS = 512
 # Desired learner updates per collected transition for DQN.
 DEFAULT_UPDATES_PER_TRANSITION = 0.125
 # Transitions collected before the learner begins updating.
@@ -120,6 +123,8 @@ EVAL_SEED_OFFSET = 1_000_003
 DEFAULT_DASHBOARD_FLAG = True
 # Number of episodes between dashboard refreshes.
 DEFAULT_DASHBOARD_EVERY = EVAL_PERIOD
+# Maximum representative samples retained by each dashboard chart.
+DASHBOARD_MAX_HISTORY_POINTS = 2_048
 # Checkpoint path before the CLI assigns an invocation-specific default.
 DEFAULT_SAVE_PATH = None
 # Training-log path before the CLI assigns an invocation-specific default.
@@ -177,6 +182,9 @@ DEFAULT_CURRICULUM_UNIFORM_FRACTION = 0.10
 DEFAULT_HARD_MAZE_FRACTION = 0.15
 # Maximum number of transformed hard-maze variants retained in memory.
 DEFAULT_HARD_MAZE_POOL_SIZE = 256
+# Validation range over which hard replay ramps to its configured maximum.
+HARD_MAZE_RAMP_START = 0.90
+HARD_MAZE_RAMP_END = 0.99
 # Whether training collects transitions from multiple environments together.
 DEFAULT_VECTORIZED_ENVS = True
 # Whether replay contents are included in checkpoints.
@@ -199,6 +207,12 @@ DEFAULT_FULL_TARGET_SOLVE_RATE = 1.00
 DEFAULT_LOCAL_TARGET_SOLVE_RATE = 1.00
 # Number of deterministic suites used to confirm one frozen target candidate.
 DEFAULT_TARGET_SOLVE_EVALS = 3
+# Post-budget evaluations without improvement before a guarded recovery pass.
+DEFAULT_PRECISION_PLATEAU_EVALS = 20
+# Transitions in one guarded precision-recovery pass.
+DEFAULT_PRECISION_RECOVERY_STEPS = 1_000_000
+# Fraction of the initial learning rate used during precision recovery.
+DEFAULT_PRECISION_RECOVERY_LR_FRACTION = 0.05
 # Number of mazes used to evaluate a curriculum stage.
 DEFAULT_CURRICULUM_EVAL_EPISODES = 200
 # Worker processes used for deterministic background maze generation.
@@ -277,7 +291,7 @@ class TrainConfig:
     epsilon_end: float = EPSILON_END
     epsilon_decay_steps: int = EPSILON_DECAY_STEPS
     epsilon_final_steps: int = EPSILON_FINAL_STEPS
-    num_envs: int = DEFAULT_NUM_ENVS
+    num_envs: int | None = None
     updates_per_transition: float = DEFAULT_UPDATES_PER_TRANSITION
     warmup_steps: int = DEFAULT_WARMUP_STEPS
     target_tau: float = DEFAULT_TARGET_TAU
@@ -315,6 +329,9 @@ class TrainConfig:
     planner_fallback: bool = DEFAULT_PLANNER_FALLBACK
     target_solve_rate: float | None = None
     target_solve_evals: int = DEFAULT_TARGET_SOLVE_EVALS
+    precision_plateau_evals: int = DEFAULT_PRECISION_PLATEAU_EVALS
+    precision_recovery_steps: int = DEFAULT_PRECISION_RECOVERY_STEPS
+    precision_recovery_lr_fraction: float = DEFAULT_PRECISION_RECOVERY_LR_FRACTION
     performance_profile: str = DEFAULT_PERFORMANCE_PROFILE
     maze_workers: int = DEFAULT_MAZE_WORKERS
     dashboard_flag: bool = DEFAULT_DASHBOARD_FLAG
@@ -380,7 +397,7 @@ class TrainConfig:
             raise ValueError("episodes must be >= 1")
         if self.max_env_steps < 1:
             raise ValueError("max_env_steps must be >= 1")
-        if self.num_envs < 1:
+        if self.num_envs is not None and self.num_envs < 1:
             raise ValueError("num_envs must be >= 1")
         if self.batch_size < 1:
             raise ValueError("batch_size must be >= 1")
@@ -468,6 +485,10 @@ class TrainConfig:
             raise ValueError("curriculum_eval_episodes must be >= 1")
         if not 0 < self.target_solve_rate <= 1 or self.target_solve_evals < 1:
             raise ValueError("target solve settings are invalid")
+        if self.precision_plateau_evals < 1 or self.precision_recovery_steps < 1:
+            raise ValueError("precision recovery intervals must be >= 1")
+        if not 0 < self.precision_recovery_lr_fraction <= 1:
+            raise ValueError("precision_recovery_lr_fraction must be in (0, 1]")
         if self.maze_workers < 0:
             raise ValueError("maze_workers must be >= 0")
         if self.expert_pretrain_mazes < 0 or self.expert_pretrain_epochs < 0:
@@ -554,6 +575,18 @@ class DashboardState:
 ChartPoint = tuple[int, float]
 RawTransition = tuple[np.ndarray, int, float, np.ndarray, bool, np.ndarray]
 ReplayTransition = tuple[np.ndarray, int, float, np.ndarray, bool, np.ndarray]
+
+
+def _append_chart_point(history: list[ChartPoint], point: ChartPoint) -> None:
+    """Append one point while retaining a bounded whole-run representation."""
+
+    history.append(point)
+    if len(history) <= DASHBOARD_MAX_HISTORY_POINTS:
+        return
+    latest = history[-1]
+    history[:] = history[::2]
+    if history[-1] != latest:
+        history.append(latest)
 
 
 class TaskSampler(Protocol):
@@ -663,6 +696,19 @@ def configure_performance(profile: str, device: torch.device) -> str:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
     return resolved
+
+
+def resolve_num_envs(config: TrainConfig) -> int:
+    """Resolve profile-selected environment parallelism when left automatic."""
+
+    if config.num_envs is not None:
+        return config.num_envs
+    if (
+        config.algorithm == "recurrent_ppo"
+        and config.performance_profile == "rtx3090-fast"
+    ):
+        return RTX3090_RECURRENT_NUM_ENVS
+    return DEFAULT_NUM_ENVS
 
 
 def device_diagnostics(device: torch.device) -> str:
@@ -1356,6 +1402,9 @@ class MazeTaskSampler:
         self.curriculum = CurriculumController(config)
         self.hard_grids: list[np.ndarray] = []
         self._hard_grid_keys: set[bytes] = set()
+        self._seen_hard_grid_keys: set[bytes] = set()
+        self.hard_candidates_seen = 0
+        self.validation_solve_rate: float | None = None
 
     def sample(self) -> Maze:
         """Sample from current, previous, and uniform task distributions."""
@@ -1372,28 +1421,42 @@ class MazeTaskSampler:
             return make_maze(self.config, rng=self.rng)
 
     def add_failed_grids(self, failed_grids: list[np.ndarray]) -> int:
-        """Add transformed failure variants without training on held-out grids."""
+        """Reservoir-sample unique transformed failures without held-out grids."""
 
         added = 0
         for failed_grid in failed_grids:
             for variant in _hard_maze_variants(failed_grid):
                 key = variant.tobytes()
-                if key in self._hard_grid_keys:
+                if key in self._seen_hard_grid_keys:
                     continue
-                if len(self.hard_grids) >= self.config.hard_maze_pool_size:
-                    removed = self.hard_grids.pop(0)
-                    self._hard_grid_keys.discard(removed.tobytes())
-                self.hard_grids.append(variant)
+                self._seen_hard_grid_keys.add(key)
+                self.hard_candidates_seen += 1
+                if len(self.hard_grids) < self.config.hard_maze_pool_size:
+                    self.hard_grids.append(variant)
+                    self._hard_grid_keys.add(key)
+                    added += 1
+                    continue
+                replacement = self.rng.randrange(self.hard_candidates_seen)
+                if replacement >= self.config.hard_maze_pool_size:
+                    continue
+                removed = self.hard_grids[replacement]
+                self._hard_grid_keys.discard(removed.tobytes())
+                self.hard_grids[replacement] = variant
                 self._hard_grid_keys.add(key)
                 added += 1
         return added
 
-    def restore_hard_grids(self, grids: object) -> None:
-        """Restore exact replay variants from checkpoint training state."""
+    def restore_hard_grids(
+        self,
+        grids: object,
+        seen_keys: object = None,
+        candidates_seen: object = None,
+        validation_solve_rate: object = None,
+    ) -> None:
+        """Restore replay reservoir state from current or legacy checkpoints."""
 
-        if not isinstance(grids, (list, tuple)):
-            return
-        for value in grids[-self.config.hard_maze_pool_size :]:
+        grid_values = grids if isinstance(grids, (list, tuple)) else ()
+        for value in grid_values[-self.config.hard_maze_pool_size :]:
             grid = np.ascontiguousarray(value, dtype=np.uint8)
             if grid.shape != self.config.maze_size:
                 continue
@@ -1402,11 +1465,46 @@ class MazeTaskSampler:
                 continue
             self.hard_grids.append(grid)
             self._hard_grid_keys.add(key)
+        if isinstance(seen_keys, (list, tuple, set)):
+            self._seen_hard_grid_keys.update(
+                bytes(key) for key in seen_keys if isinstance(key, (bytes, bytearray))
+            )
+        self._seen_hard_grid_keys.update(self._hard_grid_keys)
+        try:
+            restored_seen = int(candidates_seen)
+        except (TypeError, ValueError):
+            restored_seen = len(self._seen_hard_grid_keys)
+        self.hard_candidates_seen = max(
+            restored_seen,
+            len(self._seen_hard_grid_keys),
+            len(self.hard_grids),
+        )
+        if isinstance(validation_solve_rate, (int, float)):
+            self.validation_solve_rate = min(
+                max(float(validation_solve_rate), 0.0),
+                1.0,
+            )
+
+    def record_validation_solve_rate(self, solve_rate: float) -> None:
+        """Update the validation signal controlling the hard-replay ramp."""
+
+        self.validation_solve_rate = min(max(float(solve_rate), 0.0), 1.0)
+
+    def effective_hard_maze_fraction(self) -> float:
+        """Return the validation-ramped fraction of hard replay tasks."""
+
+        if not self.hard_grids or self.validation_solve_rate is None:
+            return 0.0
+        progress = (self.validation_solve_rate - HARD_MAZE_RAMP_START) / (
+            HARD_MAZE_RAMP_END - HARD_MAZE_RAMP_START
+        )
+        return self.config.hard_maze_fraction * min(max(progress, 0.0), 1.0)
 
     def sample_hard_grid(self) -> np.ndarray | None:
         """Return a hard-maze variant according to the configured replay mix."""
 
-        if not self.hard_grids or self.rng.random() >= self.config.hard_maze_fraction:
+        hard_fraction = self.effective_hard_maze_fraction()
+        if hard_fraction == 0.0 or self.rng.random() >= hard_fraction:
             return None
         return self.rng.choice(self.hard_grids).copy()
 
@@ -1430,7 +1528,7 @@ class MazeTaskSampler:
     def sampling_mix(self) -> dict[str, float]:
         """Return the effective current/previous/unrestricted sampling proportions."""
 
-        hard = self.config.hard_maze_fraction if self.hard_grids else 0.0
+        hard = self.effective_hard_maze_fraction()
         ordinary = 1.0 - hard
         if self.curriculum.complete or not self.config.curriculum_enabled:
             return {
@@ -1784,33 +1882,53 @@ class MazeBatch:
         ] == 1
         return in_bounds & ~walls
 
-    def step(self, actions: np.ndarray) -> BatchStep:
-        """Apply one action per environment and return vectorized transition data."""
+    def step(
+        self,
+        actions: np.ndarray,
+        indices: np.ndarray | None = None,
+    ) -> BatchStep:
+        """Apply actions to all or a selected subset of environments."""
 
         action_array = np.asarray(actions, dtype=np.int64)
-        if action_array.shape != (self.size,):
-            raise ValueError(f"actions must have shape ({self.size},), got {action_array.shape}")
+        all_selected = indices is None
+        selected = (
+            np.arange(self.size, dtype=np.int64)
+            if all_selected
+            else np.asarray(indices, dtype=np.int64)
+        )
+        if selected.ndim != 1 or np.any((selected < 0) | (selected >= self.size)):
+            raise ValueError("indices must be a one-dimensional in-range array")
+        if len(np.unique(selected)) != len(selected):
+            raise ValueError("indices must not contain duplicates")
+        if action_array.shape != (len(selected),):
+            raise ValueError(
+                f"actions must have shape ({len(selected)},), got {action_array.shape}"
+            )
         if np.any((action_array < 0) | (action_array >= len(Maze.ACTIONS))):
             raise ValueError("actions must be in [0, 3]")
 
-        indices = np.arange(self.size)
         deltas = np.asarray(Maze.ACTIONS, dtype=np.int64)
-        old_positions = self.positions.copy()
-        action_masks = self.valid_action_masks()
-        valid = action_masks[indices, action_array]
+        old_positions = self.positions[selected].copy()
+        action_masks = self.valid_action_masks()[selected]
+        local_indices = np.arange(len(selected))
+        valid = action_masks[local_indices, action_array]
         candidates = old_positions + deltas[action_array]
-        self.positions[valid] = candidates[valid]
+        self.positions[selected[valid]] = candidates[valid]
         invalid = ~valid
-        self.invalid_moves += invalid.astype(np.int64)
+        self.invalid_moves[selected] += invalid.astype(np.int64)
 
-        old_distance = self.bfs_distances[indices, old_positions[:, 0], old_positions[:, 1]]
-        new_distance = self.bfs_distances[
-            indices,
-            self.positions[:, 0],
-            self.positions[:, 1],
+        old_distance = self.bfs_distances[
+            selected,
+            old_positions[:, 0],
+            old_positions[:, 1],
         ]
-        solved = np.all(self.positions == self.goals, axis=1)
-        rewards = np.full(self.size, self.step_penalty, dtype=np.float32)
+        new_distance = self.bfs_distances[
+            selected,
+            self.positions[selected, 0],
+            self.positions[selected, 1],
+        ]
+        solved = np.all(self.positions[selected] == self.goals[selected], axis=1)
+        rewards = np.full(len(selected), self.step_penalty, dtype=np.float32)
         rewards += invalid.astype(np.float32) * self.invalid_move_penalty
         if self.distance_shaping_mode == "potential":
             shaping = self.gamma * (-new_distance) - (-old_distance)
@@ -1824,16 +1942,20 @@ class MazeBatch:
             )
             rewards += self.distance_shaping_scale * shaping
         rewards += solved.astype(np.float32) * self.goal_reward
-        self.steps += 1
-        timeout = ~solved & (self.steps >= self.max_episode_steps)
+        self.steps[selected] += 1
+        timeout = ~solved & (
+            self.steps[selected] >= self.max_episode_steps[selected]
+        )
         rewards += timeout.astype(np.float32) * self.timeout_penalty
         dones = solved | timeout
-        self.total_rewards += rewards
+        self.total_rewards[selected] += rewards
+        next_states = self.observations()
+        next_masks = self.valid_action_masks()
         return BatchStep(
-            states=self.observations(),
+            states=next_states if all_selected else next_states[selected],
             rewards=rewards,
             dones=dones,
-            action_masks=self.valid_action_masks(),
+            action_masks=next_masks if all_selected else next_masks[selected],
             invalid=invalid,
             solved=solved,
             timeout=timeout,
@@ -2819,23 +2941,45 @@ class MetricsTracker:
         self.invalid_rates.append(stats.invalid_moves / max(stats.steps, 1))
         if stats.solved:
             self.success_steps.append(stats.steps)
-        x_value = episode if episode is not None else len(self.reward_history) + 1
-        self.train_solve_history.append((x_value, self.train_solve_rate))
-        self.reward_history.append((x_value, self.avg_reward))
+        x_value = (
+            episode
+            if episode is not None
+            else (self.reward_history[-1][0] + 1 if self.reward_history else 1)
+        )
+        _append_chart_point(
+            self.train_solve_history,
+            (x_value, self.train_solve_rate),
+        )
+        _append_chart_point(self.reward_history, (x_value, self.avg_reward))
 
     def record_loss(self, loss: float | None, episode: int | None = None) -> None:
         if loss is None:
             return
         self.losses.append(loss)
-        x_value = episode if episode is not None else len(self.loss_history) + 1
-        self.loss_history.append((x_value, self.loss_ema))
+        x_value = (
+            episode
+            if episode is not None
+            else (self.loss_history[-1][0] + 1 if self.loss_history else 1)
+        )
+        _append_chart_point(self.loss_history, (x_value, self.loss_ema))
 
     def record_eval(self, metrics: EvalMetrics, episode: int | None = None) -> None:
         self.latest_eval = metrics
-        x_value = episode if episode is not None else len(self.greedy_solve_history) + 1
-        self.greedy_solve_history.append((x_value, metrics.solve_rate))
-        self.greedy_steps_history.append((x_value, metrics.avg_steps))
-        self.greedy_optimality_history.append((x_value, metrics.optimality_ratio))
+        x_value = (
+            episode
+            if episode is not None
+            else (
+                self.greedy_solve_history[-1][0] + 1
+                if self.greedy_solve_history
+                else 1
+            )
+        )
+        _append_chart_point(self.greedy_solve_history, (x_value, metrics.solve_rate))
+        _append_chart_point(self.greedy_steps_history, (x_value, metrics.avg_steps))
+        _append_chart_point(
+            self.greedy_optimality_history,
+            (x_value, metrics.optimality_ratio),
+        )
 
     @property
     def train_solve_rate(self) -> float:
@@ -3043,7 +3187,10 @@ def _eval_greedy(
     buckets = [difficulty_bucket(env.optimal_start_steps) for env in envs]
     for bucket in buckets:
         bucket_totals[bucket] = bucket_totals.get(bucket, 0) + 1
-    states = [env.reset() for env in envs]
+    for env in envs:
+        env.reset()
+    environment_batch = MazeBatch(envs)
+    states = environment_batch.observations()
     active = np.ones(len(envs), dtype=np.bool_)
     recurrent_hidden = (
         agent.initial_policy_state(len(envs))
@@ -3060,10 +3207,8 @@ def _eval_greedy(
 
     while active.any():
         active_indices = np.flatnonzero(active)
-        state_batch = np.stack([states[idx] for idx in active_indices])
-        action_masks = np.stack(
-            [envs[idx].valid_action_mask() for idx in active_indices]
-        )
+        state_batch = states[active_indices]
+        action_masks = environment_batch.valid_action_masks()[active_indices]
         if isinstance(agent, RecurrentPPOAgent):
             assert recurrent_hidden is not None
             hidden_indices = torch.as_tensor(
@@ -3084,21 +3229,26 @@ def _eval_greedy(
             actions = _agent_greedy_actions(agent, state_batch, action_masks)
 
         for batch_idx, env_idx in enumerate(active_indices):
-            env = envs[env_idx]
             action = int(actions[batch_idx])
-            state_action = (env.current_position, action)
+            position = tuple(int(value) for value in environment_batch.positions[env_idx])
+            state_action = (position, action)
             if state_action in seen_state_actions[env_idx]:
                 has_repeated_state_action[env_idx] = True
             seen_state_actions[env_idx].add(state_action)
 
-            state, step_reward, done, info = env.step(action)
-            states[env_idx] = state
-            previous_actions[env_idx] = action
-            previous_rewards[env_idx] = step_reward
-            episode_starts[env_idx] = False
-            invalid_moves += int(info["invalid"])
-            total_steps += 1
-            position_traces[env_idx].append(env.current_position)
+        step_result = environment_batch.step(actions, active_indices)
+        states[active_indices] = step_result.states
+        previous_actions[active_indices] = actions
+        previous_rewards[active_indices] = step_result.rewards
+        episode_starts[active_indices] = False
+        invalid_moves += int(step_result.invalid.sum())
+        total_steps += len(active_indices)
+
+        for batch_idx, env_idx in enumerate(active_indices):
+            current_position = tuple(
+                int(value) for value in environment_batch.positions[env_idx]
+            )
+            position_traces[env_idx].append(current_position)
             positions = position_traces[env_idx]
             if (
                 len(positions) >= 5
@@ -3107,22 +3257,30 @@ def _eval_greedy(
             ):
                 has_loop[env_idx] = True
 
-            if done:
+            if step_result.dones[batch_idx]:
                 active[env_idx] = False
-                if env.current_position == env.goal:
-                    solved_steps.append(env.steps)
-                    optimality.append(env.optimal_start_steps / max(env.steps, 1))
+                if step_result.solved[batch_idx]:
+                    steps = int(environment_batch.steps[env_idx])
+                    optimal_steps = int(environment_batch.optimal_steps[env_idx])
+                    solved_steps.append(steps)
+                    optimality.append(optimal_steps / max(steps, 1))
                     bucket = buckets[env_idx]
                     bucket_solves[bucket] = bucket_solves.get(bucket, 0) + 1
                 else:
                     timeouts += 1
-                    failed_grids.append(env.grid.copy())
+                    failed_grids.append(environment_batch.grids[env_idx].copy())
                     loop_episodes += int(has_loop[env_idx])
                     repeated_state_action_episodes += int(
                         has_repeated_state_action[env_idx]
                     )
                     failed_final_distances.append(
-                        float(env.bfs_distances[env.current_position])
+                        float(
+                            environment_batch.bfs_distances[
+                                env_idx,
+                                environment_batch.positions[env_idx, 0],
+                                environment_batch.positions[env_idx, 1],
+                            ]
+                        )
                     )
 
     total = max(config.eval_episodes, 1)
@@ -3502,7 +3660,15 @@ class Dashboard:
             tick = tick_font.render(label_text, True, (150, 160, 172))
             self.screen.blit(tick, (x + 7, ty - 7))
             pg.draw.line(self.screen, (52, 60, 70), (px, ty), (px + pw, ty))
-        for episode in _episode_tick_values(x_max, pw):
+        candidate_ticks = _episode_tick_values(x_max, pw)
+        tick_labels = [str(episode) for episode in candidate_ticks]
+        visible_ticks = _non_overlapping_episode_ticks(
+            candidate_ticks,
+            x_max,
+            pw,
+            [tick_font.size(label)[0] for label in tick_labels],
+        )
+        for episode in visible_ticks:
             tx = px + int(episode / max(x_max, 1) * (pw - 1))
             pg.draw.line(self.screen, (52, 60, 70), (tx, py), (tx, py + ph))
             tick_label = str(episode)
@@ -3564,11 +3730,11 @@ class Dashboard:
 
 
 def _format_pct(value: float) -> str:
-    return f"{value * 100:.0f}%"
+    return f"{value * 100:.2f}%"
 
 
 def _format_number(value: float) -> str:
-    return "-" if value <= 0 else f"{value:.1f}"
+    return "-" if value <= 0 else f"{value:.2f}"
 
 
 def _format_chart_tick(value: float) -> str:
@@ -3596,6 +3762,37 @@ def _episode_tick_values(max_episode: int, plot_width: int) -> list[int]:
     if ticks[-1] != max_episode:
         ticks.append(max_episode)
     return ticks
+
+
+def _non_overlapping_episode_ticks(
+    ticks: list[int],
+    max_episode: int,
+    plot_width: int,
+    label_widths: list[int],
+    minimum_gap: int = 6,
+) -> list[int]:
+    """Keep endpoint ticks and only interior labels that fit without overlap."""
+
+    if len(ticks) <= 2:
+        return ticks.copy()
+    if len(label_widths) != len(ticks):
+        raise ValueError("label_widths must match ticks")
+    maximum = max(int(max_episode), 1)
+    positions = [int(tick / maximum * max(plot_width - 1, 0)) for tick in ticks]
+    boxes = [
+        (position - width / 2, position + width / 2)
+        for position, width in zip(positions, label_widths)
+    ]
+    selected = [0, len(ticks) - 1]
+    for index in range(1, len(ticks) - 1):
+        left, right = boxes[index]
+        if all(
+            right + minimum_gap <= boxes[other][0]
+            or left >= boxes[other][1] + minimum_gap
+            for other in selected
+        ):
+            selected.append(index)
+    return [ticks[index] for index in sorted(selected)]
 
 
 def _nice_episode_step(raw_step: float) -> int:
@@ -4053,6 +4250,18 @@ def restore_agent_weights(agent: Agent, weights: dict[str, torch.Tensor]) -> Non
         agent.policy_net.load_state_dict(weights)
 
 
+def clone_optimizer_state(agent: Agent) -> dict[str, object]:
+    """Clone optimizer state for an in-memory frozen-best rollback."""
+
+    return copy.deepcopy(agent.optimizer.state_dict())
+
+
+def restore_optimizer_state(agent: Agent, state: dict[str, object]) -> None:
+    """Restore optimizer moments without changing training counters or RNGs."""
+
+    agent.optimizer.load_state_dict(copy.deepcopy(state))
+
+
 def create_agent(
     config: TrainConfig,
     observation_shape_: tuple[int, int, int],
@@ -4142,6 +4351,8 @@ def _update_training_state(
     update_budget: float = 0.0,
     curriculum: CurriculumController | None = None,
     hard_grids: list[np.ndarray] | None = None,
+    hard_sampler: MazeTaskSampler | None = None,
+    precision_recovery: dict[str, object] | None = None,
 ) -> None:
     """Attach restart metadata immediately before a checkpoint can be saved."""
 
@@ -4162,8 +4373,19 @@ def _update_training_state(
             "level": curriculum.level,
             "success_streak": curriculum.success_streak,
         }
-    if hard_grids is not None:
+    if hard_sampler is not None:
+        state["hard_maze_grids"] = [
+            grid.copy() for grid in hard_sampler.hard_grids
+        ]
+        state["hard_maze_seen_keys"] = sorted(hard_sampler._seen_hard_grid_keys)
+        state["hard_maze_candidates_seen"] = hard_sampler.hard_candidates_seen
+        state["hard_maze_validation_solve_rate"] = (
+            hard_sampler.validation_solve_rate
+        )
+    elif hard_grids is not None:
         state["hard_maze_grids"] = [grid.copy() for grid in hard_grids]
+    if precision_recovery is not None:
+        state["precision_recovery"] = dict(precision_recovery)
     agent.training_state = state
 
 
@@ -4181,12 +4403,9 @@ def _maybe_run_eval(
     start_time: float,
     process_start_cpu: float,
     on_evaluation: Callable[[EvalMetrics], None] | None = None,
+    on_new_best: Callable[[EvalMetrics], None] | None = None,
 ) -> tuple[EvalMetrics | None, int, float, dict[str, torch.Tensor] | None]:
-    should_eval = completed > 0 and (
-        last_eval_step == 0
-        or completed >= config.episodes
-        or total_steps - last_eval_step >= config.eval_every_steps
-    )
+    should_eval = _should_run_eval(config, completed, total_steps, last_eval_step)
     if not should_eval:
         return None, last_eval_step, best_eval_rate, best_weights
 
@@ -4201,6 +4420,8 @@ def _maybe_run_eval(
         best_eval_rate = greedy.solve_rate
         agent.best_greedy_solve_rate = best_eval_rate
         best_weights = clone_agent_weights(agent)
+        if on_new_best is not None:
+            on_new_best(greedy)
         if config.save_path:
             agent.save(config.save_path)
             print(
@@ -4253,6 +4474,21 @@ def _maybe_run_eval(
             ),
         )
     return greedy, last_eval_step, best_eval_rate, best_weights
+
+
+def _should_run_eval(
+    config: TrainConfig,
+    completed: int,
+    total_steps: int,
+    last_eval_step: int,
+) -> bool:
+    """Return whether evaluation is due under bounded or target-only training."""
+
+    return completed > 0 and (
+        last_eval_step == 0
+        or (not config.target_only_stop and completed >= config.episodes)
+        or total_steps - last_eval_step >= config.eval_every_steps
+    )
 
 
 def _maybe_draw_dashboard(
@@ -4386,6 +4622,7 @@ def train(
     device = select_device(config.device, config.require_cuda)
     resolved_profile = configure_performance(config.performance_profile, device)
     config.performance_profile = resolved_profile
+    config.num_envs = resolve_num_envs(config)
     logger = _TrainingLogger(config.training_log_path)
     run_timestamp = run_timestamp or invocation_timestamp()
     start_time = time.perf_counter()
@@ -5124,11 +5361,34 @@ def _train_recurrent_ppo(
     # Legacy checkpoints may contain target_streak. Confirmation now validates
     # one frozen candidate, so an evolving-policy streak is intentionally ignored.
     target_confirmed = bool(saved_state.get("target_confirmed", False))
+    recovery_saved = saved_state.get("precision_recovery", {})
+    if not isinstance(recovery_saved, dict):
+        recovery_saved = {}
+    plateau_evals = max(int(recovery_saved.get("plateau_evals", 0)), 0)
+    recovery_active = bool(recovery_saved.get("active", False))
+    recovery_end_step = max(int(recovery_saved.get("end_step", 0)), 0)
+    recovery_count = max(int(recovery_saved.get("count", 0)), 0)
+    best_optimizer_state = (
+        clone_optimizer_state(agent) if best_weights is not None else None
+    )
+
+    def precision_recovery_payload() -> dict[str, object]:
+        return {
+            "plateau_evals": plateau_evals,
+            "active": recovery_active,
+            "end_step": recovery_end_step,
+            "count": recovery_count,
+        }
     train_rng = random.Random(config.seed)
     if "train_rng_state" in saved_state:
         train_rng.setstate(saved_state["train_rng_state"])
     sampler = MazeTaskSampler(config, train_rng)
-    sampler.restore_hard_grids(saved_state.get("hard_maze_grids"))
+    sampler.restore_hard_grids(
+        saved_state.get("hard_maze_grids"),
+        saved_state.get("hard_maze_seen_keys"),
+        saved_state.get("hard_maze_candidates_seen"),
+        saved_state.get("hard_maze_validation_solve_rate"),
+    )
     curriculum_state = saved_state.get("curriculum")
     if isinstance(curriculum_state, dict):
         sampler.curriculum.level = int(curriculum_state.get("level", 0))
@@ -5138,6 +5398,7 @@ def _train_recurrent_ppo(
     )
     prefetcher = DeterministicMazePrefetcher(sampler, maze_workers)
     limits_enabled = not config.target_only_stop
+    assert config.num_envs is not None
     env_count = (
         config.num_envs
         if not limits_enabled
@@ -5150,6 +5411,20 @@ def _train_recurrent_ppo(
     previous_actions_np = np.full(env_count, -1, dtype=np.int64)
     previous_rewards_np = np.zeros(env_count, dtype=np.float32)
     episode_starts_np = np.ones(env_count, dtype=np.bool_)
+
+    def reset_training_batch() -> None:
+        """Start fresh recurrent contexts after restoring frozen-best weights."""
+
+        nonlocal states
+        nonlocal hidden
+        for index in range(env_count):
+            environment_batch.replace(index, prefetcher.next())
+        states = environment_batch.observations()
+        hidden = agent.initial_policy_state(env_count)
+        previous_actions_np.fill(-1)
+        previous_rewards_np.fill(0.0)
+        episode_starts_np.fill(True)
+
     pin_memory = agent.device.type == "cuda"
     state_staging = torch.empty(
         env_count,
@@ -5286,14 +5561,14 @@ def _train_recurrent_ppo(
         learner_started = time.perf_counter()
         intrinsic_rewards = torch.zeros_like(rollout_rewards)
         rnd_coefficient = 0.0
-        if agent.rnd is not None:
-            intrinsic_rewards = agent.rnd.bonus_and_update(
-                rollout_states,
-                config.rnd_reward_clip,
-            )
+        if agent.rnd is not None and total_steps < config.max_env_steps:
             rnd_coefficient = config.rnd_reward_coef * max(
                 0.0,
                 1.0 - total_steps / config.max_env_steps,
+            )
+            intrinsic_rewards = agent.rnd.bonus_and_update(
+                rollout_states,
+                config.rnd_reward_clip,
             )
         combined_rewards = rollout_rewards + rnd_coefficient * intrinsic_rewards
         next_state_tensor = torch.as_tensor(states, dtype=torch.float32, device=agent.device)
@@ -5323,6 +5598,10 @@ def _train_recurrent_ppo(
             total_steps,
             config,
         )
+        if recovery_active:
+            learning_rate = (
+                config.learning_rate * config.precision_recovery_lr_fraction
+            )
         for group in agent.optimizer.param_groups:
             group["lr"] = learning_rate
         update_metrics = _recurrent_ppo_update(
@@ -5354,6 +5633,7 @@ def _train_recurrent_ppo(
                 update_count=agent.update_count,
                 learning_rate=learning_rate,
                 entropy_coefficient=entropy_coefficient,
+                precision_recovery_active=recovery_active,
                 rnd_coefficient=rnd_coefficient,
                 extrinsic_reward_mean=float(rollout_rewards.mean().item()),
                 intrinsic_reward_mean=float(intrinsic_rewards.mean().item()),
@@ -5384,6 +5664,8 @@ def _train_recurrent_ppo(
                 promoted = sampler.curriculum.record_validation(stage_metrics)
                 if promoted:
                     prefetcher.reset()
+            if not config.curriculum_enabled or sampler.curriculum.complete:
+                sampler.record_validation_solve_rate(metrics.solve_rate)
             hard_variants_added = (
                 sampler.add_failed_grids(metrics.failed_grids)
                 if not config.curriculum_enabled or sampler.curriculum.complete
@@ -5396,7 +5678,8 @@ def _train_recurrent_ppo(
                 total_steps,
                 train_rng,
                 curriculum=sampler.curriculum,
-                hard_grids=sampler.hard_grids,
+                hard_sampler=sampler,
+                precision_recovery=precision_recovery_payload(),
             )
             agent.training_state["target_confirmed"] = False
             if logger.enabled:
@@ -5408,6 +5691,44 @@ def _train_recurrent_ppo(
                     sampling_mix=sampler.sampling_mix(),
                     hard_variants_added=hard_variants_added,
                     hard_maze_pool_size=len(sampler.hard_grids),
+                    hard_maze_candidates_seen=sampler.hard_candidates_seen,
+                    validation_solve_rate=sampler.validation_solve_rate,
+                )
+
+        evaluation_improved = False
+
+        def record_new_best(_metrics: EvalMetrics) -> None:
+            nonlocal best_optimizer_state
+            nonlocal evaluation_improved
+            nonlocal plateau_evals
+            nonlocal recovery_active
+            nonlocal recovery_end_step
+
+            evaluation_improved = True
+            was_recovering = recovery_active
+            best_optimizer_state = clone_optimizer_state(agent)
+            plateau_evals = 0
+            recovery_active = False
+            recovery_end_step = 0
+            _update_training_state(
+                agent,
+                completed,
+                total_steps,
+                total_steps,
+                train_rng,
+                curriculum=sampler.curriculum,
+                hard_sampler=sampler,
+                precision_recovery=precision_recovery_payload(),
+            )
+            agent.training_state["target_confirmed"] = False
+            if was_recovering and logger.enabled:
+                logger.log(
+                    "precision_recovery",
+                    phase="end",
+                    outcome="improved",
+                    total_steps=total_steps,
+                    recovery_count=recovery_count,
+                    best_greedy_solve_rate=agent.best_greedy_solve_rate,
                 )
 
         evaluation_started = time.perf_counter()
@@ -5425,6 +5746,7 @@ def _train_recurrent_ppo(
             start_time,
             process_start_cpu,
             on_evaluation=record_evaluation,
+            on_new_best=record_new_best,
         )
         evaluation_seconds = time.perf_counter() - evaluation_started
         if eval_result is not None:
@@ -5471,11 +5793,26 @@ def _train_recurrent_ppo(
                         suite_count=len(confirmation.suites),
                         hard_variants_added=confirmation_variants_added,
                         hard_maze_pool_size=len(sampler.hard_grids),
+                        hard_maze_candidates_seen=sampler.hard_candidates_seen,
                     )
                 if target_confirmed:
                     best_eval_rate = max(best_eval_rate, eval_result.solve_rate)
                     agent.best_greedy_solve_rate = best_eval_rate
                     best_weights = clone_agent_weights(agent)
+                    plateau_evals = 0
+                    recovery_active = False
+                    recovery_end_step = 0
+                    _update_training_state(
+                        agent,
+                        completed,
+                        total_steps,
+                        total_steps,
+                        train_rng,
+                        curriculum=sampler.curriculum,
+                        hard_sampler=sampler,
+                        precision_recovery=precision_recovery_payload(),
+                    )
+                    agent.training_state["target_confirmed"] = True
                     if config.save_path:
                         agent.save(config.save_path)
                         print(
@@ -5500,6 +5837,69 @@ def _train_recurrent_ppo(
                                 ),
                             )
                     break
+            if (
+                curriculum_complete
+                and total_steps >= config.max_env_steps
+                and not evaluation_improved
+            ):
+                if recovery_active and total_steps >= recovery_end_step:
+                    if best_weights is not None and best_optimizer_state is not None:
+                        restore_agent_weights(agent, best_weights)
+                        restore_optimizer_state(agent, best_optimizer_state)
+                        reset_training_batch()
+                    recovery_active = False
+                    recovery_end_step = 0
+                    plateau_evals = 0
+                    if logger.enabled:
+                        logger.log(
+                            "precision_recovery",
+                            phase="end",
+                            outcome="rollback",
+                            total_steps=total_steps,
+                            recovery_count=recovery_count,
+                            best_greedy_solve_rate=best_eval_rate,
+                        )
+                elif not recovery_active:
+                    plateau_evals += 1
+                    if (
+                        plateau_evals >= config.precision_plateau_evals
+                        and best_weights is not None
+                        and best_optimizer_state is not None
+                    ):
+                        restore_agent_weights(agent, best_weights)
+                        restore_optimizer_state(agent, best_optimizer_state)
+                        reset_training_batch()
+                        plateau_evals = 0
+                        recovery_active = True
+                        recovery_end_step = (
+                            total_steps + config.precision_recovery_steps
+                        )
+                        recovery_count += 1
+                        if logger.enabled:
+                            logger.log(
+                                "precision_recovery",
+                                phase="start",
+                                outcome="plateau",
+                                total_steps=total_steps,
+                                recovery_count=recovery_count,
+                                recovery_end_step=recovery_end_step,
+                                learning_rate=(
+                                    config.learning_rate
+                                    * config.precision_recovery_lr_fraction
+                                ),
+                                best_greedy_solve_rate=best_eval_rate,
+                            )
+                _update_training_state(
+                    agent,
+                    completed,
+                    total_steps,
+                    total_steps,
+                    train_rng,
+                    curriculum=sampler.curriculum,
+                    hard_sampler=sampler,
+                    precision_recovery=precision_recovery_payload(),
+                )
+                agent.training_state["target_confirmed"] = False
         last_dashboard_episode = _maybe_draw_dashboard(
             dashboard,
             completed,
@@ -5521,7 +5921,8 @@ def _train_recurrent_ppo(
         last_eval_step,
         train_rng,
         curriculum=sampler.curriculum,
-        hard_grids=sampler.hard_grids,
+        hard_sampler=sampler,
+        precision_recovery=precision_recovery_payload(),
     )
     agent.training_state["target_confirmed"] = target_confirmed
     prefetcher.close()
@@ -6375,6 +6776,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=None,
+        help="Resume the selected/latest checkpoint; fresh training is the default.",
     )
     parser.add_argument(
         "--target-only-stop",
@@ -6436,7 +6838,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epsilon-decay-episodes", type=int, default=None)
     parser.add_argument("--epsilon-decay-steps", type=int, default=None)
     parser.add_argument("--epsilon-final-steps", type=int, default=None)
-    parser.add_argument("--num-envs", type=int, default=None)
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=None,
+        help=(
+            "Parallel environments; defaults to 512 for recurrent PPO on the "
+            "RTX 3090 fast profile and 256 otherwise."
+        ),
+    )
     parser.add_argument("--train-updates-per-step", type=int, default=None)
     parser.add_argument("--updates-per-transition", type=float, default=None)
     parser.add_argument("--warmup-steps", type=int, default=None)
@@ -6476,7 +6886,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hard-maze-fraction",
         type=float,
         default=None,
-        help="Fraction of recurrent training tasks sampled from hard-maze variants.",
+        help=(
+            "Maximum fraction of recurrent tasks sampled from hard variants; "
+            "ramps from zero at 90% validation solve rate to full at 99%."
+        ),
     )
     parser.add_argument(
         "--hard-maze-pool-size",
@@ -6505,6 +6918,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Number of deterministic, seed-separated suites that one frozen "
             "policy must pass before target-only training stops."
         ),
+    )
+    parser.add_argument(
+        "--precision-plateau-evals",
+        type=int,
+        default=None,
+        help="Post-budget evaluations without improvement before recovery.",
+    )
+    parser.add_argument(
+        "--precision-recovery-steps",
+        type=int,
+        default=None,
+        help="Transitions trained in one frozen-best recovery window.",
+    )
+    parser.add_argument(
+        "--precision-recovery-lr-fraction",
+        type=float,
+        default=None,
+        help="Fraction of the initial learning rate used during recovery.",
     )
     parser.add_argument(
         "--performance-profile",
@@ -6647,6 +7078,9 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "expert_pretrain_epochs",
         "target_solve_rate",
         "target_solve_evals",
+        "precision_plateau_evals",
+        "precision_recovery_steps",
+        "precision_recovery_lr_fraction",
         "performance_profile",
         "maze_workers",
         "planner_fallback",
@@ -6677,6 +7111,7 @@ def main(argv: list[str] | None = None) -> None:
     config = resolve_cli_artifacts(config, args, run_timestamp)
     device = select_device(config.device, config.require_cuda)
     config.performance_profile = configure_performance(config.performance_profile, device)
+    config.num_envs = resolve_num_envs(config)
     expected_shape = observation_shape(config.maze_size, config.observation_mode, config.view_size)
     agent = create_agent(config, expected_shape, device)
 

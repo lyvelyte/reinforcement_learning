@@ -1,7 +1,7 @@
 import json
 import random
 from collections import deque
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime, timezone
 
 import numpy as np
@@ -10,6 +10,7 @@ import torch
 
 import MouseAgent as mouse_agent_module
 from MouseAgent import (
+    DASHBOARD_MAX_HISTORY_POINTS,
     DASHBOARD_TOOLTIPS,
     DEFAULT_INFER_FLAG,
     DEFAULT_INFERENCE_MAZES,
@@ -29,7 +30,6 @@ from MouseAgent import (
     MouseAgent,
     RNDModule,
     RecurrentPPOAgent,
-    SumTree,
     ReplayBuffer,
     TrainConfig,
     _chart_x_max,
@@ -41,11 +41,15 @@ from MouseAgent import (
     _episode_tick_values,
     _eval_greedy,
     _format_chart_tick,
+    _format_number,
+    _format_pct,
     _generate_prefetched_grid,
     _optional_bool,
+    _non_overlapping_episode_ticks,
     _rects_overlap,
     _recurrent_ppo_precision_schedule,
     _restore_rng_state,
+    _should_run_eval,
     _train_config_from_args,
     _training_environment_payload,
     default_artifact_paths,
@@ -53,6 +57,7 @@ from MouseAgent import (
     latest_model_path,
     paired_log_path,
     resolve_cli_artifacts,
+    resolve_num_envs,
     build_n_step_transition,
     curriculum_distance_range,
     dashboard_layout,
@@ -352,6 +357,45 @@ def test_recurrent_precision_schedule_decays_after_budget_to_floors():
     assert np.isclose(entropy, 2e-3)
 
 
+def test_target_only_evaluation_ignores_episode_cap_until_step_interval():
+    target_only = TrainConfig(
+        episodes=10,
+        eval_every_steps=50,
+        target_only_stop=True,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    bounded = replace(target_only, target_only_stop=False)
+
+    assert not _should_run_eval(target_only, completed=11, total_steps=120, last_eval_step=100)
+    assert _should_run_eval(target_only, completed=11, total_steps=150, last_eval_step=100)
+    assert _should_run_eval(bounded, completed=10, total_steps=120, last_eval_step=100)
+
+
+def test_profile_selected_environment_parallelism_preserves_overrides():
+    fast = TrainConfig(
+        algorithm="recurrent_ppo",
+        performance_profile="rtx3090-fast",
+        num_envs=None,
+    )
+    portable = TrainConfig(
+        algorithm="recurrent_ppo",
+        performance_profile="portable",
+        num_envs=None,
+    )
+    explicit = TrainConfig(
+        algorithm="recurrent_ppo",
+        performance_profile="rtx3090-fast",
+        num_envs=256,
+    )
+
+    assert resolve_num_envs(fast) == 512
+    assert resolve_num_envs(portable) == 256
+    assert resolve_num_envs(explicit) == 256
+
+
 @pytest.mark.parametrize(
     ("additional_rates", "confirmed"),
     [([1.0, 1.0], True), ([1.0, 0.99], False)],
@@ -436,6 +480,7 @@ def test_hard_maze_replay_uses_transformed_variants_and_excludes_held_out_grid()
     sampler = MazeTaskSampler(config, random.Random(123))
 
     added = sampler.add_failed_grids([fixed_grid()])
+    sampler.record_validation_solve_rate(1.0)
     sampled = sampler.sample()
 
     assert added >= 3
@@ -471,6 +516,70 @@ def test_hard_maze_pool_restores_exact_variants():
         np.array_equal(actual, expected)
         for actual, expected in zip(restored.hard_grids, original.hard_grids)
     )
+
+
+def test_hard_maze_fraction_ramps_with_validation_and_reservoir_is_deterministic():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        hard_maze_fraction=0.15,
+        hard_maze_pool_size=3,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    first = MazeTaskSampler(config, random.Random(7))
+    second = MazeTaskSampler(config, random.Random(7))
+    for sampler in (first, second):
+        sampler.add_failed_grids([fixed_grid()])
+
+    first.record_validation_solve_rate(0.90)
+    assert first.effective_hard_maze_fraction() == 0.0
+    first.record_validation_solve_rate(0.945)
+    assert np.isclose(first.effective_hard_maze_fraction(), 0.075)
+    first.record_validation_solve_rate(0.99)
+    assert np.isclose(first.effective_hard_maze_fraction(), 0.15)
+
+    assert first.hard_candidates_seen == second.hard_candidates_seen
+    assert all(
+        np.array_equal(actual, expected)
+        for actual, expected in zip(first.hard_grids, second.hard_grids)
+    )
+    seen_before = first.hard_candidates_seen
+    first.add_failed_grids([fixed_grid()])
+    assert first.hard_candidates_seen == seen_before
+
+
+def test_hard_maze_reservoir_state_round_trips_and_legacy_pool_loads():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        hard_maze_pool_size=3,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    original = MazeTaskSampler(config, random.Random(4))
+    original.add_failed_grids([fixed_grid()])
+    original.record_validation_solve_rate(0.97)
+    restored = MazeTaskSampler(config, random.Random(9))
+
+    restored.restore_hard_grids(
+        original.hard_grids,
+        original._seen_hard_grid_keys,
+        original.hard_candidates_seen,
+        original.validation_solve_rate,
+    )
+    legacy = MazeTaskSampler(config, random.Random(10))
+    legacy.restore_hard_grids(original.hard_grids)
+
+    assert restored.hard_candidates_seen == original.hard_candidates_seen
+    assert restored.validation_solve_rate == 0.97
+    assert restored._seen_hard_grid_keys == original._seen_hard_grid_keys
+    assert len(legacy.hard_grids) == len(original.hard_grids)
+    assert legacy.hard_candidates_seen == len(original.hard_grids)
 
 
 def test_make_maze_retries_candidates_that_exceed_episode_budget(monkeypatch):
@@ -575,6 +684,26 @@ def test_maze_batch_matches_sequential_maze_transitions():
         assert bool(batch_step.dones[0]) is sequential_done
         assert bool(batch_step.invalid[0]) is bool(sequential_info["invalid"])
         assert np.array_equal(batch_step.action_masks[0], sequential.valid_action_mask())
+
+
+def test_maze_batch_subset_step_leaves_inactive_slots_unchanged():
+    environments = [
+        Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+        for _ in range(3)
+    ]
+    batch = MazeBatch(environments)
+    inactive_positions = batch.positions[[0, 2]].copy()
+    inactive_steps = batch.steps[[0, 2]].copy()
+
+    result = batch.step(
+        np.array([0], dtype=np.int64),
+        indices=np.array([1], dtype=np.int64),
+    )
+
+    assert result.states.shape[0] == 1
+    assert batch.steps[1] == 1
+    assert np.array_equal(batch.positions[[0, 2]], inactive_positions)
+    assert np.array_equal(batch.steps[[0, 2]], inactive_steps)
 
 
 def test_bfs_planner_and_expert_labels_select_shortest_legal_action():
@@ -968,6 +1097,8 @@ def test_chart_tick_formatter_keeps_small_loss_values_visible():
     assert _format_chart_tick(0.0043) == "0.0043"
     assert _format_chart_tick(0.043) == "0.043"
     assert _format_chart_tick(1.2) == "1.2"
+    assert _format_pct(0.9985) == "99.85%"
+    assert _format_number(17.123) == "17.12"
 
 
 def test_chart_histories_keep_full_episode_range():
@@ -992,6 +1123,29 @@ def test_chart_histories_keep_full_episode_range():
     assert tracker.reward_history[-1][0] == 7
 
 
+def test_chart_histories_are_bounded_and_preserve_run_endpoints():
+    tracker = MetricsTracker(window=3)
+    final_episode = DASHBOARD_MAX_HISTORY_POINTS * 3
+
+    for episode in range(1, final_episode + 1):
+        tracker.record_episode(
+            EpisodeStats(
+                total_reward=float(episode),
+                steps=episode,
+                solved=True,
+                timeout=False,
+                invalid_moves=0,
+                optimal_steps=1,
+            ),
+            episode=episode,
+        )
+
+    assert len(tracker.reward_history) <= DASHBOARD_MAX_HISTORY_POINTS
+    assert len(tracker.train_solve_history) <= DASHBOARD_MAX_HISTORY_POINTS
+    assert tracker.reward_history[0][0] == 1
+    assert tracker.reward_history[-1][0] == final_episode
+
+
 def test_episode_tick_values_scale_without_clutter():
     small_ticks = _episode_tick_values(3, 320)
     large_ticks = _episode_tick_values(10_000, 320)
@@ -1001,6 +1155,18 @@ def test_episode_tick_values_scale_without_clutter():
     assert large_ticks[-1] == 10_000
     assert len(large_ticks) <= 6
     assert _chart_x_max(5, [(8, 0.5)]) == 8
+
+
+def test_episode_tick_labels_remove_overlapping_interior_endpoint_neighbor():
+    ticks = [0, 10_000_000, 10_100_000]
+    visible = _non_overlapping_episode_ticks(
+        ticks,
+        max_episode=10_100_000,
+        plot_width=320,
+        label_widths=[7, 70, 70],
+    )
+
+    assert visible == [0, 10_100_000]
 
 
 def test_dashboard_tooltips_cover_every_panel():
@@ -1154,7 +1320,7 @@ def test_resume_artifact_resolution_reuses_latest_model_and_log(tmp_path, monkey
     log_path.write_text('{"event": "train_end"}\n')
     monkeypatch.setattr(mouse_agent_module, "LOG_RESULTS_DIR", str(log_directory))
     monkeypatch.setattr(mouse_agent_module, "latest_model_path", lambda: str(model_path))
-    args = parse_args(["--train"])
+    args = parse_args(["--train", "--resume"])
 
     config = resolve_cli_artifacts(
         _train_config_from_args(args), args, "20260710T123456123456Z"
@@ -1169,7 +1335,7 @@ def test_resume_artifact_resolution_falls_back_when_no_model_exists(monkeypatch)
         raise FileNotFoundError("no model")
 
     monkeypatch.setattr(mouse_agent_module, "latest_model_path", no_model)
-    args = parse_args(["--train"])
+    args = parse_args(["--train", "--resume"])
 
     config = resolve_cli_artifacts(
         _train_config_from_args(args), args, "20260710T123456123456Z"
@@ -1184,7 +1350,7 @@ def test_resume_artifact_resolution_requires_matching_log(tmp_path, monkeypatch)
     model_path.write_bytes(b"checkpoint")
     monkeypatch.setattr(mouse_agent_module, "LOG_RESULTS_DIR", str(tmp_path / "logs"))
     monkeypatch.setattr(mouse_agent_module, "latest_model_path", lambda: str(model_path))
-    args = parse_args(["--train"])
+    args = parse_args(["--train", "--resume"])
 
     with pytest.raises(FileNotFoundError, match="matching training log"):
         resolve_cli_artifacts(
@@ -1951,6 +2117,7 @@ def test_process_prefetcher_prioritizes_hard_replay_variants():
     )
     sampler = MazeTaskSampler(config, random.Random(17))
     sampler.add_failed_grids([fixed_grid()])
+    sampler.record_validation_solve_rate(1.0)
     prefetcher = DeterministicMazePrefetcher(sampler, workers=1)
     try:
         environment = prefetcher.next()
@@ -1984,6 +2151,15 @@ def test_recurrent_checkpoint_v2_round_trip_and_rejects_legacy(tmp_path):
     agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
     agent.update_count = 7
     agent.total_env_steps = 42
+    agent.training_state = {
+        "precision_recovery": {
+            "plateau_evals": 3,
+            "active": True,
+            "end_step": 99,
+            "count": 2,
+        },
+        "hard_maze_seen_keys": [fixed_grid().tobytes()],
+    }
     agent.save(str(checkpoint))
 
     restored = RecurrentPPOAgent(config, device=torch.device("cpu"))
@@ -1992,6 +2168,7 @@ def test_recurrent_checkpoint_v2_round_trip_and_rejects_legacy(tmp_path):
 
     assert restored.update_count == 7
     assert restored.total_env_steps == 42
+    assert restored.training_state == agent.training_state
     with pytest.raises(ValueError, match="schema-v2"):
         restored.load(str(legacy))
 
@@ -2149,4 +2326,85 @@ def test_failed_target_confirmation_resumes_training(monkeypatch):
         not np.array_equal(grid, fixed_grid())
         for grid in agent.training_state["hard_maze_grids"]
     )
+    assert not rates
+
+
+@pytest.mark.parametrize(
+    ("third_rate", "expected_outcome"),
+    [(0.6, "improved"), (0.5, "rollback")],
+)
+def test_precision_recovery_handles_improvement_and_rollback(
+    monkeypatch,
+    tmp_path,
+    third_rate,
+    expected_outcome,
+):
+    rates = deque([0.5, 0.5, third_rate, 1.0, 1.0])
+
+    def fake_eval(agent, config, **kwargs):
+        del agent, config, kwargs
+        return EvalMetrics(solve_rate=rates.popleft() if rates else 1.0)
+
+    monkeypatch.setattr(mouse_agent_module, "_eval_greedy", fake_eval)
+    log_path = tmp_path / f"recovery-{expected_outcome}.jsonl"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        observation_mode="local",
+        view_size=5,
+        episodes=1,
+        max_env_steps=1,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        rnd_reward_coef=0.0,
+        eval_every_steps=1,
+        eval_episodes=1,
+        target_solve_rate=1.0,
+        target_solve_evals=2,
+        precision_plateau_evals=1,
+        precision_recovery_steps=1,
+        precision_recovery_lr_fraction=0.05,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=str(log_path),
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+
+    train(agent=agent, config=config)
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    recovery_records = [
+        record for record in records if record["event"] == "precision_recovery"
+    ]
+    recovery_learners = [
+        record
+        for record in records
+        if record["event"] == "learner"
+        and record["precision_recovery_active"] is True
+    ]
+
+    assert any(record["phase"] == "start" for record in recovery_records)
+    assert any(
+        record["phase"] == "end" and record["outcome"] == expected_outcome
+        for record in recovery_records
+    )
+    assert recovery_learners
+    assert all(
+        np.isclose(
+            record["learning_rate"],
+            config.learning_rate * config.precision_recovery_lr_fraction,
+        )
+        for record in recovery_learners
+    )
+    assert agent.training_state["precision_recovery"]["active"] is False
+    assert agent.training_state["target_confirmed"] is True
     assert not rates

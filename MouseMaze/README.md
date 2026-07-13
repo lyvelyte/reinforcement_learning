@@ -18,17 +18,19 @@ conda run -n ml pytest MouseMaze/test_mouse_agent.py
 
 ## RTX 3090 training
 
-The `auto` profile selects `rtx3090-fast` on a 24GB RTX 3090. It uses 256
-environments, BF16/TF32, compiled recurrent kernels, fused Adam, GPU-resident
-rollouts, and eight deterministic maze-generation workers. A newly encountered
+The `auto` profile selects `rtx3090-fast` on a 24GB RTX 3090. Recurrent PPO
+automatically uses 512 environments with that profile and 256 with portable or
+strict profiles; an explicit `--num-envs` always wins. The fast profile also
+uses BF16/TF32, compiled recurrent kernels, fused Adam, GPU-resident rollouts,
+and eight deterministic maze-generation workers. A newly encountered
 model/batch shape can spend roughly 1–2 minutes compiling; the compiled kernels
 are cached and subsequent launches are much faster.
 
 Recurrent PPO defaults to target-only stopping. After the curriculum completes,
 a policy that reaches the target solve rate is frozen and checked on three
 deterministic, seed-separated suites. Training stops only when that unchanged
-candidate passes every suite. It also resumes the newest timestamped checkpoint
-and appends to its paired JSONL log when one exists.
+candidate passes every suite. Fresh training is the default; pass `--resume`
+to load the newest timestamped checkpoint and append to its paired JSONL log.
 
 The configured transition budget controls the main learning-rate and RND
 schedules. RND reaches zero at that budget. Target-only training beyond the
@@ -41,11 +43,26 @@ agent time to recover from a wrong turn while retaining a finite task budget.
 
 Failed held-out evaluations feed a bounded hard-maze replay pool through
 shape-preserving rotations and reflections; the exact held-out grids are never
-used for training. By default, 15% of replacement tasks come from this pool.
+used for training. The pool uses deterministic reservoir sampling rather than
+continually replacing its oldest examples. Its configured 15% fraction is a
+maximum: replay is disabled below a 90% validation solve rate, ramps to the
+maximum between 90% and 99%, and remains there afterward.
 Recurrent PPO trains on 64-step sequences so wrong-turn and recovery behavior
 can receive credit across longer local-observation episodes. Configure these
 features with `--hard-maze-fraction`, `--hard-maze-pool-size`, and
 `--recurrent-sequence-length`.
+
+After the original transition budget, 20 regular evaluations without a new
+best policy trigger guarded recovery. Training restores the frozen best policy
+and optimizer, uses 5% of the initial learning rate for one million
+transitions, and retains the existing entropy floor. An improvement ends
+recovery immediately; otherwise the policy rolls back to the frozen best again.
+Tune this with `--precision-plateau-evals`, `--precision-recovery-steps`, and
+`--precision-recovery-lr-fraction`.
+
+Target-only runs continue evaluating by transition cadence after passing the
+nominal episode count; that count no longer causes evaluation after every
+learner update.
 
 Full-map target-only training:
 
@@ -70,11 +87,16 @@ To restore the episode/transition caps, pass `--no-target-only-stop` with
 their existing caps.
 
 Fresh training uses one UTC timestamp for paired artifacts under
-`MouseMaze/results/models/` and `MouseMaze/results/logs/`. A default resumed
-run reuses the newest model and its matching log instead. Each JSONL record
+`MouseMaze/results/models/` and `MouseMaze/results/logs/`. A run requested with
+`--resume` reuses the newest model and its matching log. Each JSONL record
 contains UTC `timestamp` and `time_unix` fields alongside resolved configuration,
 runtime and Git provenance, metrics, utilization, and checkpoint events.
 Explicit `--save-path` and `--training-log-path` values are honored exactly.
+
+The optional dashboard retains a bounded whole-run chart history, reports
+percentages to two decimal places, and suppresses overlapping episode-axis
+labels. It remains useful interactively; use `--no-dashboard` for the highest
+headless throughput.
 
 For deterministic debugging, replace the performance profile with `strict`
 and normally reduce `--num-envs`.
