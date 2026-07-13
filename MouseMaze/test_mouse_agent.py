@@ -322,10 +322,11 @@ def test_default_timeout_provides_local_recovery_budget(monkeypatch):
 
     env = make_maze(config)
 
-    assert config.min_episode_steps == 40
+    assert config.min_episode_steps == 60
     assert config.timeout_step_factor == 6.0
+    assert config.recurrent_sequence_length == 64
     assert env.optimal_start_steps == 2
-    assert env.max_episode_steps == 40
+    assert env.max_episode_steps == 60
 
 
 def test_recurrent_precision_schedule_decays_after_budget_to_floors():
@@ -419,6 +420,57 @@ def test_curriculum_distance_ranges_and_sampling_are_deterministic():
 
     assert all(6 <= steps <= 10 for steps in easy)
     assert all(8 <= steps <= 16 for steps in medium)
+
+
+def test_hard_maze_replay_uses_transformed_variants_and_excludes_held_out_grid():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        hard_maze_fraction=1.0,
+        hard_maze_pool_size=3,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    sampler = MazeTaskSampler(config, random.Random(123))
+
+    added = sampler.add_failed_grids([fixed_grid()])
+    sampled = sampler.sample()
+
+    assert added >= 3
+    assert len(sampler.hard_grids) == 3
+    assert all(not np.array_equal(grid, fixed_grid()) for grid in sampler.hard_grids)
+    assert any(np.array_equal(sampled.grid, grid) for grid in sampler.hard_grids)
+    assert sampled.optimal_start_steps <= sampled.max_episode_steps
+    assert sampler.sampling_mix() == {
+        "hard": 1.0,
+        "current": 0.0,
+        "previous": 0.0,
+        "unrestricted": 0.0,
+    }
+
+
+def test_hard_maze_pool_restores_exact_variants():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        hard_maze_fraction=1.0,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    original = MazeTaskSampler(config, random.Random(1))
+    original.add_failed_grids([fixed_grid()])
+    restored = MazeTaskSampler(config, random.Random(2))
+
+    restored.restore_hard_grids(original.hard_grids)
+
+    assert len(restored.hard_grids) == len(original.hard_grids)
+    assert all(
+        np.array_equal(actual, expected)
+        for actual, expected in zip(restored.hard_grids, original.hard_grids)
+    )
 
 
 def test_make_maze_retries_candidates_that_exceed_episode_budget(monkeypatch):
@@ -547,6 +599,37 @@ def test_bfs_planner_and_expert_labels_select_shortest_legal_action():
         maze_factory=lambda: Maze(fixed_grid(), observation_mode="full", max_episode_steps=10),
     )
     assert metrics.solve_rate == 1.0
+
+
+def test_greedy_eval_retains_failed_grids_for_hard_replay():
+    class StuckPolicy:
+        def get_actions(self, states, epsilon=0.0, action_masks=None):
+            del epsilon, action_masks
+            return np.ones(len(states), dtype=np.int64)
+
+    metrics = _eval_greedy(
+        StuckPolicy(),
+        TrainConfig(
+            maze_size=(5, 5),
+            eval_episodes=1,
+            max_episode_steps=1,
+            timeout_step_factor=None,
+            min_episode_steps=1,
+            dashboard_flag=False,
+            save_path=None,
+            training_log_path=None,
+            device="cpu",
+        ),
+        maze_factory=lambda: Maze(
+            fixed_grid(),
+            observation_mode="full",
+            max_episode_steps=1,
+        ),
+    )
+
+    assert metrics.solve_rate == 0.0
+    assert len(metrics.failed_grids) == 1
+    assert np.array_equal(metrics.failed_grids[0], fixed_grid())
 
 
 def test_prioritized_replay_samples_high_priority_transition_more_often():
@@ -1854,6 +1937,33 @@ def test_process_prefetcher_preserves_seeded_task_order():
     assert np.array_equal(actual, expected)
 
 
+def test_process_prefetcher_prioritizes_hard_replay_variants():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        hard_maze_fraction=1.0,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+        require_cuda=False,
+        maze_workers=1,
+    )
+    sampler = MazeTaskSampler(config, random.Random(17))
+    sampler.add_failed_grids([fixed_grid()])
+    prefetcher = DeterministicMazePrefetcher(sampler, workers=1)
+    try:
+        environment = prefetcher.next()
+    finally:
+        prefetcher.close()
+
+    assert any(
+        np.array_equal(environment.grid, variant)
+        for variant in sampler.hard_grids
+    )
+    assert not np.array_equal(environment.grid, fixed_grid())
+
+
 def test_recurrent_checkpoint_v2_round_trip_and_rejects_legacy(tmp_path):
     config = TrainConfig(
         maze_size=(5, 5),
@@ -1994,7 +2104,11 @@ def test_failed_target_confirmation_resumes_training(monkeypatch):
 
     def fake_eval(agent, config, **kwargs):
         del agent, config, kwargs
-        return EvalMetrics(solve_rate=rates.popleft() if rates else 1.0)
+        solve_rate = rates.popleft() if rates else 1.0
+        return EvalMetrics(
+            solve_rate=solve_rate,
+            failed_grids=[fixed_grid()] if solve_rate < 1.0 else [],
+        )
 
     monkeypatch.setattr(mouse_agent_module, "_eval_greedy", fake_eval)
     config = TrainConfig(
@@ -2030,4 +2144,9 @@ def test_failed_target_confirmation_resumes_training(monkeypatch):
 
     assert agent.training_state["target_confirmed"] is True
     assert agent.total_env_steps >= 2
+    assert agent.training_state["hard_maze_grids"]
+    assert all(
+        not np.array_equal(grid, fixed_grid())
+        for grid in agent.training_state["hard_maze_grids"]
+    )
     assert not rates

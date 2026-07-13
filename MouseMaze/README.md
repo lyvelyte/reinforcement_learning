@@ -35,9 +35,17 @@ schedules. RND reaches zero at that budget. Target-only training beyond the
 budget enters a precision phase that progressively halves the learning rate and
 entropy coefficient down to stable floors, reducing late policy drift.
 
-Episode limits default to at least 40 steps or six times the maze's shortest
+Episode limits default to at least 60 steps or six times the maze's shortest
 path, whichever is larger, capped by `--max-episode-steps`. This gives the local
 agent time to recover from a wrong turn while retaining a finite task budget.
+
+Failed held-out evaluations feed a bounded hard-maze replay pool through
+shape-preserving rotations and reflections; the exact held-out grids are never
+used for training. By default, 15% of replacement tasks come from this pool.
+Recurrent PPO trains on 64-step sequences so wrong-turn and recovery behavior
+can receive credit across longer local-observation episodes. Configure these
+features with `--hard-maze-fraction`, `--hard-maze-pool-size`, and
+`--recurrent-sequence-length`.
 
 Full-map target-only training:
 

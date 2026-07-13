@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 
@@ -107,7 +107,7 @@ MAX_EPISODE_STEPS = 300
 # Multiplier used to provide a maze-size-aware recovery budget when enabled.
 DEFAULT_TIMEOUT_STEP_FACTOR = 6.0
 # Minimum episode length allowing local agents to recover from short wrong turns.
-DEFAULT_MIN_EPISODE_STEPS = 40
+DEFAULT_MIN_EPISODE_STEPS = 60
 # Number of episodes in each standard evaluation pass during training.
 NUM_EVAL_EPISODES = 500
 # Episode-based dashboard/evaluation cadence compatibility default.
@@ -173,6 +173,10 @@ DEFAULT_CURRICULUM_PROMOTION_EVALS = 3
 DEFAULT_CURRICULUM_PREVIOUS_FRACTION = 0.20
 # Fraction of curriculum tasks sampled uniformly across available stages.
 DEFAULT_CURRICULUM_UNIFORM_FRACTION = 0.10
+# Fraction of training tasks drawn from transformed held-out failures.
+DEFAULT_HARD_MAZE_FRACTION = 0.15
+# Maximum number of transformed hard-maze variants retained in memory.
+DEFAULT_HARD_MAZE_POOL_SIZE = 256
 # Whether training collects transitions from multiple environments together.
 DEFAULT_VECTORIZED_ENVS = True
 # Whether replay contents are included in checkpoints.
@@ -221,7 +225,7 @@ PPO_VALUE_CLIP_RANGE = 0.2
 # Size of the recurrent GRU hidden state.
 RECURRENT_HIDDEN_SIZE = 128
 # Number of consecutive steps in a recurrent PPO training sequence.
-RECURRENT_SEQUENCE_LENGTH = 32
+RECURRENT_SEQUENCE_LENGTH = 64
 # Number of recurrent sequences processed in one PPO minibatch.
 RECURRENT_SEQUENCE_MINIBATCH_SIZE = 64
 # Coefficient for random-network-distillation intrinsic reward.
@@ -301,6 +305,8 @@ class TrainConfig:
     curriculum_promotion_evals: int = DEFAULT_CURRICULUM_PROMOTION_EVALS
     curriculum_previous_fraction: float = DEFAULT_CURRICULUM_PREVIOUS_FRACTION
     curriculum_uniform_fraction: float = DEFAULT_CURRICULUM_UNIFORM_FRACTION
+    hard_maze_fraction: float = DEFAULT_HARD_MAZE_FRACTION
+    hard_maze_pool_size: int = DEFAULT_HARD_MAZE_POOL_SIZE
     curriculum_eval_episodes: int = DEFAULT_CURRICULUM_EVAL_EPISODES
     vectorized_envs: bool = DEFAULT_VECTORIZED_ENVS
     checkpoint_replay: bool = DEFAULT_CHECKPOINT_REPLAY
@@ -422,6 +428,10 @@ class TrainConfig:
             raise ValueError("curriculum_uniform_fraction must be in [0, 1]")
         if self.curriculum_previous_fraction + self.curriculum_uniform_fraction > 1:
             raise ValueError("curriculum sampling fractions must sum to at most 1")
+        if not 0 <= self.hard_maze_fraction <= 1:
+            raise ValueError("hard_maze_fraction must be in [0, 1]")
+        if self.hard_maze_pool_size < 1:
+            raise ValueError("hard_maze_pool_size must be >= 1")
         self._validate_distance_range("curriculum_easy_range", self.curriculum_easy_range)
         self._validate_distance_range(
             "curriculum_medium_range",
@@ -497,6 +507,7 @@ class EvalMetrics:
     failed_final_distance: float = 0.0
     difficulty_solve_rates: dict[str, float] | None = None
     difficulty_counts: dict[str, int] | None = None
+    failed_grids: list[np.ndarray] = field(default_factory=list, repr=False)
 
 
 @dataclass(slots=True)
@@ -1343,10 +1354,15 @@ class MazeTaskSampler:
         self.config = config
         self.rng = rng
         self.curriculum = CurriculumController(config)
+        self.hard_grids: list[np.ndarray] = []
+        self._hard_grid_keys: set[bytes] = set()
 
     def sample(self) -> Maze:
         """Sample from current, previous, and uniform task distributions."""
 
+        hard_grid = self.sample_hard_grid()
+        if hard_grid is not None:
+            return _maze_from_grid(self.config, hard_grid)
         target_range = self.sample_target_range()
         try:
             return make_maze(self.config, rng=self.rng, target_range=target_range)
@@ -1354,6 +1370,45 @@ class MazeTaskSampler:
             if "target_range" not in str(exc):
                 raise
             return make_maze(self.config, rng=self.rng)
+
+    def add_failed_grids(self, failed_grids: list[np.ndarray]) -> int:
+        """Add transformed failure variants without training on held-out grids."""
+
+        added = 0
+        for failed_grid in failed_grids:
+            for variant in _hard_maze_variants(failed_grid):
+                key = variant.tobytes()
+                if key in self._hard_grid_keys:
+                    continue
+                if len(self.hard_grids) >= self.config.hard_maze_pool_size:
+                    removed = self.hard_grids.pop(0)
+                    self._hard_grid_keys.discard(removed.tobytes())
+                self.hard_grids.append(variant)
+                self._hard_grid_keys.add(key)
+                added += 1
+        return added
+
+    def restore_hard_grids(self, grids: object) -> None:
+        """Restore exact replay variants from checkpoint training state."""
+
+        if not isinstance(grids, (list, tuple)):
+            return
+        for value in grids[-self.config.hard_maze_pool_size :]:
+            grid = np.ascontiguousarray(value, dtype=np.uint8)
+            if grid.shape != self.config.maze_size:
+                continue
+            key = grid.tobytes()
+            if key in self._hard_grid_keys:
+                continue
+            self.hard_grids.append(grid)
+            self._hard_grid_keys.add(key)
+
+    def sample_hard_grid(self) -> np.ndarray | None:
+        """Return a hard-maze variant according to the configured replay mix."""
+
+        if not self.hard_grids or self.rng.random() >= self.config.hard_maze_fraction:
+            return None
+        return self.rng.choice(self.hard_grids).copy()
 
     def sample_target_range(self) -> tuple[int, int] | None:
         """Choose a curriculum range without turning a missing previous stage into uniform."""
@@ -1375,8 +1430,15 @@ class MazeTaskSampler:
     def sampling_mix(self) -> dict[str, float]:
         """Return the effective current/previous/unrestricted sampling proportions."""
 
+        hard = self.config.hard_maze_fraction if self.hard_grids else 0.0
+        ordinary = 1.0 - hard
         if self.curriculum.complete or not self.config.curriculum_enabled:
-            return {"current": 0.0, "previous": 0.0, "unrestricted": 1.0}
+            return {
+                "hard": hard,
+                "current": 0.0,
+                "previous": 0.0,
+                "unrestricted": ordinary,
+            }
         previous = (
             self.config.curriculum_previous_fraction
             if self.curriculum.previous_range() is not None
@@ -1384,9 +1446,10 @@ class MazeTaskSampler:
         )
         unrestricted = self.config.curriculum_uniform_fraction
         return {
-            "current": 1.0 - previous - unrestricted,
-            "previous": previous,
-            "unrestricted": unrestricted,
+            "hard": hard,
+            "current": ordinary * (1.0 - previous - unrestricted),
+            "previous": ordinary * previous,
+            "unrestricted": ordinary * unrestricted,
         }
 
     def describe(self, environment: Maze) -> dict[str, float | str]:
@@ -1397,6 +1460,30 @@ class MazeTaskSampler:
             "difficulty": float(distance),
             "bucket": difficulty_bucket(distance),
         }
+
+
+def _hard_maze_variants(grid: np.ndarray) -> list[np.ndarray]:
+    """Return shape-preserving symmetries, excluding the held-out original."""
+
+    original = np.asarray(grid, dtype=np.uint8)
+    candidates = [
+        np.flip(original, axis=0),
+        np.flip(original, axis=1),
+        np.rot90(original, 2),
+    ]
+    if original.shape[0] == original.shape[1]:
+        candidates.extend((np.rot90(original, 1), np.rot90(original, 3)))
+    original_key = original.tobytes()
+    variants: list[np.ndarray] = []
+    keys: set[bytes] = set()
+    for candidate in candidates:
+        variant = np.ascontiguousarray(candidate, dtype=np.uint8)
+        key = variant.tobytes()
+        if key == original_key or key in keys:
+            continue
+        variants.append(variant)
+        keys.add(key)
+    return variants
 
 
 def _generate_prefetched_grid(
@@ -1446,6 +1533,9 @@ class DeterministicMazePrefetcher:
     def next(self) -> Maze:
         if self.executor is None:
             return self.sampler.sample()
+        hard_grid = self.sampler.sample_hard_grid()
+        if hard_grid is not None:
+            return _maze_from_grid(self.sampler.config, hard_grid)
         grid = self.futures.popleft().result()
         self._fill()
         return _maze_from_grid(self.sampler.config, grid)
@@ -2943,6 +3033,7 @@ def _eval_greedy(
     loop_episodes = 0
     repeated_state_action_episodes = 0
     failed_final_distances: list[float] = []
+    failed_grids: list[np.ndarray] = []
     bucket_totals: dict[str, int] = {}
     bucket_solves: dict[str, int] = {}
     eval_rng = random.Random(resolved_eval_seed(config))
@@ -3025,6 +3116,7 @@ def _eval_greedy(
                     bucket_solves[bucket] = bucket_solves.get(bucket, 0) + 1
                 else:
                     timeouts += 1
+                    failed_grids.append(env.grid.copy())
                     loop_episodes += int(has_loop[env_idx])
                     repeated_state_action_episodes += int(
                         has_repeated_state_action[env_idx]
@@ -3053,6 +3145,7 @@ def _eval_greedy(
             for bucket, count in sorted(bucket_totals.items())
         },
         difficulty_counts=dict(sorted(bucket_totals.items())),
+        failed_grids=failed_grids,
     )
 
 
@@ -4048,6 +4141,7 @@ def _update_training_state(
     train_rng: random.Random,
     update_budget: float = 0.0,
     curriculum: CurriculumController | None = None,
+    hard_grids: list[np.ndarray] | None = None,
 ) -> None:
     """Attach restart metadata immediately before a checkpoint can be saved."""
 
@@ -4068,6 +4162,8 @@ def _update_training_state(
             "level": curriculum.level,
             "success_streak": curriculum.success_streak,
         }
+    if hard_grids is not None:
+        state["hard_maze_grids"] = [grid.copy() for grid in hard_grids]
     agent.training_state = state
 
 
@@ -5032,6 +5128,7 @@ def _train_recurrent_ppo(
     if "train_rng_state" in saved_state:
         train_rng.setstate(saved_state["train_rng_state"])
     sampler = MazeTaskSampler(config, train_rng)
+    sampler.restore_hard_grids(saved_state.get("hard_maze_grids"))
     curriculum_state = saved_state.get("curriculum")
     if isinstance(curriculum_state, dict):
         sampler.curriculum.level = int(curriculum_state.get("level", 0))
@@ -5287,6 +5384,11 @@ def _train_recurrent_ppo(
                 promoted = sampler.curriculum.record_validation(stage_metrics)
                 if promoted:
                     prefetcher.reset()
+            hard_variants_added = (
+                sampler.add_failed_grids(metrics.failed_grids)
+                if not config.curriculum_enabled or sampler.curriculum.complete
+                else 0
+            )
             _update_training_state(
                 agent,
                 completed,
@@ -5294,6 +5396,7 @@ def _train_recurrent_ppo(
                 total_steps,
                 train_rng,
                 curriculum=sampler.curriculum,
+                hard_grids=sampler.hard_grids,
             )
             agent.training_state["target_confirmed"] = False
             if logger.enabled:
@@ -5303,6 +5406,8 @@ def _train_recurrent_ppo(
                     promoted=promoted,
                     stage_metrics=_eval_metrics_payload(stage_metrics),
                     sampling_mix=sampler.sampling_mix(),
+                    hard_variants_added=hard_variants_added,
+                    hard_maze_pool_size=len(sampler.hard_grids),
                 )
 
         evaluation_started = time.perf_counter()
@@ -5339,6 +5444,10 @@ def _train_recurrent_ppo(
                 and eval_result.solve_rate >= config.target_solve_rate
             ):
                 confirmation = _confirm_target_candidate(agent, config, eval_result)
+                confirmation_variants_added = sum(
+                    sampler.add_failed_grids(suite_metrics.failed_grids)
+                    for _suite_seed, suite_metrics in confirmation.suites[1:]
+                )
                 for suite_index, (suite_seed, suite_metrics) in enumerate(
                     confirmation.suites,
                     start=1,
@@ -5360,6 +5469,8 @@ def _train_recurrent_ppo(
                         confirmed=target_confirmed,
                         target_solve_rate=config.target_solve_rate,
                         suite_count=len(confirmation.suites),
+                        hard_variants_added=confirmation_variants_added,
+                        hard_maze_pool_size=len(sampler.hard_grids),
                     )
                 if target_confirmed:
                     best_eval_rate = max(best_eval_rate, eval_result.solve_rate)
@@ -5410,6 +5521,7 @@ def _train_recurrent_ppo(
         last_eval_step,
         train_rng,
         curriculum=sampler.curriculum,
+        hard_grids=sampler.hard_grids,
     )
     agent.training_state["target_confirmed"] = target_confirmed
     prefetcher.close()
@@ -6361,6 +6473,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--curriculum-uniform-fraction", type=float, default=None)
     parser.add_argument("--curriculum-eval-episodes", type=int, default=None)
     parser.add_argument(
+        "--hard-maze-fraction",
+        type=float,
+        default=None,
+        help="Fraction of recurrent training tasks sampled from hard-maze variants.",
+    )
+    parser.add_argument(
+        "--hard-maze-pool-size",
+        type=int,
+        default=None,
+        help="Maximum transformed evaluation failures retained for hard replay.",
+    )
+    parser.add_argument(
         "--vectorized-envs",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -6515,6 +6639,8 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "curriculum_previous_fraction",
         "curriculum_uniform_fraction",
         "curriculum_eval_episodes",
+        "hard_maze_fraction",
+        "hard_maze_pool_size",
         "vectorized_envs",
         "checkpoint_replay",
         "expert_pretrain_mazes",
