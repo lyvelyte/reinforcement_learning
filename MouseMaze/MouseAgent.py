@@ -3885,7 +3885,7 @@ class Dashboard:
         self.pygame = pygame
         pygame.init()
         try:
-            self.screen = pygame.display.set_mode((width, height))
+            self.screen = pygame.display.set_mode((width, height), pygame.RESIZABLE)
             pygame.display.set_caption("MouseMaze Training")
         except pygame.error:
             print("[dashboard] pygame display failed; GUI disabled.")
@@ -3909,24 +3909,34 @@ class Dashboard:
         if self.disabled or not self.running or self.screen is None or self.pygame is None:
             return
 
-        mouse_moved = self._process_events()
+        repaint_requested = self._process_events()
         if not self.running:
             return
-        if mouse_moved and self._last_state is not None and self._last_tracker is not None:
+        if (
+            repaint_requested
+            and self._last_state is not None
+            and self._last_tracker is not None
+        ):
             self._render(self._last_state, self._last_tracker)
 
     def _process_events(self) -> bool:
         pg = self.pygame
         assert pg is not None
-        mouse_moved = False
+        repaint_requested = False
         for event in pg.event.get():
             if event.type == pg.QUIT:
                 self.running = False
             if event.type == pg.KEYDOWN and event.key == pg.K_ESCAPE:
                 self.running = False
             if event.type == pg.MOUSEMOTION:
-                mouse_moved = True
-        return mouse_moved
+                repaint_requested = True
+            if event.type == getattr(pg, "VIDEORESIZE", None):
+                resized = (max(320, event.w), max(240, event.h))
+                self.screen = pg.display.set_mode(resized, pg.RESIZABLE)
+                repaint_requested = True
+            if event.type == getattr(pg, "WINDOWRESIZED", None):
+                repaint_requested = True
+        return repaint_requested
 
     def _render(self, state: DashboardState, tracker: MetricsTracker) -> None:
         pg = self.pygame

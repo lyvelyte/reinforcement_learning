@@ -1400,6 +1400,58 @@ def test_dashboard_poll_repaints_cached_state_on_mouse_motion():
     assert render_calls == [(state, tracker)]
 
 
+def test_dashboard_poll_resizes_and_repaints_cached_state():
+    class FakeEvent:
+        type = 4
+        w = 840
+        h = 560
+
+    class FakeEventQueue:
+        def get(self):
+            return [FakeEvent()]
+
+    class FakeDisplay:
+        def __init__(self):
+            self.calls = []
+
+        def set_mode(self, size, flags):
+            self.calls.append((size, flags))
+            return ("screen", size)
+
+    class FakePygame:
+        QUIT = 1
+        KEYDOWN = 2
+        MOUSEMOTION = 3
+        VIDEORESIZE = 4
+        WINDOWRESIZED = 5
+        K_ESCAPE = 27
+        RESIZABLE = 8
+
+        def __init__(self):
+            self.event = FakeEventQueue()
+            self.display = FakeDisplay()
+
+    dashboard = Dashboard.__new__(Dashboard)
+    dashboard.running = True
+    dashboard.disabled = False
+    dashboard.screen = object()
+    dashboard.pygame = FakePygame()
+    state = object()
+    tracker = object()
+    dashboard._last_state = state
+    dashboard._last_tracker = tracker
+    render_calls = []
+    dashboard._render = lambda rendered_state, rendered_tracker: render_calls.append(
+        (rendered_state, rendered_tracker)
+    )
+
+    dashboard.poll()
+
+    assert dashboard.pygame.display.calls == [((840, 560), dashboard.pygame.RESIZABLE)]
+    assert dashboard.screen == ("screen", (840, 560))
+    assert render_calls == [(state, tracker)]
+
+
 def test_cli_omitted_args_use_top_level_train_config_defaults():
     args = parse_args([])
 
