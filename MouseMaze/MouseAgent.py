@@ -46,9 +46,10 @@ NETWORK_TYPES = ("spatial", "flat")
 DISTANCE_SHAPING_MODES = ("potential", "fractional", "none")
 # Hardware/reproducibility tuning profiles exposed by the CLI.
 PERFORMANCE_PROFILES = ("auto", "rtx3090-fast", "strict", "portable")
+CURRICULUM_MODES = ("auto", "manual")
 # Checkpoint format version written by the current agent implementation.
-CHECKPOINT_SCHEMA_VERSION = 2
-# Number of training episodes when training is enabled without an override.
+CHECKPOINT_SCHEMA_VERSION = 3
+# Compatibility episode limit used when training is enabled without an override.
 DEFAULT_EPISODES = 1_000_000
 # Seed used for training maze generation and other random operations.
 DEFAULT_SEED = 0
@@ -59,9 +60,9 @@ DEFAULT_ALGORITHM = "recurrent_ppo"
 # Network layout used by default for algorithms that support both layouts.
 DEFAULT_NETWORK_TYPE = "spatial"
 # Whether training resumes from the checkpoint instead of starting fresh.
-DEFAULT_RESUME = True
+DEFAULT_RESUME = False
 # Whether recurrent PPO ignores episode and transition caps until it reaches its target.
-DEFAULT_TARGET_ONLY_STOP: bool | None = None
+DEFAULT_TARGET_ONLY_STOP: bool | None = False
 
 # Maximum number of transitions retained by the DQN replay buffer.
 BUFFER_SIZE = 200_000
@@ -90,7 +91,7 @@ EPSILON_FINAL_STEPS = 1_500_000
 # Fallback number of parallel environments used by vectorized collection.
 DEFAULT_NUM_ENVS = 256
 # Recurrent environments used by the RTX 3090 fast profile when auto-sized.
-RTX3090_RECURRENT_NUM_ENVS = 512
+RTX3090_RECURRENT_NUM_ENVS = 768
 # Desired learner updates per collected transition for DQN.
 DEFAULT_UPDATES_PER_TRANSITION = 0.125
 # Transitions collected before the learner begins updating.
@@ -105,18 +106,22 @@ DEFAULT_PRIORITY_ALPHA = 0.6
 DEFAULT_PRIORITY_BETA_START = 0.4
 # Number of transitions over which replay correction reaches full strength.
 DEFAULT_PRIORITY_BETA_STEPS = 1_500_000
-# Hard cap on steps in one maze episode.
-MAX_EPISODE_STEPS = 300
+# Optional hard cap on steps in one maze episode; None uses the resolved budget.
+MAX_EPISODE_STEPS: int | None = None
 # Multiplier used to provide a maze-size-aware recovery budget when enabled.
 DEFAULT_TIMEOUT_STEP_FACTOR = 4.0
 # Minimum episode length allowing local agents to recover from short wrong turns.
 DEFAULT_MIN_EPISODE_STEPS = 20
+# Complete depth-first traversal allowance for partially observed mazes.
+DEFAULT_EXPLORATION_STEP_FACTOR = 2.0
 # Number of episodes in each standard evaluation pass during training.
 NUM_EVAL_EPISODES = 500
 # Episode-based dashboard/evaluation cadence compatibility default.
 EVAL_PERIOD = 100
 # Transition interval between evaluation passes during training.
 EVAL_PERIOD_STEPS = 50_000
+# Less frequent final-distribution evaluation after curriculum completion.
+DEFAULT_POST_CURRICULUM_EVAL_STEPS = 500_000
 # Offset keeping evaluation maze seeds separate from training seeds.
 EVAL_SEED_OFFSET = 1_000_003
 # Whether the live training dashboard is enabled by default.
@@ -161,6 +166,12 @@ DEFAULT_DISTANCE_SHAPING_MODE = "potential"
 
 # Whether curriculum sampling changes maze difficulty during training.
 DEFAULT_CURRICULUM_ENABLED = True
+# Empirical size-and-complexity curriculum used by new runs.
+DEFAULT_CURRICULUM_MODE = "auto"
+# Candidate mazes used to resolve deterministic complexity quantiles per size.
+DEFAULT_CURRICULUM_PROBE_MAZES = 2_048
+# Odd-cell dimension increment used to construct the automatic size ladder.
+DEFAULT_CURRICULUM_SIZE_STEP = 4
 # Goal-distance range used for the easiest curriculum stage.
 DEFAULT_CURRICULUM_EASY_RANGE = (6, 10)
 # Goal-distance range used for the medium curriculum stage.
@@ -178,9 +189,9 @@ DEFAULT_CURRICULUM_PROMOTION_EVALS = 3
 DEFAULT_CURRICULUM_PREVIOUS_FRACTION = 0.20
 # Fraction of curriculum tasks sampled uniformly across available stages.
 DEFAULT_CURRICULUM_UNIFORM_FRACTION = 0.10
-# Fraction of training tasks drawn from transformed held-out failures.
-DEFAULT_HARD_MAZE_FRACTION = 0.0
-# Maximum number of transformed hard-maze variants retained in memory.
+# Fraction of training tasks drawn from timed-out training mazes.
+DEFAULT_HARD_MAZE_FRACTION = 0.05
+# Maximum number of transformed hard-maze variants retained per grid shape.
 DEFAULT_HARD_MAZE_POOL_SIZE = 256
 # Validation range over which hard replay ramps to its configured maximum.
 HARD_MAZE_RAMP_START = 0.90
@@ -200,7 +211,7 @@ DEFAULT_PERFORMANCE_PROFILE = "auto"
 # Default transition budget for full-map training.
 DEFAULT_FULL_MAX_ENV_STEPS = 3_000_000
 # Default transition budget for local-observation training.
-DEFAULT_LOCAL_MAX_ENV_STEPS = 5_000_000
+DEFAULT_LOCAL_MAX_ENV_STEPS = 100_000_000
 # Target validation solve rate for full-map training.
 DEFAULT_FULL_TARGET_SOLVE_RATE = 1.00
 # Target validation solve rate for local-observation training.
@@ -221,6 +232,10 @@ DEFAULT_LATEST_CHECKPOINT_EVERY_STEPS = 1_000_000
 DEFAULT_CURRICULUM_EVAL_EPISODES = 200
 # Worker processes used for deterministic background maze generation.
 DEFAULT_MAZE_WORKERS = 8
+# Maze grids returned by one process-pool future.
+DEFAULT_MAZE_GENERATION_BATCH_SIZE = 64
+# Submitted generation batches retained per worker.
+DEFAULT_MAZE_PREFETCH_BATCHES_PER_WORKER = 4
 
 # Number of transitions collected in one PPO rollout.
 PPO_ROLLOUT_STEPS = 128
@@ -250,6 +265,12 @@ RECURRENT_SEQUENCE_MINIBATCH_SIZE = 32
 RND_REWARD_COEF = 0.10
 # Maximum absolute intrinsic reward contribution from RND.
 RND_REWARD_CLIP = 5.0
+# Fraction of the finite budget reserved for precision annealing.
+DEFAULT_PRECISION_FRACTION = 0.20
+# Final learning-rate multiplier relative to the configured initial rate.
+DEFAULT_PRECISION_LEARNING_RATE_FRACTION = 0.01
+# Final entropy multiplier relative to the configured initial coefficient.
+DEFAULT_PRECISION_ENTROPY_FRACTION = 0.10
 
 # Module-level device hint retained for callers that import this module.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -270,9 +291,10 @@ class TrainConfig:
     target_only_stop: bool | None = DEFAULT_TARGET_ONLY_STOP
     observation_mode: str = DEFAULT_OBSERVATION_MODE
     view_size: int = VIEW_SIZE
-    max_episode_steps: int = MAX_EPISODE_STEPS
+    max_episode_steps: int | None = MAX_EPISODE_STEPS
     timeout_step_factor: float | None = DEFAULT_TIMEOUT_STEP_FACTOR
     min_episode_steps: int = DEFAULT_MIN_EPISODE_STEPS
+    exploration_step_factor: float = DEFAULT_EXPLORATION_STEP_FACTOR
     step_penalty: float = STEP_PENALTY
     invalid_move_penalty: float = INVALID_MOVE_PENALTY
     goal_reward: float = GOAL_REWARD
@@ -280,6 +302,9 @@ class TrainConfig:
     distance_shaping_scale: float = DISTANCE_SHAPING_SCALE
     distance_shaping_mode: str = DEFAULT_DISTANCE_SHAPING_MODE
     curriculum_enabled: bool = DEFAULT_CURRICULUM_ENABLED
+    curriculum_mode: str = DEFAULT_CURRICULUM_MODE
+    curriculum_probe_mazes: int = DEFAULT_CURRICULUM_PROBE_MAZES
+    curriculum_size_step: int = DEFAULT_CURRICULUM_SIZE_STEP
     curriculum_easy_range: tuple[int, int] = DEFAULT_CURRICULUM_EASY_RANGE
     curriculum_medium_range: tuple[int, int] = DEFAULT_CURRICULUM_MEDIUM_RANGE
     curriculum_max_retries: int = DEFAULT_CURRICULUM_MAX_RETRIES
@@ -318,6 +343,7 @@ class TrainConfig:
     rnd_reward_coef: float = RND_REWARD_COEF
     rnd_reward_clip: float = RND_REWARD_CLIP
     eval_every_steps: int = EVAL_PERIOD_STEPS
+    post_curriculum_eval_every_steps: int = DEFAULT_POST_CURRICULUM_EVAL_STEPS
     eval_episodes: int = NUM_EVAL_EPISODES
     curriculum_promotion_rate: float = DEFAULT_CURRICULUM_PROMOTION_RATE
     curriculum_promotion_evals: int = DEFAULT_CURRICULUM_PROMOTION_EVALS
@@ -337,9 +363,14 @@ class TrainConfig:
     precision_recovery_steps: int = DEFAULT_PRECISION_RECOVERY_STEPS
     precision_recovery_lr_fraction: float = DEFAULT_PRECISION_RECOVERY_LR_FRACTION
     precision_recovery_enabled: bool = DEFAULT_PRECISION_RECOVERY_ENABLED
+    precision_fraction: float = DEFAULT_PRECISION_FRACTION
+    precision_learning_rate_fraction: float = DEFAULT_PRECISION_LEARNING_RATE_FRACTION
+    precision_entropy_fraction: float = DEFAULT_PRECISION_ENTROPY_FRACTION
     latest_checkpoint_every_steps: int = DEFAULT_LATEST_CHECKPOINT_EVERY_STEPS
     performance_profile: str = DEFAULT_PERFORMANCE_PROFILE
     maze_workers: int = DEFAULT_MAZE_WORKERS
+    maze_generation_batch_size: int = DEFAULT_MAZE_GENERATION_BATCH_SIZE
+    maze_prefetch_batches_per_worker: int = DEFAULT_MAZE_PREFETCH_BATCHES_PER_WORKER
     dashboard_flag: bool = DEFAULT_DASHBOARD_FLAG
     dashboard_every: int = DEFAULT_DASHBOARD_EVERY
     save_path: str | None = DEFAULT_SAVE_PATH
@@ -355,7 +386,7 @@ class TrainConfig:
         if self.algorithm not in ALGORITHMS:
             raise ValueError(f"algorithm must be one of {ALGORITHMS}; got {self.algorithm!r}")
         if self.target_only_stop is None:
-            self.target_only_stop = self.algorithm == "recurrent_ppo"
+            self.target_only_stop = False
         elif self.target_only_stop and self.algorithm != "recurrent_ppo":
             raise ValueError("target_only_stop is supported only by recurrent_ppo")
         if self.network_type not in NETWORK_TYPES:
@@ -368,10 +399,21 @@ class TrainConfig:
                 f"got {self.observation_mode!r}"
             )
         if self.max_env_steps is None:
-            self.max_env_steps = (
-                DEFAULT_LOCAL_MAX_ENV_STEPS
-                if self.observation_mode == "local"
-                else DEFAULT_FULL_MAX_ENV_STEPS
+            if self.observation_mode == "local":
+                scaled_budget = (
+                    DEFAULT_LOCAL_MAX_ENV_STEPS
+                    * max(self.maze_size)
+                    / max(DEFAULT_MAZE_SIZE)
+                )
+                self.max_env_steps = int(round(scaled_budget / 1_000_000)) * 1_000_000
+            else:
+                self.max_env_steps = DEFAULT_FULL_MAX_ENV_STEPS
+        if self.algorithm == "recurrent_ppo" and self.episodes == DEFAULT_EPISODES:
+            # Keep the transition budget authoritative even if every episode
+            # happens to terminate after a single step.
+            self.episodes = max(
+                self.episodes,
+                self.max_env_steps,
             )
         if self.target_solve_rate is None:
             self.target_solve_rate = (
@@ -433,12 +475,20 @@ class TrainConfig:
             raise ValueError("priority_beta_start must be in [0, 1]")
         if self.priority_beta_steps < 1:
             raise ValueError("priority_beta_steps must be >= 1")
-        if self.max_episode_steps < 1:
+        if self.max_episode_steps is not None and self.max_episode_steps < 1:
             raise ValueError("max_episode_steps must be >= 1")
         if self.timeout_step_factor is not None and self.timeout_step_factor <= 0:
             raise ValueError("timeout_step_factor must be positive or None")
         if self.min_episode_steps < 1:
             raise ValueError("min_episode_steps must be >= 1")
+        if self.exploration_step_factor <= 0:
+            raise ValueError("exploration_step_factor must be positive")
+        if self.curriculum_mode not in CURRICULUM_MODES:
+            raise ValueError(f"curriculum_mode must be one of {CURRICULUM_MODES}")
+        if self.curriculum_probe_mazes < 1:
+            raise ValueError("curriculum_probe_mazes must be >= 1")
+        if self.curriculum_size_step < 2 or self.curriculum_size_step % 2:
+            raise ValueError("curriculum_size_step must be a positive even increment")
         if self.curriculum_max_retries < 1:
             raise ValueError("curriculum_max_retries must be >= 1")
         if not 0 < self.curriculum_promotion_rate <= 1:
@@ -485,6 +535,8 @@ class TrainConfig:
             raise ValueError("RND coefficient must be non-negative and clip must be positive")
         if self.eval_every_steps < 1:
             raise ValueError("eval_every_steps must be >= 1")
+        if self.post_curriculum_eval_every_steps < 1:
+            raise ValueError("post_curriculum_eval_every_steps must be >= 1")
         if self.eval_episodes < 1:
             raise ValueError("eval_episodes must be >= 1")
         if self.curriculum_eval_episodes < 1:
@@ -495,10 +547,20 @@ class TrainConfig:
             raise ValueError("precision recovery intervals must be >= 1")
         if not 0 < self.precision_recovery_lr_fraction <= 1:
             raise ValueError("precision_recovery_lr_fraction must be in (0, 1]")
+        if not 0 < self.precision_fraction < 1:
+            raise ValueError("precision_fraction must be in (0, 1)")
+        if not 0 < self.precision_learning_rate_fraction <= 0.1:
+            raise ValueError("precision_learning_rate_fraction must be in (0, 0.1]")
+        if not 0 < self.precision_entropy_fraction <= 1:
+            raise ValueError("precision_entropy_fraction must be in (0, 1]")
         if self.latest_checkpoint_every_steps < 1:
             raise ValueError("latest_checkpoint_every_steps must be >= 1")
         if self.maze_workers < 0:
             raise ValueError("maze_workers must be >= 0")
+        if self.maze_generation_batch_size < 1:
+            raise ValueError("maze_generation_batch_size must be >= 1")
+        if self.maze_prefetch_batches_per_worker < 1:
+            raise ValueError("maze_prefetch_batches_per_worker must be >= 1")
         if self.expert_pretrain_mazes < 0 or self.expert_pretrain_epochs < 0:
             raise ValueError("expert pretraining settings must be non-negative")
         if self.dashboard_every < 1:
@@ -760,7 +822,7 @@ def observation_shape(
     if observation_mode == "full":
         return (4, maze_size[0], maze_size[1])
     if observation_mode == "local":
-        return (4, view_size, view_size)
+        return (5, view_size, view_size)
     raise ValueError(f"unsupported observation_mode: {observation_mode!r}")
 
 
@@ -1005,7 +1067,8 @@ class Maze:
     """Grid maze environment with full-map and local observation modes.
 
     Grid values are 0 for open cells, 1 for walls, 2 for start, and 3 for goal.
-    Observations contain walls, agent, goal, and remaining-time channels.
+    Observations contain walls, agent, goal, and remaining-time channels. Local
+    observations also contain the persistent visited-cell channel.
     """
 
     ACTIONS = [(0, 1), (0, -1), (1, 0), (-1, 0)]  # R, L, D, U
@@ -1016,9 +1079,10 @@ class Maze:
         grid: np.ndarray,
         observation_mode: str = "full",
         view_size: int = VIEW_SIZE,
-        max_episode_steps: int = MAX_EPISODE_STEPS,
+        max_episode_steps: int | None = MAX_EPISODE_STEPS,
         timeout_step_factor: float | None = None,
         min_episode_steps: int = 1,
+        exploration_step_factor: float = DEFAULT_EXPLORATION_STEP_FACTOR,
         step_penalty: float = STEP_PENALTY,
         invalid_move_penalty: float = INVALID_MOVE_PENALTY,
         goal_reward: float = GOAL_REWARD,
@@ -1034,9 +1098,12 @@ class Maze:
         self.grid = grid
         self.observation_mode = observation_mode
         self.view_size = view_size
-        self.max_episode_steps = int(max_episode_steps)
+        self.episode_step_cap = (
+            None if max_episode_steps is None else int(max_episode_steps)
+        )
         self.timeout_step_factor = timeout_step_factor
         self.min_episode_steps = int(min_episode_steps)
+        self.exploration_step_factor = float(exploration_step_factor)
         self.step_penalty = float(step_penalty)
         self.invalid_move_penalty = float(invalid_move_penalty)
         self.goal_reward = float(goal_reward)
@@ -1047,6 +1114,8 @@ class Maze:
         self.start = tuple(np.argwhere(self.grid == 2)[0])
         self.goal = tuple(np.argwhere(self.grid == 3)[0])
         self.current_position = self.start
+        self.visited = np.zeros(self.grid.shape, dtype=np.bool_)
+        self.visited[self.start] = True
         self.steps = 0
         self.invalid_moves = 0
         self.total_reward = 0.0
@@ -1087,19 +1156,32 @@ class Maze:
         self.bfs_distances = dist
 
     def _resolve_max_episode_steps(self) -> int:
-        if self.timeout_step_factor is None:
-            return self.max_episode_steps
-        shaped_limit = max(
-            self.min_episode_steps,
-            int(math.ceil(self.optimal_start_steps * self.timeout_step_factor)),
-        )
-        return min(self.max_episode_steps, shaped_limit)
+        if self.observation_mode == "full" and self.timeout_step_factor is None:
+            if self.episode_step_cap is not None:
+                return self.episode_step_cap
+            return max(self.min_episode_steps, self.optimal_start_steps)
+        candidates = [self.min_episode_steps, self.optimal_start_steps]
+        if self.timeout_step_factor is not None:
+            candidates.append(
+                int(math.ceil(self.optimal_start_steps * self.timeout_step_factor))
+            )
+        if self.observation_mode == "local":
+            traversable_cells = int(np.count_nonzero(self.grid != 1))
+            candidates.append(
+                int(math.ceil(traversable_cells * self.exploration_step_factor))
+            )
+        resolved = max(candidates)
+        if self.episode_step_cap is not None:
+            resolved = min(resolved, self.episode_step_cap)
+        return resolved
 
     def reset(self) -> np.ndarray:
         self.steps = 0
         self.invalid_moves = 0
         self.total_reward = 0.0
         self.current_position = self.start
+        self.visited.fill(False)
+        self.visited[self.start] = True
         return self.observation()
 
     def observation(self) -> np.ndarray:
@@ -1117,7 +1199,7 @@ class Maze:
 
     def _local_observation(self, position: tuple[int, int]) -> np.ndarray:
         half = self.view_size // 2
-        obs = np.zeros((4, self.view_size, self.view_size), dtype=np.float32)
+        obs = np.zeros((5, self.view_size, self.view_size), dtype=np.float32)
         obs[1, half, half] = 1.0
         obs[3].fill(self.remaining_time_fraction)
         for di in range(-half, half + 1):
@@ -1130,6 +1212,7 @@ class Maze:
                 cell = self.grid[r, c]
                 obs[0, vi, vj] = float(cell == 1)
                 obs[2, vi, vj] = float((r, c) == self.goal)
+                obs[4, vi, vj] = float(self.visited[r, c])
         return obs
 
     @property
@@ -1152,6 +1235,7 @@ class Maze:
         else:
             invalid = True
             self.invalid_moves += 1
+        self.visited[self.current_position] = True
 
         new_distance = float(self.bfs_distances[self.current_position])
         solved = self.current_position == self.goal
@@ -1352,38 +1436,210 @@ def _scale_distance_range(
     return low, high
 
 
+@dataclass(frozen=True, slots=True)
+class CurriculumStage:
+    """One fixed-shape sampling stage in the resolved curriculum."""
+
+    maze_size: tuple[int, int]
+    name: str
+    distance_range: tuple[int, int] | None = None
+    complexity_high: float | None = None
+
+    def payload(self) -> dict[str, object]:
+        """Return a checkpoint- and log-safe stage description."""
+
+        return {
+            "maze_size": list(self.maze_size),
+            "name": self.name,
+            "distance_range": (
+                list(self.distance_range) if self.distance_range is not None else None
+            ),
+            "complexity_high": self.complexity_high,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> "CurriculumStage":
+        """Restore one validated stage from checkpoint metadata."""
+
+        maze_size = tuple(int(value) for value in payload["maze_size"])
+        distance_value = payload.get("distance_range")
+        distance_range = (
+            tuple(int(value) for value in distance_value)
+            if distance_value is not None
+            else None
+        )
+        return cls(
+            maze_size=maze_size,
+            name=str(payload["name"]),
+            distance_range=distance_range,
+            complexity_high=(
+                None
+                if payload.get("complexity_high") is None
+                else float(payload["complexity_high"])
+            ),
+        )
+
+
+def automatic_curriculum_sizes(
+    final_size: tuple[int, int],
+    step: int = DEFAULT_CURRICULUM_SIZE_STEP,
+) -> list[tuple[int, int]]:
+    """Build an odd, synchronized size ladder ending at ``final_size``."""
+
+    current = tuple(min(size, 11) for size in final_size)
+    sizes = [current]
+    while current != final_size:
+        current = tuple(min(target, value + step) for value, target in zip(current, final_size))
+        if current != sizes[-1]:
+            sizes.append(current)
+    return sizes
+
+
+def maze_exploration_complexity(environment: Maze) -> float:
+    """Estimate goal-discovery cost for a visited-map depth-first explorer."""
+
+    base = list(Maze.ACTIONS)
+    orders = []
+    for rotation in range(4):
+        rotated = base[rotation:] + base[:rotation]
+        orders.extend((rotated, list(reversed(rotated))))
+
+    costs: list[int] = []
+    for order in orders:
+        visited = {environment.start}
+        stack: list[tuple[tuple[int, int], int]] = [(environment.start, 0)]
+        transitions = 0
+        while stack and stack[-1][0] != environment.goal:
+            position, next_index = stack[-1]
+            if next_index >= len(order):
+                stack.pop()
+                if stack:
+                    transitions += 1
+                continue
+            stack[-1] = (position, next_index + 1)
+            dr, dc = order[next_index]
+            neighbor = (position[0] + dr, position[1] + dc)
+            if neighbor in visited or not environment._is_valid(neighbor):
+                continue
+            visited.add(neighbor)
+            stack.append((neighbor, 0))
+            transitions += 1
+        costs.append(transitions)
+    return float(sum(costs) / len(costs))
+
+
+_AUTO_CURRICULUM_CACHE: dict[tuple[object, ...], tuple[CurriculumStage, ...]] = {}
+
+
+def resolve_curriculum_stages(config: TrainConfig) -> list[CurriculumStage]:
+    """Resolve deterministic manual or empirical automatic curriculum stages."""
+
+    if not config.curriculum_enabled:
+        return [CurriculumStage(config.maze_size, "unrestricted")]
+    if config.curriculum_mode == "manual":
+        scale = max(config.maze_size) / max(DEFAULT_MAZE_SIZE)
+        return [
+            CurriculumStage(
+                config.maze_size,
+                "manual-easy",
+                distance_range=_scale_distance_range(config.curriculum_easy_range, scale),
+            ),
+            CurriculumStage(
+                config.maze_size,
+                "manual-medium",
+                distance_range=_scale_distance_range(config.curriculum_medium_range, scale),
+            ),
+            CurriculumStage(config.maze_size, "unrestricted"),
+        ]
+
+    key = (
+        config.maze_size,
+        config.seed,
+        config.curriculum_probe_mazes,
+        config.curriculum_size_step,
+        config.observation_mode,
+        config.view_size,
+    )
+    cached = _AUTO_CURRICULUM_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
+
+    stages: list[CurriculumStage] = []
+    root_rng = random.Random(config.seed + 17 * EVAL_SEED_OFFSET)
+    maze_sizes = (
+        automatic_curriculum_sizes(config.maze_size, config.curriculum_size_step)
+        if config.algorithm == "recurrent_ppo" and config.observation_mode == "local"
+        else [config.maze_size]
+    )
+    for maze_size in maze_sizes:
+        stage_config = replace(config, maze_size=maze_size)
+        complexities: list[float] = []
+        for _ in range(config.curriculum_probe_mazes):
+            grid = generate_random_maze(*maze_size, rng=root_rng)
+            complexities.append(
+                maze_exploration_complexity(_maze_from_grid(stage_config, grid))
+            )
+        lower, upper = np.quantile(complexities, (1.0 / 3.0, 2.0 / 3.0))
+        label = f"{maze_size[0]}x{maze_size[1]}"
+        stages.extend(
+            (
+                CurriculumStage(maze_size, f"{label}-easy", complexity_high=float(lower)),
+                CurriculumStage(maze_size, f"{label}-medium", complexity_high=float(upper)),
+                CurriculumStage(maze_size, f"{label}-unrestricted"),
+            )
+        )
+    _AUTO_CURRICULUM_CACHE[key] = tuple(stages)
+    return stages
+
+
 class CurriculumController:
     """Promote task difficulty only after repeated validation success."""
 
-    def __init__(self, config: TrainConfig):
+    def __init__(
+        self,
+        config: TrainConfig,
+        stages: list[CurriculumStage] | None = None,
+    ):
         self.config = config
+        self.stages = stages or resolve_curriculum_stages(config)
         self.level = 0
         self.success_streak = 0
 
     @property
     def complete(self) -> bool:
-        return self.level >= 2
+        return self.level >= len(self.stages) - 1
+
+    @property
+    def current_stage(self) -> CurriculumStage:
+        return self.stages[min(self.level, len(self.stages) - 1)]
 
     def target_range(self) -> tuple[int, int] | None:
         """Return the current maze path-length range, or uniform sampling."""
 
-        if not self.config.curriculum_enabled or self.complete:
-            return None
-        scale = max(self.config.maze_size) / max(DEFAULT_MAZE_SIZE)
-        source = (
-            self.config.curriculum_easy_range
-            if self.level == 0
-            else self.config.curriculum_medium_range
-        )
-        return _scale_distance_range(source, scale)
+        return self.current_stage.distance_range
+
+    def target_complexity(self) -> float | None:
+        """Return the active automatic complexity ceiling."""
+
+        return self.current_stage.complexity_high
 
     def previous_range(self) -> tuple[int, int] | None:
         """Return the immediately previous curriculum range when available."""
 
         if self.level < 1:
             return None
-        scale = max(self.config.maze_size) / max(DEFAULT_MAZE_SIZE)
-        return _scale_distance_range(self.config.curriculum_easy_range, scale)
+        previous = self.stages[self.level - 1]
+        if previous.maze_size != self.current_stage.maze_size:
+            return None
+        return previous.distance_range
+
+    def previous_stage(self) -> CurriculumStage | None:
+        """Return the prior stage only when its grid shape is compatible."""
+
+        if self.level < 1:
+            return None
+        previous = self.stages[self.level - 1]
+        return previous if previous.maze_size == self.current_stage.maze_size else None
 
     def record_validation(self, metrics: EvalMetrics) -> bool:
         """Record validation quality and return whether a promotion occurred."""
@@ -1404,53 +1660,80 @@ class CurriculumController:
 class MazeTaskSampler:
     """Difficulty-aware MouseMaze sampler conforming to ``TaskSampler``."""
 
-    def __init__(self, config: TrainConfig, rng: random.Random):
+    def __init__(
+        self,
+        config: TrainConfig,
+        rng: random.Random,
+        stages: list[CurriculumStage] | None = None,
+    ):
         self.config = config
         self.rng = rng
-        self.curriculum = CurriculumController(config)
-        self.hard_grids: list[np.ndarray] = []
-        self._hard_grid_keys: set[bytes] = set()
-        self._seen_hard_grid_keys: set[bytes] = set()
-        self.hard_candidates_seen = 0
+        self.curriculum = CurriculumController(config, stages=stages)
+        self.hard_grids_by_shape: dict[tuple[int, int], list[np.ndarray]] = {}
+        self._seen_hard_grid_keys: dict[tuple[int, int], set[bytes]] = {}
+        self.hard_candidates_seen_by_shape: dict[tuple[int, int], int] = {}
         self.validation_solve_rate: float | None = None
+
+    @property
+    def current_size(self) -> tuple[int, int]:
+        return self.curriculum.current_stage.maze_size
+
+    @property
+    def hard_grids(self) -> list[np.ndarray]:
+        """Return the active shape's hard-maze reservoir."""
+
+        return self.hard_grids_by_shape.setdefault(self.current_size, [])
+
+    @property
+    def hard_candidates_seen(self) -> int:
+        return self.hard_candidates_seen_by_shape.get(self.current_size, 0)
 
     def sample(self) -> Maze:
         """Sample from current, previous, and uniform task distributions."""
 
         hard_grid = self.sample_hard_grid()
         if hard_grid is not None:
-            return _maze_from_grid(self.config, hard_grid)
-        target_range = self.sample_target_range()
+            return _maze_from_grid(
+                replace(self.config, maze_size=tuple(hard_grid.shape)),
+                hard_grid,
+            )
+        stage = self.sample_stage()
+        stage_config = replace(self.config, maze_size=stage.maze_size)
         try:
-            return make_maze(self.config, rng=self.rng, target_range=target_range)
+            return make_maze(
+                stage_config,
+                rng=self.rng,
+                target_range=stage.distance_range,
+                target_complexity=stage.complexity_high,
+            )
         except TypeError as exc:
-            if "target_range" not in str(exc):
+            if "unexpected keyword argument" not in str(exc):
                 raise
-            return make_maze(self.config, rng=self.rng)
+            return make_maze(stage_config, rng=self.rng)
 
     def add_failed_grids(self, failed_grids: list[np.ndarray]) -> int:
-        """Reservoir-sample unique transformed failures without held-out grids."""
+        """Reservoir-sample training failures and their unique symmetries."""
 
         added = 0
         for failed_grid in failed_grids:
-            for variant in _hard_maze_variants(failed_grid):
+            shape = tuple(int(value) for value in failed_grid.shape)
+            reservoir = self.hard_grids_by_shape.setdefault(shape, [])
+            seen = self._seen_hard_grid_keys.setdefault(shape, set())
+            for variant in _hard_maze_variants(failed_grid, include_original=True):
                 key = variant.tobytes()
-                if key in self._seen_hard_grid_keys:
+                if key in seen:
                     continue
-                self._seen_hard_grid_keys.add(key)
-                self.hard_candidates_seen += 1
-                if len(self.hard_grids) < self.config.hard_maze_pool_size:
-                    self.hard_grids.append(variant)
-                    self._hard_grid_keys.add(key)
+                seen.add(key)
+                candidates_seen = self.hard_candidates_seen_by_shape.get(shape, 0) + 1
+                self.hard_candidates_seen_by_shape[shape] = candidates_seen
+                if len(reservoir) < self.config.hard_maze_pool_size:
+                    reservoir.append(variant)
                     added += 1
                     continue
-                replacement = self.rng.randrange(self.hard_candidates_seen)
+                replacement = self.rng.randrange(candidates_seen)
                 if replacement >= self.config.hard_maze_pool_size:
                     continue
-                removed = self.hard_grids[replacement]
-                self._hard_grid_keys.discard(removed.tobytes())
-                self.hard_grids[replacement] = variant
-                self._hard_grid_keys.add(key)
+                reservoir[replacement] = variant
                 added += 1
         return added
 
@@ -1461,32 +1744,53 @@ class MazeTaskSampler:
         candidates_seen: object = None,
         validation_solve_rate: object = None,
     ) -> None:
-        """Restore replay reservoir state from current or legacy checkpoints."""
+        """Restore shape-separated schema-v3 replay reservoir state."""
 
-        grid_values = grids if isinstance(grids, (list, tuple)) else ()
-        for value in grid_values[-self.config.hard_maze_pool_size :]:
-            grid = np.ascontiguousarray(value, dtype=np.uint8)
-            if grid.shape != self.config.maze_size:
-                continue
-            key = grid.tobytes()
-            if key in self._hard_grid_keys:
-                continue
-            self.hard_grids.append(grid)
-            self._hard_grid_keys.add(key)
+        if isinstance(grids, (list, tuple)):
+            shape = self.current_size
+            self.hard_grids_by_shape[shape] = [
+                np.ascontiguousarray(value, dtype=np.uint8)
+                for value in grids[-self.config.hard_maze_pool_size :]
+                if np.asarray(value).shape == shape
+            ]
+        elif isinstance(grids, dict):
+            for shape_key, values in grids.items():
+                shape = tuple(int(value) for value in shape_key)
+                reservoir = self.hard_grids_by_shape.setdefault(shape, [])
+                for value in list(values)[-self.config.hard_maze_pool_size :]:
+                    grid = np.ascontiguousarray(value, dtype=np.uint8)
+                    if grid.shape == shape:
+                        reservoir.append(grid)
         if isinstance(seen_keys, (list, tuple, set)):
-            self._seen_hard_grid_keys.update(
-                bytes(key) for key in seen_keys if isinstance(key, (bytes, bytearray))
+            self._seen_hard_grid_keys[self.current_size] = {
+                bytes(value)
+                for value in seen_keys
+                if isinstance(value, (bytes, bytearray))
+            }
+        elif isinstance(seen_keys, dict):
+            for shape_key, values in seen_keys.items():
+                shape = tuple(int(value) for value in shape_key)
+                self._seen_hard_grid_keys[shape] = {
+                    bytes(value)
+                    for value in values
+                    if isinstance(value, (bytes, bytearray))
+                }
+        for shape, reservoir in self.hard_grids_by_shape.items():
+            self._seen_hard_grid_keys.setdefault(shape, set()).update(
+                grid.tobytes() for grid in reservoir
             )
-        self._seen_hard_grid_keys.update(self._hard_grid_keys)
-        try:
-            restored_seen = int(candidates_seen)
-        except (TypeError, ValueError):
-            restored_seen = len(self._seen_hard_grid_keys)
-        self.hard_candidates_seen = max(
-            restored_seen,
-            len(self._seen_hard_grid_keys),
-            len(self.hard_grids),
-        )
+        if isinstance(candidates_seen, (int, float)):
+            self.hard_candidates_seen_by_shape[self.current_size] = int(candidates_seen)
+        elif isinstance(candidates_seen, dict):
+            self.hard_candidates_seen_by_shape = {
+                tuple(int(value) for value in shape): int(count)
+                for shape, count in candidates_seen.items()
+            }
+        for shape, seen in self._seen_hard_grid_keys.items():
+            self.hard_candidates_seen_by_shape[shape] = max(
+                self.hard_candidates_seen_by_shape.get(shape, 0),
+                len(seen),
+            )
         if isinstance(validation_solve_rate, (int, float)):
             self.validation_solve_rate = min(
                 max(float(validation_solve_rate), 0.0),
@@ -1516,22 +1820,27 @@ class MazeTaskSampler:
             return None
         return self.rng.choice(self.hard_grids).copy()
 
-    def sample_target_range(self) -> tuple[int, int] | None:
-        """Choose a curriculum range without turning a missing previous stage into uniform."""
+    def sample_stage(self) -> CurriculumStage:
+        """Choose current, compatible previous, or unrestricted task sampling."""
 
-        target_range = self.curriculum.target_range()
-        if target_range is None:
-            return None
+        current = self.curriculum.current_stage
+        if self.curriculum.complete or not self.config.curriculum_enabled:
+            return current
         draw = self.rng.random()
         if draw < self.config.curriculum_uniform_fraction:
-            return None
-        previous = self.curriculum.previous_range()
+            return CurriculumStage(current.maze_size, f"{current.name}-uniform")
+        previous = self.curriculum.previous_stage()
         if previous is not None and draw < (
             self.config.curriculum_uniform_fraction
             + self.config.curriculum_previous_fraction
         ):
             return previous
-        return target_range
+        return current
+
+    def sample_target_range(self) -> tuple[int, int] | None:
+        """Choose a curriculum range without turning a missing previous stage into uniform."""
+
+        return self.sample_stage().distance_range
 
     def sampling_mix(self) -> dict[str, float]:
         """Return the effective current/previous/unrestricted sampling proportions."""
@@ -1547,7 +1856,7 @@ class MazeTaskSampler:
             }
         previous = (
             self.config.curriculum_previous_fraction
-            if self.curriculum.previous_range() is not None
+            if self.curriculum.previous_stage() is not None
             else 0.0
         )
         unrestricted = self.config.curriculum_uniform_fraction
@@ -1564,15 +1873,19 @@ class MazeTaskSampler:
         distance = environment.optimal_start_steps
         return {
             "difficulty": float(distance),
+            "exploration_complexity": maze_exploration_complexity(environment),
             "bucket": difficulty_bucket(distance),
         }
 
 
-def _hard_maze_variants(grid: np.ndarray) -> list[np.ndarray]:
-    """Return shape-preserving symmetries, excluding the held-out original."""
+def _hard_maze_variants(
+    grid: np.ndarray,
+    include_original: bool = False,
+) -> list[np.ndarray]:
+    """Return unique shape-preserving task symmetries."""
 
     original = np.asarray(grid, dtype=np.uint8)
-    candidates = [
+    candidates = ([original] if include_original else []) + [
         np.flip(original, axis=0),
         np.flip(original, axis=1),
         np.rot90(original, 2),
@@ -1585,7 +1898,7 @@ def _hard_maze_variants(grid: np.ndarray) -> list[np.ndarray]:
     for candidate in candidates:
         variant = np.ascontiguousarray(candidate, dtype=np.uint8)
         key = variant.tobytes()
-        if key == original_key or key in keys:
+        if (not include_original and key == original_key) or key in keys:
             continue
         variants.append(variant)
         keys.add(key)
@@ -1596,6 +1909,7 @@ def _generate_prefetched_grid(
     config: TrainConfig,
     seed: int,
     target_range: tuple[int, int] | None,
+    target_complexity: float | None = None,
 ) -> np.ndarray:
     """Generate one deterministically seeded task in a worker process."""
 
@@ -1603,7 +1917,25 @@ def _generate_prefetched_grid(
         config,
         rng=random.Random(seed),
         target_range=target_range,
+        target_complexity=target_complexity,
     ).grid
+
+
+def _generate_prefetched_grid_batch(
+    config: TrainConfig,
+    requests: list[tuple[int, CurriculumStage]],
+) -> list[np.ndarray]:
+    """Generate one ordered batch of independently seeded maze grids."""
+
+    return [
+        _generate_prefetched_grid(
+            replace(config, maze_size=stage.maze_size),
+            seed,
+            stage.distance_range,
+            stage.complexity_high,
+        )
+        for seed, stage in requests
+    ]
 
 
 class DeterministicMazePrefetcher:
@@ -1613,7 +1945,10 @@ class DeterministicMazePrefetcher:
         self.sampler = sampler
         self.workers = workers
         self.executor: ProcessPoolExecutor | None = None
-        self.futures: deque[Future[np.ndarray]] = deque()
+        self.futures: deque[Future[list[np.ndarray]]] = deque()
+        self.ready_grids: deque[np.ndarray] = deque()
+        self.generated_grids = 0
+        self.started_at = time.perf_counter()
         if workers > 0:
             self.executor = ProcessPoolExecutor(
                 max_workers=workers,
@@ -1624,15 +1959,20 @@ class DeterministicMazePrefetcher:
     def _fill(self) -> None:
         if self.executor is None:
             return
-        while len(self.futures) < self.workers * 2:
-            target_range = self.sampler.sample_target_range()
-            seed = self.sampler.rng.randrange(0, 2**63)
+        target_batches = (
+            self.workers * self.sampler.config.maze_prefetch_batches_per_worker
+        )
+        while len(self.futures) < target_batches:
+            requests: list[tuple[int, CurriculumStage]] = []
+            for _ in range(self.sampler.config.maze_generation_batch_size):
+                stage = self.sampler.sample_stage()
+                seed = self.sampler.rng.randrange(0, 2**63)
+                requests.append((seed, stage))
             self.futures.append(
                 self.executor.submit(
-                    _generate_prefetched_grid,
+                    _generate_prefetched_grid_batch,
                     self.sampler.config,
-                    seed,
-                    target_range,
+                    requests,
                 )
             )
 
@@ -1641,10 +1981,30 @@ class DeterministicMazePrefetcher:
             return self.sampler.sample()
         hard_grid = self.sampler.sample_hard_grid()
         if hard_grid is not None:
-            return _maze_from_grid(self.sampler.config, hard_grid)
-        grid = self.futures.popleft().result()
+            return _maze_from_grid(
+                replace(self.sampler.config, maze_size=tuple(hard_grid.shape)),
+                hard_grid,
+            )
+        if not self.ready_grids:
+            self.ready_grids.extend(self.futures.popleft().result())
+            self.generated_grids += len(self.ready_grids)
+        grid = self.ready_grids.popleft()
         self._fill()
-        return _maze_from_grid(self.sampler.config, grid)
+        return _maze_from_grid(
+            replace(self.sampler.config, maze_size=tuple(grid.shape)),
+            grid,
+        )
+
+    def telemetry(self) -> dict[str, float | int]:
+        """Return prepared queue depth and process generation throughput."""
+
+        elapsed = max(time.perf_counter() - self.started_at, 1e-9)
+        return {
+            "ready_grids": len(self.ready_grids),
+            "queued_batches": len(self.futures),
+            "generated_grids": self.generated_grids,
+            "generated_grids_per_second": self.generated_grids / elapsed,
+        }
 
     def reset(self) -> None:
         """Discard queued tasks after curriculum promotion."""
@@ -1654,6 +2014,7 @@ class DeterministicMazePrefetcher:
         for future in self.futures:
             future.cancel()
         self.futures.clear()
+        self.ready_grids.clear()
         self._fill()
 
     def close(self) -> None:
@@ -1661,6 +2022,7 @@ class DeterministicMazePrefetcher:
             self.executor.shutdown(wait=True, cancel_futures=True)
             self.executor = None
             self.futures.clear()
+            self.ready_grids.clear()
 
 
 def _maze_from_grid(config: TrainConfig, grid: np.ndarray) -> Maze:
@@ -1671,6 +2033,7 @@ def _maze_from_grid(config: TrainConfig, grid: np.ndarray) -> Maze:
         max_episode_steps=config.max_episode_steps,
         timeout_step_factor=config.timeout_step_factor,
         min_episode_steps=config.min_episode_steps,
+        exploration_step_factor=config.exploration_step_factor,
         step_penalty=config.step_penalty,
         invalid_move_penalty=config.invalid_move_penalty,
         goal_reward=config.goal_reward,
@@ -1686,6 +2049,7 @@ def make_maze(
     rng: random.Random | None = None,
     episode: int | None = None,
     target_range: tuple[int, int] | None = None,
+    target_complexity: float | None = None,
 ) -> Maze:
     """Generate a maze that can be completed within its episode budget.
 
@@ -1703,12 +2067,18 @@ def make_maze(
         if env.optimal_start_steps > env.max_episode_steps:
             continue
         if target_range is None:
-            return env
-        low, high = target_range
-        if low <= env.optimal_start_steps <= high:
+            distance_matches = True
+        else:
+            low, high = target_range
+            distance_matches = low <= env.optimal_start_steps <= high
+        complexity_matches = (
+            target_complexity is None
+            or maze_exploration_complexity(env) <= target_complexity
+        )
+        if distance_matches and complexity_matches:
             return env
 
-    if target_range is not None:
+    if target_range is not None or target_complexity is not None:
         # Preserve the previous behavior of relaxing an unavailable
         # curriculum distance range, while retaining the episode-budget
         # guarantee for the fallback maze.
@@ -1744,7 +2114,7 @@ def make_training_maze(
 
 @dataclass(slots=True)
 class BatchStep:
-    """Results of stepping a same-shaped batch of full-map maze tasks."""
+    """Results of stepping a same-shaped batch of maze tasks."""
 
     states: np.ndarray
     rewards: np.ndarray
@@ -1783,6 +2153,7 @@ class MazeBatch:
         self.starts = np.empty((self.size, 2), dtype=np.int64)
         self.goals = np.empty((self.size, 2), dtype=np.int64)
         self.positions = np.empty((self.size, 2), dtype=np.int64)
+        self.visited = np.empty((self.size, *grid_shape), dtype=np.bool_)
         self.steps = np.empty(self.size, dtype=np.int64)
         self.invalid_moves = np.empty(self.size, dtype=np.int64)
         self.total_rewards = np.empty(self.size, dtype=np.float32)
@@ -1812,6 +2183,7 @@ class MazeBatch:
         self.starts[index] = environment.start
         self.goals[index] = environment.goal
         self.positions[index] = environment.current_position
+        self.visited[index] = environment.visited
         self.steps[index] = environment.steps
         self.invalid_moves[index] = environment.invalid_moves
         self.total_rewards[index] = environment.total_reward
@@ -1853,7 +2225,7 @@ class MazeBatch:
         batch_indices = np.arange(self.size)[:, np.newaxis, np.newaxis]
         cells = self.grids[batch_indices, clipped_rows, clipped_cols]
         observations = np.zeros(
-            (self.size, 4, self.view_size, self.view_size),
+            (self.size, 5, self.view_size, self.view_size),
             dtype=np.float32,
         )
         observations[:, 0] = (~in_bounds) | (cells == 1)
@@ -1867,6 +2239,11 @@ class MazeBatch:
             1,
         )
         observations[:, 3] = remaining[:, np.newaxis, np.newaxis]
+        observations[:, 4] = in_bounds & self.visited[
+            batch_indices,
+            clipped_rows,
+            clipped_cols,
+        ]
         return observations
 
     def valid_action_masks(self) -> np.ndarray:
@@ -1922,6 +2299,11 @@ class MazeBatch:
         valid = action_masks[local_indices, action_array]
         candidates = old_positions + deltas[action_array]
         self.positions[selected[valid]] = candidates[valid]
+        self.visited[
+            selected,
+            self.positions[selected, 0],
+            self.positions[selected, 1],
+        ] = True
         invalid = ~valid
         self.invalid_moves[selected] += invalid.astype(np.int64)
 
@@ -2012,7 +2394,7 @@ class SpatialTrunk(nn.Module):
         residual_blocks: int = 6,
     ):
         super().__init__()
-        _input_channels, rows, cols = input_shape
+        input_channels, rows, cols = input_shape
         row_coords = torch.linspace(-1.0, 1.0, rows)
         col_coords = torch.linspace(-1.0, 1.0, cols)
         row_plane = row_coords.view(1, rows, 1).expand(1, rows, cols)
@@ -2023,16 +2405,16 @@ class SpatialTrunk(nn.Module):
             persistent=False,
         )
         layers: list[nn.Module] = [
-            nn.Conv2d(5, channels, kernel_size=3, padding=1),
+            nn.Conv2d(input_channels - 1 + 2, channels, kernel_size=3, padding=1),
             nn.ReLU(),
         ]
         layers.extend(ResidualBlock(channels) for _ in range(residual_blocks))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        walls_goal_time = torch.cat((x[:, 0:1], x[:, 2:4]), dim=1)
+        observable_features = torch.cat((x[:, 0:1], x[:, 2:]), dim=1)
         coordinates = self.coordinate_planes.to(dtype=x.dtype).expand(x.shape[0], -1, -1, -1)
-        return self.net(torch.cat((walls_goal_time, coordinates), dim=1))
+        return self.net(torch.cat((observable_features, coordinates), dim=1))
 
 
 def _gather_agent_cell(cell_values: torch.Tensor, observations: torch.Tensor) -> torch.Tensor:
@@ -2320,7 +2702,8 @@ class MouseAgent:
         payload = torch.load(path, map_location=self.device, weights_only=False)
         if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             raise ValueError(
-                f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} checkpoint"
+                f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} "
+                "checkpoint; schema-v2 policies must be retrained"
             )
         state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
         if isinstance(payload, dict):
@@ -2495,7 +2878,8 @@ class MaskedPPOAgent:
         payload = torch.load(path, map_location=self.device, weights_only=False)
         if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             raise ValueError(
-                f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} checkpoint"
+                f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} "
+                "checkpoint; schema-v2 policies must be retrained"
             )
         state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
         self.policy_net.load_state_dict(state_dict)
@@ -2822,7 +3206,8 @@ class RecurrentPPOAgent:
         payload = torch.load(path, map_location=self.device, weights_only=False)
         if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             raise ValueError(
-                f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} checkpoint"
+                f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} "
+                "checkpoint; schema-v2 policies must be retrained"
             )
         if payload.get("algorithm") != self.algorithm:
             raise ValueError(f"checkpoint algorithm is {payload.get('algorithm')!r}, expected {self.algorithm!r}")
@@ -3144,12 +3529,36 @@ def _recurrent_ppo_precision_schedule(
     total_steps: int,
     config: TrainConfig,
 ) -> tuple[float, float]:
-    """Return the proven finite-budget schedule and its stable precision floor."""
+    """Return exploration and final cosine-precision PPO schedules."""
 
     budget = max(config.max_env_steps, 1)
     progress = min(max(total_steps, 0) / budget, 1.0)
-    learning_rate = config.learning_rate * (1.0 - 0.9 * progress)
-    return learning_rate, config.ppo_entropy_coef
+    precision_start = 1.0 - config.precision_fraction
+    if progress <= precision_start:
+        phase_progress = progress / precision_start
+        learning_rate = config.learning_rate * (1.0 - 0.9 * phase_progress)
+        entropy = config.ppo_entropy_coef
+    else:
+        phase_progress = (progress - precision_start) / config.precision_fraction
+        cosine_weight = 0.5 * (1.0 + math.cos(math.pi * phase_progress))
+        final_learning_rate = (
+            config.learning_rate * config.precision_learning_rate_fraction
+        )
+        learning_rate = final_learning_rate + (
+            config.learning_rate * 0.1 - final_learning_rate
+        ) * cosine_weight
+        final_entropy = config.ppo_entropy_coef * config.precision_entropy_fraction
+        entropy = final_entropy + (
+            config.ppo_entropy_coef - final_entropy
+        ) * cosine_weight
+    return learning_rate, entropy
+
+
+def _rnd_coefficient(total_steps: int, config: TrainConfig) -> float:
+    """Cosine-decay RND across the complete resolved finite budget."""
+
+    progress = min(max(total_steps, 0) / max(config.max_env_steps, 1), 1.0)
+    return config.rnd_reward_coef * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def _eval_greedy(
@@ -4285,7 +4694,8 @@ def checkpoint_training_states(
     ):
         raise ValueError(
             f"checkpoint {path!r} is not a MouseMaze "
-            f"schema-v{CHECKPOINT_SCHEMA_VERSION} checkpoint"
+            f"schema-v{CHECKPOINT_SCHEMA_VERSION} checkpoint; schema-v2 policies "
+            "must be retrained"
         )
     weights = {
         key: value.detach().cpu().clone()
@@ -4311,7 +4721,8 @@ def checkpoint_algorithm(path: str) -> str:
     payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
     if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError(
-            f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} checkpoint"
+            f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} "
+            "checkpoint; schema-v2 policies must be retrained"
         )
     return str(payload.get("algorithm", "dqn"))
 
@@ -4409,13 +4820,20 @@ def _update_training_state(
         state["curriculum"] = {
             "level": curriculum.level,
             "success_streak": curriculum.success_streak,
+            "stages": [stage.payload() for stage in curriculum.stages],
         }
     if hard_sampler is not None and hard_sampler.config.hard_maze_fraction > 0.0:
-        state["hard_maze_grids"] = [
-            grid.copy() for grid in hard_sampler.hard_grids
-        ]
-        state["hard_maze_seen_keys"] = sorted(hard_sampler._seen_hard_grid_keys)
-        state["hard_maze_candidates_seen"] = hard_sampler.hard_candidates_seen
+        state["hard_maze_grids"] = {
+            shape: [grid.copy() for grid in grids]
+            for shape, grids in hard_sampler.hard_grids_by_shape.items()
+        }
+        state["hard_maze_seen_keys"] = {
+            shape: sorted(keys)
+            for shape, keys in hard_sampler._seen_hard_grid_keys.items()
+        }
+        state["hard_maze_candidates_seen"] = dict(
+            hard_sampler.hard_candidates_seen_by_shape
+        )
         state["hard_maze_validation_solve_rate"] = (
             hard_sampler.validation_solve_rate
         )
@@ -4481,18 +4899,27 @@ def _maybe_run_eval(
     process_start_cpu: float,
     on_evaluation: Callable[[EvalMetrics], None] | None = None,
     on_new_best: Callable[[EvalMetrics], None] | None = None,
+    eval_every_steps: int | None = None,
+    evaluation_fn: Callable[[], EvalMetrics] | None = None,
+    allow_new_best: bool = True,
 ) -> tuple[EvalMetrics | None, int, float, dict[str, torch.Tensor] | None]:
-    should_eval = _should_run_eval(config, completed, total_steps, last_eval_step)
+    should_eval = _should_run_eval(
+        config,
+        completed,
+        total_steps,
+        last_eval_step,
+        eval_every_steps=eval_every_steps,
+    )
     if not should_eval:
         return None, last_eval_step, best_eval_rate, best_weights
 
-    greedy = _eval_greedy(agent, config)
+    greedy = evaluation_fn() if evaluation_fn is not None else _eval_greedy(agent, config)
     tracker.record_eval(greedy, completed)
     last_eval_step = total_steps
     if on_evaluation is not None:
         on_evaluation(greedy)
     is_new_best = False
-    if greedy.solve_rate > best_eval_rate:
+    if allow_new_best and greedy.solve_rate > best_eval_rate:
         is_new_best = True
         best_eval_rate = greedy.solve_rate
         agent.best_greedy_solve_rate = best_eval_rate
@@ -4565,13 +4992,15 @@ def _should_run_eval(
     completed: int,
     total_steps: int,
     last_eval_step: int,
+    eval_every_steps: int | None = None,
 ) -> bool:
     """Return whether evaluation is due under bounded or target-only training."""
 
+    cadence = config.eval_every_steps if eval_every_steps is None else eval_every_steps
     return completed > 0 and (
         last_eval_step == 0
         or (not config.target_only_stop and completed >= config.episodes)
-        or total_steps - last_eval_step >= config.eval_every_steps
+        or total_steps - last_eval_step >= cadence
     )
 
 
@@ -4721,10 +5150,7 @@ def train(
     process_start_cpu = time.process_time()
     print(f"[train] {device_diagnostics(device)}")
     if config.observation_mode == "local":
-        print(
-            "[train] observation_mode=local is experimental for this pass; "
-            "full-map observations are the reliable baseline."
-        )
+        print("[train] local observation includes explicit visited-cell memory.")
 
     expected_shape = observation_shape(config.maze_size, config.observation_mode, config.view_size)
     if agent is None:
@@ -4916,10 +5342,21 @@ def _train_dqn_sequential(
     train_rng = random.Random(config.seed)
     if "train_rng_state" in saved_state:
         train_rng.setstate(saved_state["train_rng_state"])
-    sampler = MazeTaskSampler(config, train_rng)
     curriculum_state = saved_state.get("curriculum")
+    restored_stages: list[CurriculumStage] | None = None
+    if isinstance(curriculum_state, dict) and isinstance(
+        curriculum_state.get("stages"), list
+    ):
+        restored_stages = [
+            CurriculumStage.from_payload(payload)
+            for payload in curriculum_state["stages"]
+        ]
+    sampler = MazeTaskSampler(config, train_rng, stages=restored_stages)
     if isinstance(curriculum_state, dict):
-        sampler.curriculum.level = int(curriculum_state.get("level", 0))
+        sampler.curriculum.level = min(
+            int(curriculum_state.get("level", 0)),
+            len(sampler.curriculum.stages) - 1,
+        )
         sampler.curriculum.success_streak = int(curriculum_state.get("success_streak", 0))
     envs = initial_envs or [
         make_training_maze(config, train_rng, completed + 1, sampler=sampler)
@@ -5470,18 +5907,27 @@ def _curriculum_stage_eval(
     config: TrainConfig,
     curriculum: CurriculumController,
 ) -> EvalMetrics:
-    target_range = curriculum.target_range()
-    if target_range is None:
+    stage = curriculum.current_stage
+    stage_config = replace(
+        config,
+        maze_size=stage.maze_size,
+        eval_episodes=config.curriculum_eval_episodes,
+    )
+    if stage.distance_range is None and stage.complexity_high is None:
         return _eval_greedy(
             agent,
-            replace(config, eval_episodes=config.curriculum_eval_episodes),
+            stage_config,
         )
     stage_rng = random.Random(resolved_eval_seed(config) + 100_000 * (curriculum.level + 1))
-    stage_config = replace(config, eval_episodes=config.curriculum_eval_episodes)
     return _eval_greedy(
         agent,
         stage_config,
-        maze_factory=lambda: make_maze(stage_config, rng=stage_rng, target_range=target_range),
+        maze_factory=lambda: make_maze(
+            stage_config,
+            rng=stage_rng,
+            target_range=stage.distance_range,
+            target_complexity=stage.complexity_high,
+        ),
     )
 
 
@@ -5552,7 +5998,16 @@ def _train_recurrent_ppo(
     train_rng = random.Random(config.seed)
     if "train_rng_state" in saved_state:
         train_rng.setstate(saved_state["train_rng_state"])
-    sampler = MazeTaskSampler(config, train_rng)
+    curriculum_state = saved_state.get("curriculum")
+    restored_stages: list[CurriculumStage] | None = None
+    if isinstance(curriculum_state, dict) and isinstance(
+        curriculum_state.get("stages"), list
+    ):
+        restored_stages = [
+            CurriculumStage.from_payload(payload)
+            for payload in curriculum_state["stages"]
+        ]
+    sampler = MazeTaskSampler(config, train_rng, stages=restored_stages)
     if config.hard_maze_fraction > 0.0:
         sampler.restore_hard_grids(
             saved_state.get("hard_maze_grids"),
@@ -5560,9 +6015,11 @@ def _train_recurrent_ppo(
             saved_state.get("hard_maze_candidates_seen"),
             saved_state.get("hard_maze_validation_solve_rate"),
         )
-    curriculum_state = saved_state.get("curriculum")
     if isinstance(curriculum_state, dict):
-        sampler.curriculum.level = int(curriculum_state.get("level", 0))
+        sampler.curriculum.level = min(
+            int(curriculum_state.get("level", 0)),
+            len(sampler.curriculum.stages) - 1,
+        )
         sampler.curriculum.success_streak = int(curriculum_state.get("success_streak", 0))
     maze_workers = (
         config.maze_workers if config.performance_profile == "rtx3090-fast" else 0
@@ -5588,8 +6045,8 @@ def _train_recurrent_ppo(
 
         nonlocal states
         nonlocal hidden
-        for index in range(env_count):
-            environment_batch.replace(index, prefetcher.next())
+        nonlocal environment_batch
+        environment_batch = MazeBatch([prefetcher.next() for _ in range(env_count)])
         states = environment_batch.observations()
         hidden = agent.initial_policy_state(env_count)
         previous_actions_np.fill(-1)
@@ -5696,6 +6153,13 @@ def _train_recurrent_ppo(
             rollout_dones[step].copy_(
                 torch.as_tensor(result.dones, dtype=torch.float32, device=agent.device)
             )
+            failed_training_grids = [
+                environment_batch.grids[int(index)].copy()
+                for index in np.flatnonzero(result.dones)
+                if result.timeout[int(index)]
+            ]
+            if failed_training_grids and config.hard_maze_fraction > 0.0:
+                sampler.add_failed_grids(failed_training_grids)
             for index in np.flatnonzero(result.dones):
                 if limits_enabled and completed >= config.episodes:
                     break
@@ -5732,11 +6196,9 @@ def _train_recurrent_ppo(
         learner_started = time.perf_counter()
         intrinsic_rewards = torch.zeros_like(rollout_rewards)
         rnd_coefficient = 0.0
-        if agent.rnd is not None and total_steps < config.max_env_steps:
-            rnd_coefficient = config.rnd_reward_coef * max(
-                0.0,
-                1.0 - total_steps / config.max_env_steps,
-            )
+        if agent.rnd is not None:
+            rnd_coefficient = _rnd_coefficient(total_steps, config)
+        if agent.rnd is not None and rnd_coefficient > 0.0:
             intrinsic_rewards = agent.rnd.bonus_and_update(
                 rollout_states,
                 config.rnd_reward_clip,
@@ -5815,6 +6277,22 @@ def _train_recurrent_ppo(
                 entropy_coefficient=entropy_coefficient,
                 precision_recovery_active=recovery_active,
                 rnd_coefficient=rnd_coefficient,
+                schedule={
+                    "budget_steps": config.max_env_steps,
+                    "progress": min(total_steps / max(config.max_env_steps, 1), 1.0),
+                    "phase": (
+                        "precision"
+                        if total_steps >= config.max_env_steps * (1.0 - config.precision_fraction)
+                        else "exploration"
+                    ),
+                },
+                active_eval_every_steps=(
+                    config.post_curriculum_eval_every_steps
+                    if sampler.curriculum.complete
+                    else config.eval_every_steps
+                ),
+                curriculum_stage=sampler.curriculum.current_stage.payload(),
+                generation=prefetcher.telemetry(),
                 extrinsic_reward_mean=float(rollout_rewards.mean().item()),
                 intrinsic_reward_mean=float(intrinsic_rewards.mean().item()),
                 ppo={
@@ -5862,22 +6340,21 @@ def _train_recurrent_ppo(
             "periodic_latest",
         )
 
+        became_complete = False
+
         def record_evaluation(metrics: EvalMetrics) -> None:
+            nonlocal became_complete
             promoted = False
             stage_metrics = metrics
             if config.curriculum_enabled and not sampler.curriculum.complete:
-                stage_metrics = _curriculum_stage_eval(agent, config, sampler.curriculum)
                 promoted = sampler.curriculum.record_validation(stage_metrics)
                 if promoted:
+                    became_complete = sampler.curriculum.complete
                     prefetcher.reset()
+                    reset_training_batch()
             if not config.curriculum_enabled or sampler.curriculum.complete:
                 sampler.record_validation_solve_rate(metrics.solve_rate)
-            hard_variants_added = (
-                sampler.add_failed_grids(metrics.failed_grids)
-                if config.hard_maze_fraction > 0.0
-                and (not config.curriculum_enabled or sampler.curriculum.complete)
-                else 0
-            )
+            hard_variants_added = 0
             _update_training_state(
                 agent,
                 completed,
@@ -5893,6 +6370,7 @@ def _train_recurrent_ppo(
                 logger.log(
                     "curriculum",
                     level=sampler.curriculum.level,
+                    stage=sampler.curriculum.current_stage.payload(),
                     promoted=promoted,
                     stage_metrics=_eval_metrics_payload(stage_metrics),
                     sampling_mix=sampler.sampling_mix(),
@@ -5900,6 +6378,11 @@ def _train_recurrent_ppo(
                     hard_maze_pool_size=len(sampler.hard_grids),
                     hard_maze_candidates_seen=sampler.hard_candidates_seen,
                     validation_solve_rate=sampler.validation_solve_rate,
+                    active_eval_every_steps=(
+                        config.post_curriculum_eval_every_steps
+                        if sampler.curriculum.complete
+                        else config.eval_every_steps
+                    ),
                 )
 
         evaluation_improved = False
@@ -5939,6 +6422,14 @@ def _train_recurrent_ppo(
                 )
 
         evaluation_started = time.perf_counter()
+        curriculum_complete_before_eval = (
+            not config.curriculum_enabled or sampler.curriculum.complete
+        )
+        active_eval_every_steps = (
+            config.post_curriculum_eval_every_steps
+            if curriculum_complete_before_eval
+            else config.eval_every_steps
+        )
         eval_result, last_eval_step, best_eval_rate, best_weights = _maybe_run_eval(
             agent,
             config,
@@ -5954,7 +6445,33 @@ def _train_recurrent_ppo(
             process_start_cpu,
             on_evaluation=record_evaluation,
             on_new_best=record_new_best,
+            eval_every_steps=active_eval_every_steps,
+            evaluation_fn=(
+                None
+                if curriculum_complete_before_eval
+                else lambda: _curriculum_stage_eval(agent, config, sampler.curriculum)
+            ),
+            allow_new_best=curriculum_complete_before_eval,
         )
+        if became_complete:
+            eval_result, last_eval_step, best_eval_rate, best_weights = _maybe_run_eval(
+                agent,
+                config,
+                logger,
+                tracker,
+                completed,
+                total_steps,
+                0.0,
+                best_eval_rate,
+                best_weights,
+                0,
+                start_time,
+                process_start_cpu,
+                on_evaluation=record_evaluation,
+                on_new_best=record_new_best,
+                eval_every_steps=config.post_curriculum_eval_every_steps,
+                allow_new_best=True,
+            )
         evaluation_seconds = time.perf_counter() - evaluation_started
         if eval_result is not None:
             last_eval = eval_result
@@ -5973,14 +6490,7 @@ def _train_recurrent_ppo(
                 and eval_result.solve_rate >= config.target_solve_rate
             ):
                 confirmation = _confirm_target_candidate(agent, config, eval_result)
-                confirmation_variants_added = (
-                    sum(
-                        sampler.add_failed_grids(suite_metrics.failed_grids)
-                        for _suite_seed, suite_metrics in confirmation.suites[1:]
-                    )
-                    if config.hard_maze_fraction > 0.0
-                    else 0
-                )
+                confirmation_variants_added = 0
                 for suite_index, (suite_seed, suite_metrics) in enumerate(
                     confirmation.suites,
                     start=1,
@@ -6989,8 +7499,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Resume the selected/latest checkpoint (default); --no-resume "
-            "starts a fresh timestamped experiment."
+            "Resume the selected/latest schema-v3 checkpoint; fresh training "
+            "is the default."
         ),
     )
     parser.add_argument(
@@ -7007,6 +7517,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-episode-steps", type=int, default=None)
     parser.add_argument("--timeout-step-factor", type=float, default=None)
     parser.add_argument("--min-episode-steps", type=int, default=None)
+    parser.add_argument("--exploration-step-factor", type=float, default=None)
     parser.add_argument("--step-penalty", type=float, default=None)
     parser.add_argument("--invalid-move-penalty", type=float, default=None)
     parser.add_argument("--goal-reward", type=float, default=None)
@@ -7023,6 +7534,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument("--curriculum-mode", choices=CURRICULUM_MODES, default=None)
+    parser.add_argument("--curriculum-probe-mazes", type=int, default=None)
+    parser.add_argument("--curriculum-size-step", type=int, default=None)
     parser.add_argument("--curriculum-easy-episodes", type=int, default=None)
     parser.add_argument("--curriculum-medium-episodes", type=int, default=None)
     parser.add_argument(
@@ -7058,7 +7572,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Parallel environments; defaults to 512 for recurrent PPO on the "
+            "Parallel environments; defaults to 768 for recurrent PPO on the "
             "RTX 3090 fast profile and 256 otherwise."
         ),
     )
@@ -7091,6 +7605,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-episodes", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None)
     parser.add_argument("--eval-every-steps", type=int, default=None)
+    parser.add_argument("--post-curriculum-eval-every-steps", type=int, default=None)
     parser.add_argument("--dashboard-every", type=int, default=None)
     parser.add_argument("--curriculum-promotion-rate", type=float, default=None)
     parser.add_argument("--curriculum-promotion-evals", type=int, default=None)
@@ -7141,6 +7656,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Opt in to rollback-based post-budget precision recovery.",
     )
+    parser.add_argument("--precision-fraction", type=float, default=None)
+    parser.add_argument("--precision-learning-rate-fraction", type=float, default=None)
+    parser.add_argument("--precision-entropy-fraction", type=float, default=None)
     parser.add_argument(
         "--precision-plateau-evals",
         type=int,
@@ -7171,6 +7689,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--maze-workers", type=int, default=None)
+    parser.add_argument("--maze-generation-batch-size", type=int, default=None)
+    parser.add_argument("--maze-prefetch-batches-per-worker", type=int, default=None)
     parser.add_argument(
         "--planner-fallback",
         action=argparse.BooleanOptionalAction,
@@ -7237,6 +7757,10 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         values["curriculum_easy_range"] = tuple(args.curriculum_easy_range)
     if args.curriculum_medium_range is not None:
         values["curriculum_medium_range"] = tuple(args.curriculum_medium_range)
+    if args.max_env_steps is None and (
+        args.maze_size is not None or args.observation_mode is not None
+    ):
+        values["max_env_steps"] = None
     for name in (
         "episodes",
         "max_env_steps",
@@ -7251,6 +7775,7 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "max_episode_steps",
         "timeout_step_factor",
         "min_episode_steps",
+        "exploration_step_factor",
         "step_penalty",
         "invalid_move_penalty",
         "goal_reward",
@@ -7258,6 +7783,9 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "distance_shaping_scale",
         "distance_shaping_mode",
         "curriculum_enabled",
+        "curriculum_mode",
+        "curriculum_probe_mazes",
+        "curriculum_size_step",
         "curriculum_max_retries",
         "buffer_size",
         "batch_size",
@@ -7295,6 +7823,7 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "rnd_reward_clip",
         "eval_episodes",
         "eval_every_steps",
+        "post_curriculum_eval_every_steps",
         "dashboard_every",
         "curriculum_promotion_rate",
         "curriculum_promotion_evals",
@@ -7313,9 +7842,14 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "precision_recovery_steps",
         "precision_recovery_lr_fraction",
         "precision_recovery_enabled",
+        "precision_fraction",
+        "precision_learning_rate_fraction",
+        "precision_entropy_fraction",
         "latest_checkpoint_every_steps",
         "performance_profile",
         "maze_workers",
+        "maze_generation_batch_size",
+        "maze_prefetch_batches_per_worker",
         "planner_fallback",
         "dashboard_flag",
         "save_path",

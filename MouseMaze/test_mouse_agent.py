@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import MouseAgent as mouse_agent_module
+from gen_maze import generate_random_maze
 from MouseAgent import (
     DASHBOARD_MAX_HISTORY_POINTS,
     DASHBOARD_TOOLTIPS,
@@ -18,6 +19,7 @@ from MouseAgent import (
     EVAL_SEED_OFFSET,
     BfsPlanner,
     CurriculumController,
+    CurriculumStage,
     Dashboard,
     DeterministicMazePrefetcher,
     EpisodeStats,
@@ -48,6 +50,7 @@ from MouseAgent import (
     _non_overlapping_episode_ticks,
     _rects_overlap,
     _recurrent_ppo_precision_schedule,
+    _rnd_coefficient,
     _restore_rng_state,
     _should_run_eval,
     _apply_legacy_cli_aliases,
@@ -63,6 +66,7 @@ from MouseAgent import (
     resolve_cli_artifacts,
     resolve_num_envs,
     build_n_step_transition,
+    automatic_curriculum_sizes,
     curriculum_distance_range,
     dashboard_layout,
     inference_layout,
@@ -88,6 +92,41 @@ def fixed_grid():
         ],
         dtype=np.uint8,
     )
+
+
+def test_wilson_generator_is_seeded_connected_and_acyclic():
+    first = generate_random_maze(11, 11, rng=random.Random(1234))
+    second = generate_random_maze(11, 11, rng=random.Random(1234))
+
+    assert np.array_equal(first, second)
+    assert np.all(first[[0, -1], :] == 1)
+    assert np.all(first[:, [0, -1]] == 1)
+    traversable = first != 1
+    open_cells = int(traversable.sum())
+    edges = int(
+        (traversable[:, :-1] & traversable[:, 1:]).sum()
+        + (traversable[:-1] & traversable[1:]).sum()
+    )
+    env = Maze(first, observation_mode="full")
+
+    assert np.count_nonzero(env.bfs_distances >= 0) == open_cells
+    assert edges == open_cells - 1
+
+
+def test_automatic_curriculum_size_ladder_and_budget_scaling():
+    assert automatic_curriculum_sizes((11, 11)) == [(11, 11)]
+    assert automatic_curriculum_sizes((21, 15)) == [
+        (11, 11),
+        (15, 15),
+        (19, 15),
+        (21, 15),
+    ]
+    medium = TrainConfig(maze_size=(15, 15))
+    large = TrainConfig(maze_size=(21, 21))
+    assert medium.max_env_steps == 136_000_000
+    assert large.max_env_steps == 191_000_000
+    assert medium.episodes >= medium.max_env_steps
+    assert large.episodes >= large.max_env_steps
 
 
 @pytest.mark.parametrize(
@@ -222,11 +261,17 @@ def test_local_observation_keeps_agent_centered_and_goal_visible():
 
     obs = env.reset()
 
-    assert obs.shape == (4, 5, 5)
+    assert obs.shape == (5, 5, 5)
     assert obs[1, 2, 2] == 1.0
     assert obs[1].sum() == 1.0
     assert obs[2, 2, 4] == 1.0
     assert np.all(obs[3] == 1.0)
+    assert obs[4, 2, 2] == 1.0
+    assert obs[4].sum() == 1.0
+
+    next_obs, _reward, _done, _info = env.step(0)
+    assert next_obs[4, 2, 1] == 1.0
+    assert next_obs[4, 2, 2] == 1.0
 
 
 def test_reward_invalid_move_solve_and_timeout_flags():
@@ -314,6 +359,43 @@ def test_dynamic_timeout_uses_optimal_steps_with_cap():
     assert capped_env.max_episode_steps == 6
 
 
+@pytest.mark.parametrize("maze_size", [(11, 11), (21, 21)])
+def test_local_exploration_horizon_scales_with_traversable_cells(maze_size):
+    grid = generate_random_maze(*maze_size, rng=random.Random(sum(maze_size)))
+    local = Maze(
+        grid,
+        observation_mode="local",
+        max_episode_steps=None,
+        timeout_step_factor=4.0,
+        min_episode_steps=1,
+        exploration_step_factor=2.0,
+    )
+    expected = max(
+        1,
+        4 * local.optimal_start_steps,
+        2 * int(np.count_nonzero(grid != 1)),
+    )
+    capped = Maze(
+        grid,
+        observation_mode="local",
+        max_episode_steps=expected - 1,
+        timeout_step_factor=4.0,
+        min_episode_steps=1,
+        exploration_step_factor=2.0,
+    )
+    full = Maze(
+        grid,
+        observation_mode="full",
+        max_episode_steps=None,
+        timeout_step_factor=4.0,
+        min_episode_steps=1,
+    )
+
+    assert local.max_episode_steps == expected
+    assert capped.max_episode_steps == expected - 1
+    assert full.max_episode_steps == max(1, 4 * full.optimal_start_steps)
+
+
 def test_default_timeout_provides_local_recovery_budget(monkeypatch):
     config = TrainConfig(
         maze_size=(5, 5),
@@ -333,11 +415,11 @@ def test_default_timeout_provides_local_recovery_budget(monkeypatch):
 
     assert config.min_episode_steps == 20
     assert config.timeout_step_factor == 4.0
-    assert config.max_episode_steps == 300
+    assert config.max_episode_steps is None
     assert config.recurrent_sequence_length == 64
     assert config.recurrent_sequence_minibatch_size == 32
     assert config.recurrent_hidden_size == 128
-    assert config.hard_maze_fraction == 0.0
+    assert config.hard_maze_fraction == 0.05
     assert config.precision_recovery_enabled is False
     assert config.target_solve_rate == 1.0
     assert config.target_solve_evals == 3
@@ -358,14 +440,16 @@ def test_recurrent_precision_schedule_holds_lr_and_entropy_floors_after_budget()
 
     assert _recurrent_ppo_precision_schedule(0, config) == (1e-3, 2e-2)
     learning_rate, entropy = _recurrent_ppo_precision_schedule(100, config)
-    assert np.isclose(learning_rate, 1e-4)
-    assert np.isclose(entropy, 2e-2)
+    assert np.isclose(learning_rate, 1e-5)
+    assert np.isclose(entropy, 2e-3)
     learning_rate, entropy = _recurrent_ppo_precision_schedule(200, config)
-    assert np.isclose(learning_rate, 1e-4)
-    assert np.isclose(entropy, 2e-2)
+    assert np.isclose(learning_rate, 1e-5)
+    assert np.isclose(entropy, 2e-3)
     learning_rate, entropy = _recurrent_ppo_precision_schedule(1_000, config)
-    assert np.isclose(learning_rate, 1e-4)
-    assert np.isclose(entropy, 2e-2)
+    assert np.isclose(learning_rate, 1e-5)
+    assert np.isclose(entropy, 2e-3)
+    assert np.isclose(_rnd_coefficient(0, config), config.rnd_reward_coef)
+    assert np.isclose(_rnd_coefficient(100, config), 0.0)
 
 
 def test_default_recurrent_minibatch_preserves_2048_transition_density():
@@ -400,6 +484,13 @@ def test_target_only_evaluation_ignores_episode_cap_until_step_interval():
     assert not _should_run_eval(target_only, completed=11, total_steps=120, last_eval_step=100)
     assert _should_run_eval(target_only, completed=11, total_steps=150, last_eval_step=100)
     assert _should_run_eval(bounded, completed=10, total_steps=120, last_eval_step=100)
+    assert not _should_run_eval(
+        target_only,
+        completed=11,
+        total_steps=150,
+        last_eval_step=100,
+        eval_every_steps=500,
+    )
 
 
 def test_profile_selected_environment_parallelism_preserves_overrides():
@@ -419,7 +510,7 @@ def test_profile_selected_environment_parallelism_preserves_overrides():
         num_envs=256,
     )
 
-    assert resolve_num_envs(fast) == 512
+    assert resolve_num_envs(fast) == 768
     assert resolve_num_envs(portable) == 256
     assert resolve_num_envs(explicit) == 256
 
@@ -494,11 +585,11 @@ def test_curriculum_distance_ranges_and_sampling_are_deterministic():
     assert all(8 <= steps <= 16 for steps in medium)
 
 
-def test_hard_maze_replay_uses_transformed_variants_and_excludes_held_out_grid():
+def test_hard_maze_replay_uses_training_failure_and_transformed_variants():
     config = TrainConfig(
         maze_size=(5, 5),
         hard_maze_fraction=1.0,
-        hard_maze_pool_size=3,
+        hard_maze_pool_size=8,
         curriculum_enabled=False,
         dashboard_flag=False,
         save_path=None,
@@ -512,8 +603,8 @@ def test_hard_maze_replay_uses_transformed_variants_and_excludes_held_out_grid()
     sampled = sampler.sample()
 
     assert added >= 3
-    assert len(sampler.hard_grids) == 3
-    assert all(not np.array_equal(grid, fixed_grid()) for grid in sampler.hard_grids)
+    assert len(sampler.hard_grids) == added
+    assert any(np.array_equal(grid, fixed_grid()) for grid in sampler.hard_grids)
     assert any(np.array_equal(sampled.grid, grid) for grid in sampler.hard_grids)
     assert sampled.optimal_start_steps <= sampled.max_episode_steps
     assert sampler.sampling_mix() == {
@@ -527,6 +618,7 @@ def test_hard_maze_replay_uses_transformed_variants_and_excludes_held_out_grid()
 def test_hard_maze_pool_restores_exact_variants():
     config = TrainConfig(
         maze_size=(5, 5),
+        curriculum_mode="manual",
         hard_maze_fraction=1.0,
         dashboard_flag=False,
         save_path=None,
@@ -544,6 +636,27 @@ def test_hard_maze_pool_restores_exact_variants():
         np.array_equal(actual, expected)
         for actual, expected in zip(restored.hard_grids, original.hard_grids)
     )
+
+
+def test_hard_maze_reservoirs_are_separated_by_grid_shape():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        hard_maze_fraction=1.0,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    sampler = MazeTaskSampler(config, random.Random(11))
+    rectangular = generate_random_maze(5, 7, rng=random.Random(12))
+
+    sampler.add_failed_grids([fixed_grid(), rectangular])
+
+    assert set(sampler.hard_grids_by_shape) == {(5, 5), (5, 7)}
+    assert all(grid.shape == (5, 5) for grid in sampler.hard_grids_by_shape[(5, 5)])
+    assert all(grid.shape == (5, 7) for grid in sampler.hard_grids_by_shape[(5, 7)])
+    assert sampler.hard_grids is sampler.hard_grids_by_shape[(5, 5)]
 
 
 def test_hard_maze_fraction_ramps_with_validation_and_reservoir_is_deterministic():
@@ -675,6 +788,7 @@ def test_make_maze_raises_instead_of_returning_unsolvable_budget_candidate(monke
 def test_curriculum_promotes_only_after_repeated_validation_success():
     config = TrainConfig(
         maze_size=(5, 5),
+        curriculum_mode="manual",
         curriculum_promotion_rate=0.75,
         curriculum_promotion_evals=2,
         dashboard_flag=False,
@@ -691,6 +805,25 @@ def test_curriculum_promotes_only_after_repeated_validation_success():
     assert controller.level == 1
     assert controller.target_range() == (4, 7)
     assert controller.previous_range() == (3, 5)
+
+
+def test_automatic_curriculum_stages_are_deterministic_and_resumable():
+    config = TrainConfig(
+        maze_size=(7, 7),
+        curriculum_probe_mazes=24,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+        require_cuda=False,
+    )
+    first = CurriculumController(config)
+    second = CurriculumController(config)
+
+    assert first.stages == second.stages
+    assert [stage.maze_size for stage in first.stages] == [(7, 7)] * 3
+    assert first.stages[0].complexity_high <= first.stages[1].complexity_high
+    assert first.stages[2].complexity_high is None
 
 
 def test_maze_batch_matches_sequential_maze_transitions():
@@ -1285,8 +1418,8 @@ def test_cli_help_renders_all_percentage_descriptions(capsys):
     assert "90%" in help_text
 
 
-def test_target_only_stop_defaults_to_recurrent_ppo_and_can_be_disabled():
-    assert TrainConfig(algorithm="recurrent_ppo").target_only_stop is True
+def test_target_only_stop_is_finite_by_default_and_can_be_enabled():
+    assert TrainConfig(algorithm="recurrent_ppo").target_only_stop is False
     assert TrainConfig(algorithm="dqn").target_only_stop is False
     assert TrainConfig(algorithm="ppo").target_only_stop is False
 
@@ -1490,9 +1623,17 @@ def test_cli_args_override_top_level_train_config_defaults():
             "3.5",
             "--min-episode-steps",
             "7",
+            "--max-episode-steps",
+            "42",
+            "--exploration-step-factor",
+            "2.5",
             "--distance-shaping-mode",
             "none",
             "--no-curriculum",
+            "--curriculum-mode",
+            "manual",
+            "--curriculum-probe-mazes",
+            "16",
             "--curriculum-easy-range",
             "4",
             "8",
@@ -1502,12 +1643,24 @@ def test_cli_args_override_top_level_train_config_defaults():
             "8",
             "--recurrent-hidden-size",
             "64",
+            "--post-curriculum-eval-every-steps",
+            "777",
+            "--precision-fraction",
+            "0.25",
+            "--precision-learning-rate-fraction",
+            "0.02",
+            "--precision-entropy-fraction",
+            "0.2",
             "--target-solve-rate",
             "0.8",
             "--performance-profile",
             "portable",
             "--maze-workers",
             "0",
+            "--maze-generation-batch-size",
+            "8",
+            "--maze-prefetch-batches-per-worker",
+            "2",
             "--learning-rate",
             "0.001",
             "--device",
@@ -1528,15 +1681,25 @@ def test_cli_args_override_top_level_train_config_defaults():
     assert config.resume is True
     assert config.timeout_step_factor == 3.5
     assert config.min_episode_steps == 7
+    assert config.max_episode_steps == 42
+    assert config.exploration_step_factor == 2.5
     assert config.distance_shaping_mode == "none"
     assert config.curriculum_enabled is False
+    assert config.curriculum_mode == "manual"
+    assert config.curriculum_probe_mazes == 16
     assert config.curriculum_easy_range == (4, 8)
     assert config.n_step_returns == 4
     assert config.ppo_rollout_steps == 8
     assert config.recurrent_hidden_size == 64
+    assert config.post_curriculum_eval_every_steps == 777
+    assert config.precision_fraction == 0.25
+    assert config.precision_learning_rate_fraction == 0.02
+    assert config.precision_entropy_fraction == 0.2
     assert config.target_solve_rate == 0.8
     assert config.performance_profile == "portable"
     assert config.maze_workers == 0
+    assert config.maze_generation_batch_size == 8
+    assert config.maze_prefetch_batches_per_worker == 2
     assert config.learning_rate == 0.001
     assert config.device == "cpu"
     assert _optional_bool(args.infer_flag, DEFAULT_INFER_FLAG) is False
@@ -1914,6 +2077,7 @@ def test_train_resumes_existing_save_path_only_when_requested(tmp_path, capsys):
         num_envs=1,
         updates_per_transition=1.0,
         eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=str(save_path),
@@ -1948,6 +2112,7 @@ def test_train_resumes_existing_save_path_only_when_requested(tmp_path, capsys):
         num_envs=1,
         updates_per_transition=1.0,
         eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=str(save_path),
@@ -2076,6 +2241,7 @@ def test_training_writes_jsonl_log_with_metrics_speed_and_utilization(tmp_path):
         num_envs=1,
         updates_per_transition=1.0,
         eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
         eval_episodes=1,
         dashboard_flag=False,
         save_path=None,
@@ -2291,7 +2457,7 @@ def test_local_recurrent_agent_uses_rnd_without_distance_shaping():
     observation = Maze(
         fixed_grid(), observation_mode="local", view_size=5, max_episode_steps=10
     ).reset()
-    states = torch.from_numpy(observation).view(1, 1, 4, 5, 5).repeat(2, 1, 1, 1, 1)
+    states = torch.from_numpy(observation).view(1, 1, 5, 5, 5).repeat(2, 1, 1, 1, 1)
 
     assert config.distance_shaping_mode == "none"
     assert agent.rnd is not None
@@ -2343,11 +2509,18 @@ def test_process_prefetcher_preserves_seeded_task_order():
         device="cpu",
         require_cuda=False,
         maze_workers=1,
+        maze_generation_batch_size=1,
+        maze_prefetch_batches_per_worker=1,
     )
     expected_sampler = MazeTaskSampler(config, random.Random(91))
-    expected_range = expected_sampler.sample_target_range()
+    expected_stage = expected_sampler.sample_stage()
     expected_seed = expected_sampler.rng.randrange(0, 2**63)
-    expected = _generate_prefetched_grid(config, expected_seed, expected_range)
+    expected = _generate_prefetched_grid(
+        replace(config, maze_size=expected_stage.maze_size),
+        expected_seed,
+        expected_stage.distance_range,
+        expected_stage.complexity_high,
+    )
     actual_sampler = MazeTaskSampler(config, random.Random(91))
     prefetcher = DeterministicMazePrefetcher(actual_sampler, workers=1)
     try:
@@ -2369,6 +2542,8 @@ def test_process_prefetcher_prioritizes_hard_replay_variants():
         device="cpu",
         require_cuda=False,
         maze_workers=1,
+        maze_generation_batch_size=1,
+        maze_prefetch_batches_per_worker=1,
     )
     sampler = MazeTaskSampler(config, random.Random(17))
     sampler.add_failed_grids([fixed_grid()])
@@ -2383,10 +2558,9 @@ def test_process_prefetcher_prioritizes_hard_replay_variants():
         np.array_equal(environment.grid, variant)
         for variant in sampler.hard_grids
     )
-    assert not np.array_equal(environment.grid, fixed_grid())
 
 
-def test_recurrent_checkpoint_v2_round_trip_and_rejects_legacy(tmp_path):
+def test_recurrent_checkpoint_v3_round_trip_and_rejects_legacy(tmp_path):
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
@@ -2401,7 +2575,7 @@ def test_recurrent_checkpoint_v2_round_trip_and_rejects_legacy(tmp_path):
         performance_profile="portable",
         maze_workers=0,
     )
-    checkpoint = tmp_path / "recurrent_v2.pth"
+    checkpoint = tmp_path / "recurrent_v3.pth"
     legacy = tmp_path / "legacy.pth"
     agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
     agent.update_count = 7
@@ -2419,12 +2593,12 @@ def test_recurrent_checkpoint_v2_round_trip_and_rejects_legacy(tmp_path):
 
     restored = RecurrentPPOAgent(config, device=torch.device("cpu"))
     restored.load(str(checkpoint))
-    torch.save({"schema_version": 1, "algorithm": "dqn"}, legacy)
+    torch.save({"schema_version": 2, "algorithm": "dqn"}, legacy)
 
     assert restored.update_count == 7
     assert restored.total_env_steps == 42
     assert restored.training_state == agent.training_state
-    with pytest.raises(ValueError, match="schema-v2"):
+    with pytest.raises(ValueError, match="schema-v3"):
         restored.load(str(legacy))
 
 
@@ -2462,6 +2636,105 @@ def test_short_local_recurrent_training_smoke():
     assert len(tracker.solved) == 3
 
 
+def test_recurrent_resume_uses_saved_curriculum_definitions(monkeypatch):
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        observation_mode="local",
+        view_size=5,
+        episodes=1,
+        max_env_steps=1,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        rnd_reward_coef=0.0,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+    saved_stage = CurriculumStage((5, 5), "saved-unrestricted")
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    agent.total_env_steps = 1
+    agent.training_state = {
+        "completed_episodes": 1,
+        "total_steps": 1,
+        "curriculum": {
+            "level": 0,
+            "success_streak": 0,
+            "stages": [saved_stage.payload()],
+        },
+    }
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "resolve_curriculum_stages",
+        lambda _config: pytest.fail("resume recomputed curriculum stages"),
+    )
+
+    train(agent=agent, config=config)
+
+    assert agent.training_state["curriculum"]["stages"] == [saved_stage.payload()]
+
+
+def test_short_recurrent_training_promotes_automatic_curriculum(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_eval_greedy",
+        lambda agent, config, **kwargs: EvalMetrics(solve_rate=1.0),
+    )
+    log_path = tmp_path / "auto-curriculum.jsonl"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        observation_mode="local",
+        view_size=5,
+        episodes=10,
+        max_env_steps=10,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        rnd_reward_coef=0.0,
+        eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
+        eval_episodes=1,
+        curriculum_probe_mazes=8,
+        curriculum_promotion_rate=0.9,
+        curriculum_promotion_evals=1,
+        curriculum_eval_episodes=1,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=str(log_path),
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+
+    train(agent=agent, config=config)
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    promotions = [
+        record for record in records
+        if record["event"] == "curriculum" and record["promoted"]
+    ]
+    learners = [record for record in records if record["event"] == "learner"]
+
+    assert len(promotions) == 2
+    assert promotions[-1]["stage"]["name"] == "5x5-unrestricted"
+    assert all("active_eval_every_steps" in record for record in learners)
+
+
 def test_target_only_recurrent_ppo_confirms_frozen_candidate_and_ignores_legacy_streak(
     monkeypatch,
     tmp_path,
@@ -2486,9 +2759,11 @@ def test_target_only_recurrent_ppo_confirms_frozen_candidate_and_ignores_legacy_
         recurrent_sequence_length=1,
         recurrent_sequence_minibatch_size=1,
         eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
         eval_episodes=1,
         target_solve_rate=1.0,
         target_solve_evals=2,
+        target_only_stop=True,
         curriculum_enabled=True,
         curriculum_promotion_rate=0.9,
         curriculum_promotion_evals=3,
@@ -2564,9 +2839,11 @@ def test_failed_target_confirmation_resumes_training(monkeypatch):
         recurrent_sequence_length=1,
         recurrent_sequence_minibatch_size=1,
         eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
         eval_episodes=1,
         target_solve_rate=1.0,
         target_solve_evals=2,
+        target_only_stop=True,
         curriculum_enabled=False,
         dashboard_flag=False,
         save_path=None,
@@ -2582,7 +2859,7 @@ def test_failed_target_confirmation_resumes_training(monkeypatch):
 
     assert agent.training_state["target_confirmed"] is True
     assert agent.total_env_steps >= 2
-    assert "hard_maze_grids" not in agent.training_state
+    assert "hard_maze_grids" in agent.training_state
     assert not rates
 
 
@@ -2615,6 +2892,7 @@ def test_disabled_precision_recovery_clears_legacy_active_state(
         eval_episodes=1,
         target_solve_rate=1.0,
         target_solve_evals=2,
+        target_only_stop=True,
         precision_recovery_enabled=False,
         curriculum_enabled=False,
         dashboard_flag=False,
@@ -2689,9 +2967,11 @@ def test_precision_recovery_handles_improvement_and_rollback(
         recurrent_sequence_minibatch_size=1,
         rnd_reward_coef=0.0,
         eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
         eval_episodes=1,
         target_solve_rate=1.0,
         target_solve_evals=2,
+        target_only_stop=True,
         precision_plateau_evals=1,
         precision_recovery_steps=1,
         precision_recovery_lr_fraction=0.05,

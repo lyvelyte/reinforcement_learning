@@ -18,20 +18,39 @@ def valid_neighbors(m, n, r, c):
 
 
 def wilsons_algorithm(grid, rng=None):
+    """Carve a uniform spanning tree with Wilson's loop-erased random walks."""
+
     random_source = rng if rng is not None else random
     m, n = grid.shape
-    unvisited = set((r, c) for r in range(1, m, 2) for c in range(1, n, 2))
-    current = random_source.choice(list(unvisited))
-    unvisited.remove(current)
+    cells = [(r, c) for r in range(1, m, 2) for c in range(1, n, 2)]
+    unvisited = set(cells)
+    root = random_source.choice(cells)
+    unvisited.remove(root)
 
     while unvisited:
-        r, c = current
-        neighbors = valid_neighbors(m, n, r, c)
-        next_r, next_c = random_source.choice(neighbors)
-        if (next_r, next_c) in unvisited:
-            grid[r + (next_r - r) // 2, c + (next_c - c) // 2] = 0
-            unvisited.remove((next_r, next_c))
-        current = (next_r, next_c)
+        current = random_source.choice(sorted(unvisited))
+        walk = [current]
+        positions = {current: 0}
+
+        while current in unvisited:
+            next_cell = random_source.choice(valid_neighbors(m, n, *current))
+            loop_start = positions.get(next_cell)
+            if loop_start is not None:
+                for removed in walk[loop_start + 1 :]:
+                    positions.pop(removed, None)
+                del walk[loop_start + 1 :]
+            else:
+                positions[next_cell] = len(walk)
+                walk.append(next_cell)
+            current = next_cell
+
+        for source, destination in zip(walk, walk[1:]):
+            wall = (
+                source[0] + (destination[0] - source[0]) // 2,
+                source[1] + (destination[1] - source[1]) // 2,
+            )
+            grid[wall] = 0
+            unvisited.discard(source)
     return grid
 
 

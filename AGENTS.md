@@ -21,16 +21,16 @@ Two independent RL projects live side-by-side under this repo root:
 - **`marioppo/alveybj/Test.py`** — Evaluate a loaded model (50 evals × 100 steps). Video export available via wrapper flag.
 - **`marioppo/clarity_coder/Train.py`** — Train PPO (2 M timesteps, custom `SaveOnBestTrainingRewardCallback`, TensorBoard under `./board/`).
 - **`marioppo/clarity_coder/Test.py`** — Evaluate `ppo_level_1_1.zip` (40 episodes × 200 steps).
-- **`MouseMaze/MouseAgent.py`** — All-in-one recurrent PPO/DQN trainer, vectorized `Maze` environment, corrected validation-gated curriculum, RND local exploration, benchmarking, pygame dashboard, and RTX 3090 performance profiles.
+- **`MouseMaze/MouseAgent.py`** — All-in-one recurrent PPO/DQN trainer, five-channel local visited memory, automatic size/complexity curriculum, RND exploration, benchmarking, pygame dashboard, and RTX 3090 performance profiles.
 - **`MouseMaze/gen_maze.py`** — Maze generator (Wilson's algorithm, perfect mazes).
 
 ### Model artifacts
 - `marioppo/alveybj/models/best_model.zip` — CNN-PPO weights.
 - `marioppo/alveybj/lstm_models/best_model.zip` — RecurrentPPO weights.
 - `marioppo/clarity_coder/ppo_level_1_1.zip` — PPO level-1 model.
-- `MouseMaze/results/models/<timestamp>_mousemaze.pth` — Schema-v2 frozen-best checkpoints selected by inference and benchmarks.
-- `MouseMaze/results/models/<timestamp>_mousemaze.latest.pth` — Atomic resumable sidecars containing the current policy and full training state. Default resume prefers the paired sidecar and falls back to the frozen-best checkpoint.
-- `MouseMaze/agent_weights*.pth` — Earlier DQN artifacts are archived and incompatible with the schema-v2 loader.
+- `MouseMaze/results/models/<timestamp>_mousemaze.pth` — Schema-v3 frozen-best checkpoints selected by inference and benchmarks. Schema-v2 artifacts are archived but rejected.
+- `MouseMaze/results/models/<timestamp>_mousemaze.latest.pth` — Atomic resumable sidecars containing the current policy, resolved curriculum, hard-maze reservoirs, and full training state. Explicit resume prefers the paired sidecar.
+- `MouseMaze/agent_weights*.pth` — Earlier DQN artifacts are archived and incompatible with the schema-v3 loader.
 
 ### Logs & telemetry
 - `marioppo/alveybj/tensorboard_logs/` — TensorBoard runs for PPO training.
@@ -47,6 +47,10 @@ Two independent RL projects live side-by-side under this repo root:
 - For MouseMaze production training on the RTX 3090, use the `rtx3090-fast`
   profile and transition budgets documented in `MouseMaze/README.md`. Use the
   `strict` profile for deterministic debugging.
+- MouseMaze recurrent PPO defaults to finite fresh training: 100 M local
+  transitions at 11×11, linearly scaled by final maze dimension. Automatic
+  curriculum and 5% training-failure hard replay are enabled by default. The
+  measured `rtx3090-fast` recurrent default is 768 environments.
 
 ## Change Guidelines
 - Only read and modify files within this project root.
