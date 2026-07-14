@@ -35,7 +35,7 @@ from gen_maze import generate_random_maze
 # Size of the centered local observation window; it must remain odd.
 VIEW_SIZE = 7
 # Rows and columns used when no maze size is supplied on the command line.
-DEFAULT_MAZE_SIZE = (11, 11)
+DEFAULT_MAZE_SIZE = (21, 21)
 # Observation choices: the full map or a centered local window.
 OBSERVATION_MODES = ("full", "local")
 # Algorithms supported by the trainer and checkpoint loader.
@@ -139,9 +139,9 @@ DEFAULT_DEVICE = "auto"
 # Whether a missing CUDA device should be treated as an error in auto mode.
 DEFAULT_REQUIRE_CUDA = True
 # Training is opt-in so launching the script does not alter a checkpoint.
-DEFAULT_TRAIN_FLAG = True
+DEFAULT_TRAIN_FLAG = False
 # Inference is enabled by default after optional training/checkpoint loading.
-DEFAULT_INFER_FLAG = False
+DEFAULT_INFER_FLAG = True
 # Number of fresh mazes rendered for inference; zero means run indefinitely.
 DEFAULT_INFERENCE_MAZES = 0
 
