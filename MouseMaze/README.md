@@ -1,22 +1,50 @@
 # MouseMaze
 
-MouseMaze trains masked recurrent PPO agents on procedurally generated perfect
-mazes. The default `local` observation exposes a centered 7×7 view and uses GRU
-memory plus random-network-distillation exploration; `full` mode exposes the
-complete map. Local observations add a fifth channel containing an egocentric
-crop of the episode's explicit visited-cell map.
+MouseMaze trains recurrent PPO agents on procedurally generated perfect mazes.
+The default is a continuous recurrent PPO agent using a centered 5×5 `local`
+observation, a 512-unit GRU, potential-based distance shaping, 0.25-cell control
+steps, a `-0.2` invalid-move penalty, and a small RND reward. Walls block line of
+sight; `full` mode exposes the complete map. Local observations include an
+egocentric crop with optional clipped visit counts.
 
-Observations contain wall, mouse, goal, and remaining-time channels, plus the
-local-only visited channel. Local training never uses hidden BFS reward shaping.
+Default full-map observations contain wall, mouse, goal, and clipped visit-count
+channels. Default local observations contain wall, goal, and clipped visit-count
+channels only. Counts saturate at five visits by default.
+The remaining-time channel is disabled by default. Configure these inputs with
+`--remaining-time-channel`, `--no-visit-count-channel`,
+`--visit-count-clip COUNT`, and `--no-wall-occlusion`; each Boolean option also
+accepts its inverse form. Reward shaping is explicitly selectable with
+`--distance-shaping-mode none|fractional|potential` and is never silently
+overridden by the observation mode.
+
+Continuous recurrent PPO is the default. Use `--action-space discrete` for the
+legacy four-direction policy. Continuous mode adds three translation-invariant
+spatial inputs: normalized within-cell row/column offsets and the previous
+collision flag. Its policy is a tanh-squashed two-dimensional Gaussian, so
+sampled and deterministic actions stay in `[-1, 1]`. The environment scales
+them to 0.25 cell per control step by default, checks the swept segment for
+walls/corners, and supplies the executed displacement—not a rejected requested
+action—to the GRU. Configure the scale with `--continuous-step-scale` and
+continuous entropy independently with `--continuous-entropy-coef`.
 
 ## Environment
 
-Use the repository's shared conda environment. Do not invoke Python or pytest
-directly.
+Use the repository's shared conda environment. Repository automation and checks
+should select it explicitly:
 
 ```bash
 conda run -n ml pytest MouseMaze/test_mouse_agent.py
 ```
+
+If the `ml` environment is already activated, start the recommended continuous
+training profile from this directory with no arguments:
+
+```bash
+python MouseAgent.py
+```
+
+From the repository root, the equivalent environment-independent command is
+`conda run -n ml python MouseMaze/MouseAgent.py`.
 
 ## RTX 3090 training
 
@@ -24,16 +52,25 @@ The `auto` profile selects `rtx3090-fast` on a 24GB RTX 3090. Recurrent PPO
 automatically uses 768 environments with that profile and 256 with portable or
 strict profiles; an explicit `--num-envs` always wins. The fast profile also
 uses BF16/TF32, compiled recurrent kernels, fused Adam, GPU-resident rollouts,
-and eight deterministic maze-generation workers. A newly encountered
+vectorized exact continuous-maze geometry, and eight deterministic
+maze-generation workers. A newly encountered
 model/batch shape can spend roughly 1–2 minutes compiling; the compiled kernels
 are cached and subsequent launches are much faster.
 
-The RTX 3090 default was selected with seed `20260714`, the same 11×11 local
-configuration, and eight 128-step rollouts at each candidate size. After
-discarding three compile/warm-up rollouts, median end-to-end training throughput
-over the remaining five was 5,714 steps/s at 512 environments, 6,041 steps/s at
-768 (+5.72%), and 5,999 steps/s at 1,024 (+4.98% versus 512). The prepared maze
-queue remained populated throughout the measured rollouts.
+The RTX 3090 default was revalidated on 2026-08-26 with the 11×11 continuous
+local configuration and eight 128-step rollouts at each candidate size. After
+discarding three compile/warm-up rollouts, median collector-plus-learner
+throughput over the remaining five was 6,532 steps/s at 512 environments,
+7,816 steps/s at 768 (+19.7%), and 7,185 steps/s at 1,024. At 768 environments,
+eight maze workers reached 7,816 steps/s versus 7,708 with 12 and 7,662 with 16;
+generation blocking was already negligible with eight.
+
+A CUDA-resident environment prototype matched observations, terminal flags,
+collisions, and executed actions exactly, with a maximum reward difference of
+`2.98e-8`. It reduced isolated 128-step environment time from 0.703 seconds to
+0.115 seconds, but its projected end-to-end gain was only 4.7% with four PPO
+epochs and approximately 16.6% before integration overhead with one epoch.
+The production trainer therefore retains the simpler vectorized CPU environment.
 
 Recurrent PPO defaults to finite fresh training. The 11×11 local budget is 100
 million transitions and scales linearly with the final maximum dimension (136
@@ -41,42 +78,50 @@ million for 15×15 and 191 million for 21×21). Explicit `--max-env-steps`,
 `--resume`, and `--target-only-stop` flags override those defaults. Target-only
 candidates are still checked on three deterministic, seed-separated suites.
 
-The resolved budget controls every recurrent schedule. RND cosine-decays to
-zero across the full run. The learning rate reaches `3e-5` at 80% progress;
-during the final 20% precision phase it cosine-decays to `3e-6`, while entropy
-anneals from `0.01` to `0.001`. Explicit target-only runs retain those floors.
+The resolved budget controls every recurrent schedule. RND defaults to `0.05`
+and cosine-decays to zero by two-thirds progress. For the default 100-million
+transition run, the learning rate decreases linearly from `3e-4` to `1.2e-4`
+over the first 50 million transitions, then cosine-decays monotonically to
+`3e-6`. Default continuous entropy stays at `0.003` until that precision phase
+and then anneals to `0.0003`. Explicit target-only runs retain those floors.
 
 Local episode limits use the maximum of 20 steps, four times shortest path, and
-twice the traversable-cell count. This provides a full depth-first exploration
-allowance independently of oracle path length. There is no default hard cap;
-`--max-episode-steps` adds one.
+twice the traversable-cell count. Continuous mode scales the path and
+exploration allowances by the inverse control-step scale. This provides a full
+depth-first exploration allowance independently of oracle path length. There
+is no default hard cap; `--max-episode-steps` adds one.
 
 Hard-maze replay defaults to 5%. Timed-out training mazes and their unique
 symmetries feed shape-specific bounded reservoirs; validation and benchmark
-mazes are never added. Replay ramps from zero at a 90% validation solve rate to
-its configured maximum at 99%.
+mazes are never added. Replay ramps from zero at a 60% validation solve rate to
+its configured maximum at 80%.
 
 Automatic curriculum is the default. It builds an odd size ladder in increments
 of four, probes 2,048 deterministic mazes per size, and stages the lower third,
 lower two-thirds, then unrestricted distribution using an eight-order
-depth-first discovery score. Three consecutive 90% validations promote a stage.
-Use `--curriculum-mode manual` for the legacy easy and medium distance ranges.
+depth-first discovery score. Three consecutive 70% validations promote a stage.
+Performance can promote sooner, but the default reserves the final 20% of a
+finite budget for unrestricted mazes. Configure or disable that boundary with
+`--curriculum-final-stage-fraction`. Use `--curriculum-mode manual` for the
+legacy easy and medium distance ranges.
 
 Maze generation uses Wilson's loop-erased random-walk algorithm. RTX workers
 return 64 grids per future and retain four queued batches per worker while
 preserving seeded submission order. Curriculum validation runs every 50,000
 transitions; final-distribution evaluation changes to every 500,000 transitions.
 
-Recurrent PPO uses a 128-unit GRU and 64-step truncated-BPTT sequences. The GRU
+Recurrent PPO uses a 512-unit GRU and 128-step truncated-BPTT sequences. The GRU
 hidden state persists across the complete episode; sequence length controls the
-gradient-history window, not inference memory lifetime. Minibatches contain 32
-sequences, preserving a 2,048-transition effective minibatch and the proven
-optimizer-update density. Learner telemetry records that effective size and the
-optimizer updates performed by every rollout.
+gradient-history window, not inference memory lifetime. Minibatches contain 16
+sequences, preserving a 2,048-transition effective minibatch. Learner telemetry
+records that effective size and the optimizer updates performed by every rollout.
+Target-KL stopping uses the mean
+nonnegative approximate KL over a complete epoch, so every rollout receives at
+least one full optimization epoch before later epochs can be skipped.
 
-Rollback-based precision recovery is disabled by default, including when a
-legacy checkpoint contains an active recovery window. Use
-`--precision-recovery` to opt in; the existing
+Rollback-based precision recovery is enabled during final-stage precision
+training after 20 evaluations without improvement. Use
+`--no-precision-recovery` to disable it; the existing
 `--precision-plateau-evals`, `--precision-recovery-steps`, and
 `--precision-recovery-lr-fraction` controls remain available for experiments.
 
@@ -93,14 +138,29 @@ conda run -n ml python MouseMaze/MouseAgent.py \
   --performance-profile rtx3090-fast
 ```
 
-Local 7×7 finite training:
+Local 5×5 discrete finite training:
 
 ```bash
 conda run -n ml python MouseMaze/MouseAgent.py \
   --train --no-resume --no-infer --no-dashboard \
-  --algorithm recurrent_ppo --observation-mode local --view-size 7 \
+  --algorithm recurrent_ppo --action-space discrete \
+  --observation-mode local --view-size 5 \
   --performance-profile rtx3090-fast
 ```
+
+Continuous ablation without distance shaping:
+
+```bash
+conda run -n ml python MouseMaze/MouseAgent.py \
+  --train --no-resume --no-infer --no-dashboard \
+  --algorithm recurrent_ppo --action-space continuous \
+  --observation-mode local --view-size 5 \
+  --distance-shaping-mode none --continuous-step-scale 0.25 \
+  --performance-profile rtx3090-fast
+```
+
+Continuous mode is rejected for DQN and feed-forward PPO because those agents
+do not implement a continuous action head.
 
 Use `--target-only-stop` to opt out of the finite transition cap. DQN and
 feed-forward PPO retain their existing bounded behavior.
@@ -127,8 +187,9 @@ transition and cannot be combined with `--updates-per-transition`.
 
 The optional dashboard retains a bounded whole-run chart history, reports
 percentages to two decimal places, and suppresses overlapping episode-axis
-labels. It remains useful interactively; use `--no-dashboard` for the highest
-headless throughput.
+labels. Pygame and its event loop run in a separate process; training publishes
+only the newest frame through a bounded, non-blocking queue, so a slow or closed
+window cannot stall collection. Use `--no-dashboard` for fully headless runs.
 
 For deterministic debugging, replace the performance profile with `strict`
 and normally reduce `--num-envs`.
@@ -156,7 +217,19 @@ conda run -n ml python MouseMaze/MouseAgent.py \
 The inference window is resizable and keeps the maze centered with square
 cells. In `local` observation mode, the policy's current observation footprint
 is outlined while the rest of the maze is dimmed. Press Escape or close the
-window to stop inference.
+window to stop inference. Use `--show-input-channels` to start with a labeled
+side panel showing the exact spatial channels supplied to the policy. Press
+`I` to toggle that panel while inference is running. The module-level
+`DEFAULT_SHOW_INPUT_CHANNELS` setting near the top of `MouseAgent.py` controls
+the default when neither CLI form is supplied; `--no-show-input-channels`
+overrides it for one run.
+
+The panel shows the channels enabled for the current model: full-map inputs use
+`Walls`, `Mouse`, and `Goal`; local inputs use `Walls` and `Goal`. Both modes
+may additionally include `Time remaining` and `Visit count`. Continuous inputs
+also show `Within-cell row`, `Within-cell col`, and `Previous collision`.
+Recurrent hidden state, previous executed displacement, and previous reward are
+not rendered as maps.
 
 Run the three deterministic held-out suites without training:
 
@@ -168,11 +241,15 @@ conda run -n ml python MouseMaze/MouseAgent.py \
 
 Inference and benchmark commands without `--save-path` select the newest valid
 timestamped frozen-best model and ignore `.latest.pth` sidecars. Pass an
-explicit path to load an archived or specific model.
+explicit path to load an archived or specific model. Curriculum-stage scores do
+not compete for the frozen-best checkpoint; the main `.pth` is created from
+unrestricted evaluation, while `.latest.pth` always retains resumable current
+training state.
 
-Checkpoints and logs use schema v3. Schema-v2 and earlier model artifacts remain
-archived but are intentionally rejected because they lack visited-map weights;
-train a fresh schema-v3 policy before inference or benchmarking.
+Checkpoints and logs use schema v9. Older model artifacts remain archived but
+are intentionally rejected because continuous observations, action likelihoods,
+and motion semantics changed. Loading infers both algorithm and action space
+before constructing the model; an explicit CLI mismatch is rejected.
 
 The exact full-map BFS planner remains available only as an environment sanity
 check:

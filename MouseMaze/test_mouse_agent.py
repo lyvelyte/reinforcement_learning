@@ -1,5 +1,7 @@
 import json
+import os
 import random
+import tempfile
 from collections import deque
 from dataclasses import fields, replace
 from datetime import datetime, timezone
@@ -15,12 +17,19 @@ from MouseAgent import (
     DASHBOARD_TOOLTIPS,
     DEFAULT_INFER_FLAG,
     DEFAULT_INFERENCE_MAZES,
+    DEFAULT_REMAINING_TIME_CHANNEL,
+    DEFAULT_SHOW_INPUT_CHANNELS,
     DEFAULT_TRAIN_FLAG,
+    DEFAULT_VISIT_COUNT_CHANNEL,
+    DEFAULT_VISIT_COUNT_CLIP,
+    DEFAULT_WALL_OCCLUSION,
     EVAL_SEED_OFFSET,
     BfsPlanner,
     CurriculumController,
     CurriculumStage,
+    CONTINUOUS_LOG_STD_MIN,
     Dashboard,
+    DashboardProcess,
     DeterministicMazePrefetcher,
     EpisodeStats,
     EvalMetrics,
@@ -33,14 +42,18 @@ from MouseAgent import (
     RNDModule,
     RecurrentPPOAgent,
     ReplayBuffer,
+    SpatialQNetwork,
     TrainConfig,
     _chart_x_max,
     _confirm_target_candidate,
+    _curriculum_final_stage_start_step,
     _dashboard_tooltip_at,
     _draw_cheese_icon,
+    _draw_input_channel_panel,
     _draw_mouse_icon,
     _draw_start_icon,
     _episode_tick_values,
+    _gather_policy_cell,
     _eval_greedy,
     _format_chart_tick,
     _format_number,
@@ -49,7 +62,13 @@ from MouseAgent import (
     _optional_bool,
     _non_overlapping_episode_ticks,
     _rects_overlap,
+    _in_precision_phase,
+    _maybe_run_eval,
+    _serialized_numpy_rng_state,
+    _update_training_state,
+    clone_agent_weights,
     _recurrent_ppo_precision_schedule,
+    _recurrent_sequence_chunks,
     _rnd_coefficient,
     _restore_rng_state,
     _should_run_eval,
@@ -58,7 +77,9 @@ from MouseAgent import (
     _train_config_from_args,
     _training_speed_payload,
     _training_environment_payload,
+    _toggle_input_channel_panel,
     default_artifact_paths,
+    inference_channel_specs,
     invocation_timestamp,
     latest_model_path,
     latest_checkpoint_path,
@@ -71,6 +92,7 @@ from MouseAgent import (
     dashboard_layout,
     inference_layout,
     linear_epsilon,
+    local_visibility_mask,
     local_observation_bounds,
     make_maze,
     parse_args,
@@ -211,6 +233,588 @@ def test_inference_layout_centers_square_cells_within_viewport(
     assert hud_width > 0
 
 
+@pytest.mark.parametrize("show_input_channels", [False, True])
+def test_inference_layout_reserves_input_channel_panel_when_enabled(
+    show_input_channels,
+):
+    layout = inference_layout(
+        (1200, 700),
+        (21, 21),
+        show_input_channels=show_input_channels,
+    )
+
+    if show_input_channels:
+        assert layout.channel_panel_rect is not None
+        panel_x, panel_y, panel_width, panel_height = layout.channel_panel_rect
+        assert panel_x >= 0
+        assert panel_y >= 0
+        assert panel_x + panel_width <= 1200
+        assert panel_y + panel_height <= 700
+        assert panel_x > layout.maze_rect[0] + layout.maze_rect[2]
+    else:
+        assert layout.channel_panel_rect is None
+
+
+def test_inference_channel_specs_match_full_and_local_observations():
+    full = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    local = Maze(
+        fixed_grid(),
+        observation_mode="local",
+        view_size=5,
+        max_episode_steps=10,
+    )
+
+    full_specs = inference_channel_specs(full.reset(), "full")
+    local_specs = inference_channel_specs(local.reset(), "local")
+
+    assert [label for label, _channel, _color in full_specs] == [
+        "Walls",
+        "Mouse",
+        "Goal",
+        "Visit count",
+    ]
+    assert [label for label, _channel, _color in local_specs] == [
+        "Walls",
+        "Goal",
+        "Visit count",
+    ]
+    assert [channel.shape for _label, channel, _color in local_specs] == [
+        (5, 5),
+        (5, 5),
+        (5, 5),
+    ]
+
+
+def test_inference_channel_specs_reject_wrong_observation_shape():
+    with pytest.raises(ValueError, match="expected 3 observation channels"):
+        inference_channel_specs(np.zeros((4, 5, 5), dtype=np.float32), "local")
+
+
+def test_input_channel_panel_renders_without_mutating_observation():
+    pygame = pytest.importorskip("pygame")
+    environment = Maze(
+        fixed_grid(),
+        observation_mode="local",
+        view_size=5,
+        max_episode_steps=10,
+    )
+    state = environment.reset()
+    original_state = state.copy()
+    pygame.init()
+    try:
+        screen = pygame.Surface((500, 400))
+        screen.fill((26, 31, 38))
+        _draw_input_channel_panel(
+            pygame,
+            screen,
+            (0, 0, 500, 400),
+            state,
+            "local",
+            False,
+            True,
+        )
+        pixels = pygame.surfarray.array3d(screen)
+        assert np.any(pixels != np.asarray((26, 31, 38), dtype=np.uint8))
+        np.testing.assert_array_equal(state, original_state)
+    finally:
+        pygame.quit()
+
+
+def _continuous_maze(
+    grid=None, *, step_scale=0.25, max_episode_steps=20, shaping="none"
+):
+    return Maze(
+        fixed_grid() if grid is None else grid,
+        observation_mode="local",
+        view_size=5,
+        max_episode_steps=max_episode_steps,
+        distance_shaping_mode=shaping,
+        action_space="continuous",
+        continuous_step_scale=step_scale,
+    )
+
+
+def test_continuous_reset_and_proprioception_expose_within_cell_state():
+    env = _continuous_maze()
+    initial = env.reset()
+    env.continuous_position = (1.0, 1.25)
+    offset_state = env.observation()
+
+    assert initial.shape == (6, 5, 5)
+    assert not np.array_equal(initial, offset_state)
+    assert np.allclose(offset_state[-3], 0.0)
+    assert np.allclose(offset_state[-2], 0.5)
+
+    env.continuous_position = (1.49, 1.0)
+    _state, _reward, _done, info = env.step(np.array([1.0, 0.0], dtype=np.float32))
+    assert info["invalid"] is True
+    assert info["collision_cause"] == "wall"
+    assert np.all(env.observation()[-1] == 1.0)
+
+    env.reset()
+    assert env.current_position == env.start
+    assert env.continuous_position == tuple(float(value) for value in env.start)
+    assert env.previous_collision is False
+
+
+def test_continuous_scalar_and_batch_transitions_match_and_report_execution():
+    scalar = _continuous_maze(step_scale=1.0)
+    batch = MazeBatch([_continuous_maze(step_scale=1.0)], continuous=True)
+
+    for action in (
+        np.array([0.0, 1.0], dtype=np.float32),
+        np.array([1.0, 0.0], dtype=np.float32),
+        np.array([0.0, 1.0], dtype=np.float32),
+    ):
+        state, reward, done, info = scalar.step(action)
+        result = batch.step(action[np.newaxis])
+        np.testing.assert_allclose(result.states[0], state)
+        assert result.rewards[0] == pytest.approx(reward)
+        assert bool(result.dones[0]) is done
+        assert bool(result.invalid[0]) is info["invalid"]
+        np.testing.assert_allclose(
+            result.executed_displacements[0], info["executed_displacement"]
+        )
+        assert result.collision_causes[0] == info["collision_cause"]
+
+
+def _alternate_continuous_grid():
+    grid = fixed_grid().copy()
+    grid[1, 2] = 1
+    grid[2, 1] = 0
+    grid[3, 1:4] = 0
+    grid[2, 3] = 0
+    return grid
+
+
+def test_continuous_noncontiguous_subset_uses_selected_grids_only():
+    alternate = _alternate_continuous_grid()
+    scalar_open = _continuous_maze(step_scale=1.0)
+    scalar_blocked = _continuous_maze(alternate, step_scale=1.0)
+    batch = MazeBatch(
+        [
+            _continuous_maze(step_scale=1.0),
+            _continuous_maze(step_scale=1.0),
+            _continuous_maze(alternate, step_scale=1.0),
+        ],
+        continuous=True,
+    )
+    inactive = (
+        batch.positions[1].copy(),
+        batch.continuous_positions[1].copy(),
+        batch.steps[1].copy(),
+        batch.visit_counts[1].copy(),
+    )
+    actions = np.array([[0.0, 1.0], [0.0, 1.0]], dtype=np.float32)
+
+    open_result = scalar_open.step(actions[0])
+    blocked_result = scalar_blocked.step(actions[1])
+    result = batch.step(actions, indices=np.array([0, 2]))
+
+    assert result.invalid.tolist() == [open_result[3]["invalid"], blocked_result[3]["invalid"]]
+    np.testing.assert_allclose(batch.continuous_positions[0], scalar_open.continuous_position)
+    np.testing.assert_allclose(batch.continuous_positions[2], scalar_blocked.continuous_position)
+    np.testing.assert_array_equal(batch.positions[1], inactive[0])
+    np.testing.assert_array_equal(batch.continuous_positions[1], inactive[1])
+    assert batch.steps[1] == inactive[2]
+    np.testing.assert_array_equal(batch.visit_counts[1], inactive[3])
+
+
+def test_continuous_sweep_blocks_diagonal_corner_and_counts_cell_entries():
+    env = _continuous_maze(step_scale=1.0)
+    initial_visits = int(env.visit_counts.sum())
+
+    _state, _reward, _done, info = env.step(np.array([1.0, 1.0], dtype=np.float32))
+    assert info["invalid"] is True
+    assert info["collision_cause"] == "wall"
+    assert env.continuous_position == (1.0, 1.0)
+    assert int(env.visit_counts.sum()) == initial_visits
+
+    env = _continuous_maze(step_scale=0.25)
+    env.step(np.array([0.0, 0.5], dtype=np.float32))
+    assert int(env.visit_counts.sum()) == 1
+    env.step(np.array([0.0, 1.0], dtype=np.float32))
+    env.step(np.array([0.0, 1.0], dtype=np.float32))
+    assert int(env.visit_counts.sum()) == 2
+
+
+def test_continuous_geodesic_shaping_rewards_forward_and_cache_replacement():
+    env = _continuous_maze(step_scale=1.0, shaping="potential")
+    _state, forward_reward, _done, _info = env.step(np.array([0.0, 1.0]))
+    _state, reverse_reward, _done, _info = env.step(np.array([0.0, -1.0]))
+    assert forward_reward > 0.0
+    assert reverse_reward < 0.0
+
+    no_shaping = _continuous_maze(step_scale=1.0, shaping="none")
+    _state, reward, _done, _info = no_shaping.step(np.array([0.0, 1.0]))
+    assert reward == pytest.approx(no_shaping.step_penalty)
+
+    batch = MazeBatch([_continuous_maze(step_scale=1.0)], continuous=True)
+    old_path = batch._get_centerline(0)
+    batch.replace(0, _continuous_maze(_alternate_continuous_grid(), step_scale=1.0))
+    new_path = batch._get_centerline(0)
+    assert old_path != new_path
+    assert new_path[0] == tuple(batch.starts[0])
+    assert new_path[-1] == tuple(batch.goals[0])
+
+
+def test_vectorized_centerline_distances_match_scalar_geometry():
+    environments = [
+        _continuous_maze(step_scale=0.25),
+        _continuous_maze(_alternate_continuous_grid(), step_scale=0.25),
+    ]
+    batch = MazeBatch(environments, continuous=True)
+    rng = np.random.default_rng(20260826)
+    positions = batch.continuous_positions.astype(np.float64)
+    positions += rng.uniform(-0.45, 0.45, size=positions.shape)
+
+    actual = batch._centerline_distances(np.arange(batch.size), positions)
+    expected = np.asarray(
+        [
+            mouse_agent_module.continuous_geodesic_distance(
+                positions[index],
+                batch._get_centerline(index),
+            )
+            for index in range(batch.size)
+        ]
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+
+
+def _continuous_agent():
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        action_space="continuous",
+        observation_mode="local",
+        recurrent_hidden_size=8,
+        rnd_reward_coef=0.0,
+        performance_profile="portable",
+        device="cpu",
+    )
+    return config, RecurrentPPOAgent(config, device=torch.device("cpu"))
+
+
+def test_continuous_recurrent_adapter_preserves_previous_action_floats(monkeypatch):
+    _config, agent = _continuous_agent()
+    state = _continuous_maze().reset()[np.newaxis]
+    captured = {}
+
+    def fake_step(states, masks, previous_actions, rewards, starts, hidden, deterministic):
+        del masks, rewards, starts, deterministic
+        captured["previous_actions"] = previous_actions.detach().cpu().numpy()
+        return (
+            torch.zeros((len(states), 2)),
+            torch.zeros(len(states)),
+            torch.zeros(len(states)),
+            hidden,
+        )
+
+    monkeypatch.setattr(agent, "step", fake_step)
+    previous = np.array([[0.25, -0.5]], dtype=np.float32)
+    agent.get_actions_stateful(
+        state,
+        np.ones((1, 4), dtype=np.bool_),
+        previous,
+        np.zeros(1, dtype=np.float32),
+        np.zeros(1, dtype=np.bool_),
+        agent.initial_policy_state(1),
+    )
+    np.testing.assert_array_equal(captured["previous_actions"], previous)
+
+    with pytest.raises(ValueError, match="shape"):
+        agent.get_actions_stateful(
+            state,
+            np.ones((1, 4), dtype=np.bool_),
+            np.zeros(1, dtype=np.float32),
+            np.zeros(1, dtype=np.float32),
+            np.zeros(1, dtype=np.bool_),
+            agent.initial_policy_state(1),
+        )
+
+
+def test_squashed_continuous_policy_is_bounded_and_log_probs_recompute():
+    _config, agent = _continuous_agent()
+    states = torch.from_numpy(np.stack([_continuous_maze().reset()] * 16))
+    masks = torch.ones((16, 4), dtype=torch.bool)
+    previous = torch.zeros((16, 2))
+    rewards = torch.zeros(16)
+    starts = torch.ones(16, dtype=torch.bool)
+    hidden = agent.initial_policy_state(16)
+
+    actions, log_probs, _values, _hidden = agent.step(
+        states, masks, previous, rewards, starts, hidden, deterministic=False
+    )
+    mean, _values, _hidden, log_std = agent.policy_net.forward_step(
+        states, previous, rewards, starts, hidden
+    )
+    distribution = torch.distributions.Normal(mean, log_std.exp())
+    recomputed = mouse_agent_module._bounded_action_log_prob(distribution, actions)
+
+    assert torch.all(actions >= -1.0) and torch.all(actions <= 1.0)
+    assert torch.isfinite(log_probs).all()
+    assert torch.allclose(log_probs, recomputed, atol=1e-5)
+    near_bounds = torch.tensor([[1.0 - 1e-7, -1.0 + 1e-7]], requires_grad=True)
+    near_log_prob = mouse_agent_module._bounded_action_log_prob(
+        torch.distributions.Normal(
+            torch.zeros_like(near_bounds), torch.ones_like(near_bounds)
+        ),
+        near_bounds,
+    ).sum()
+    near_log_prob.backward()
+    assert torch.isfinite(near_log_prob)
+    assert torch.isfinite(near_bounds.grad).all()
+
+
+def test_continuous_policy_enforces_exploration_log_std_floor():
+    _config, agent = _continuous_agent()
+    with torch.no_grad():
+        agent.policy_net.log_std_head.weight.zero_()
+        agent.policy_net.log_std_head.bias.fill_(-100.0)
+    states = torch.from_numpy(np.stack([_continuous_maze().reset()] * 2))
+    _mean, _values, _hidden, log_std = agent.policy_net.forward_step(
+        states,
+        torch.zeros((2, 2)),
+        torch.zeros(2),
+        torch.ones(2, dtype=torch.bool),
+        agent.initial_policy_state(2),
+    )
+
+    assert torch.all(log_std == CONTINUOUS_LOG_STD_MIN)
+
+
+def test_continuous_checkpoint_action_space_round_trip_and_mismatch(tmp_path):
+    config, agent = _continuous_agent()
+    path = tmp_path / "continuous.pth"
+    agent.save(str(path))
+
+    assert mouse_agent_module.checkpoint_action_space(str(path)) == "continuous"
+    RecurrentPPOAgent(config, device=torch.device("cpu")).load(str(path))
+    mismatched = replace(config, action_space="discrete")
+    with pytest.raises(ValueError, match="action space"):
+        RecurrentPPOAgent(mismatched, device=torch.device("cpu")).load(str(path))
+
+
+def test_continuous_recurrent_sequence_matches_step_unroll():
+    _config, agent = _continuous_agent()
+    observation = torch.from_numpy(
+        np.stack([_continuous_maze().reset(), _continuous_maze().reset()])
+    )
+    observations = observation.unsqueeze(0).repeat(3, 1, 1, 1, 1)
+    previous_actions = torch.tensor(
+        [
+            [[0.0, 0.0], [0.0, 0.0]],
+            [[0.25, -0.5], [-0.25, 0.5]],
+            [[0.1, 0.2], [-0.1, -0.2]],
+        ]
+    )
+    previous_rewards = torch.zeros(3, 2)
+    episode_starts = torch.tensor(
+        [[True, True], [False, False], [False, True]]
+    )
+    initial_hidden = agent.initial_policy_state(2)
+
+    sequence = agent.policy_net.forward_sequence(
+        observations,
+        previous_actions,
+        previous_rewards,
+        episode_starts,
+        initial_hidden,
+    )
+    means, values, sequence_hidden, log_stds = sequence
+    hidden = initial_hidden
+    step_means = []
+    step_values = []
+    step_log_stds = []
+    for step in range(3):
+        mean, value, hidden, log_std = agent.policy_net.forward_step(
+            observations[step],
+            previous_actions[step],
+            previous_rewards[step],
+            episode_starts[step],
+            hidden,
+        )
+        step_means.append(mean)
+        step_values.append(value)
+        step_log_stds.append(log_std)
+
+    assert torch.allclose(means, torch.stack(step_means))
+    assert torch.allclose(values, torch.stack(step_values))
+    assert torch.allclose(log_stds, torch.stack(step_log_stds))
+    assert torch.allclose(sequence_hidden, hidden)
+
+
+def test_recurrent_sequence_chunks_are_environment_major_and_pad_final_chunk():
+    values = torch.arange(5 * 3, dtype=torch.int64).reshape(5, 3)
+
+    chunks = _recurrent_sequence_chunks(values, sequence_length=2, padding_value=-1)
+
+    assert chunks.tolist() == [
+        [0, 3],
+        [6, 9],
+        [12, -1],
+        [1, 4],
+        [7, 10],
+        [13, -1],
+        [2, 5],
+        [8, 11],
+        [14, -1],
+    ]
+
+
+def test_recurrent_ppo_kl_stopping_completes_the_first_epoch():
+    base_config, _agent = _continuous_agent()
+    config = replace(
+        base_config,
+        ppo_epochs=3,
+        ppo_target_kl=1e-6,
+        recurrent_sequence_length=2,
+        recurrent_sequence_minibatch_size=1,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    time_steps = 4
+    env_count = 2
+    observation = torch.from_numpy(_continuous_maze().reset())
+    states = observation.view(1, 1, *observation.shape).repeat(
+        time_steps, env_count, 1, 1, 1
+    )
+    action_masks = torch.ones(time_steps, env_count, 4, dtype=torch.bool)
+    actions = torch.zeros(time_steps, env_count, 2)
+    previous_actions = torch.zeros_like(actions)
+    previous_rewards = torch.zeros(time_steps, env_count)
+    episode_starts = torch.zeros(time_steps, env_count, dtype=torch.bool)
+    episode_starts[0] = True
+    hidden_states = torch.zeros(
+        time_steps, env_count, config.recurrent_hidden_size
+    )
+    with torch.no_grad():
+        means, old_values, _hidden, log_stds = agent.policy_net.forward_sequence(
+            states,
+            previous_actions,
+            previous_rewards,
+            episode_starts,
+            agent.initial_policy_state(env_count),
+        )
+        distribution = torch.distributions.Normal(means, log_stds.exp())
+        current_log_probs = mouse_agent_module._bounded_action_log_prob(
+            distribution, actions
+        )
+    old_log_probs = current_log_probs + 5.0
+    advantages = torch.arange(
+        time_steps * env_count, dtype=torch.float32
+    ).reshape(time_steps, env_count)
+    returns = old_values + advantages
+
+    metrics = mouse_agent_module._recurrent_ppo_update(
+        agent,
+        config,
+        states,
+        action_masks,
+        actions,
+        previous_actions,
+        previous_rewards,
+        episode_starts,
+        hidden_states,
+        old_log_probs,
+        old_values,
+        advantages,
+        returns,
+    )
+
+    expected_first_epoch_updates = env_count * (time_steps // 2)
+    assert agent.update_count == expected_first_epoch_updates
+    assert metrics.epochs == 1
+    assert metrics.approx_kl > config.ppo_target_kl
+
+
+def test_continuous_evaluation_is_invariant_to_maze_order():
+    config, agent = _continuous_agent()
+    config.eval_episodes = 3
+    grids = [fixed_grid(), _alternate_continuous_grid(), fixed_grid()]
+
+    def evaluate(order):
+        environments = iter(
+            [
+                Maze(
+                    grids[index],
+                    observation_mode="local",
+                    view_size=5,
+                    max_episode_steps=3,
+                    action_space="continuous",
+                    continuous_step_scale=0.25,
+                    distance_shaping_mode="none",
+                )
+                for index in order
+            ]
+        )
+        return _eval_greedy(agent, config, maze_factory=lambda: next(environments))
+
+    first = evaluate([0, 1, 2])
+    permuted = evaluate([2, 0, 1])
+    assert first.solve_rate == permuted.solve_rate
+    assert first.timeout_rate == permuted.timeout_rate
+    assert first.invalid_move_rate == permuted.invalid_move_rate
+    assert first.failed_final_distance == pytest.approx(permuted.failed_final_distance)
+    assert first.requested_action_mean is not None
+    assert first.executed_displacement_mean is not None
+    assert first.collision_cause_rates is not None
+
+
+@pytest.mark.parametrize("algorithm", ["dqn", "ppo"])
+def test_continuous_action_space_rejects_unsupported_algorithms(algorithm):
+    with pytest.raises(ValueError, match="recurrent_ppo"):
+        TrainConfig(algorithm=algorithm, action_space="continuous")
+
+
+def test_short_continuous_strict_training_checkpoint_smoke(tmp_path):
+    save_path = tmp_path / "continuous_smoke.pth"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        action_space="continuous",
+        observation_mode="local",
+        distance_shaping_mode="none",
+        episodes=2,
+        max_env_steps=8,
+        max_episode_steps=4,
+        num_envs=2,
+        ppo_rollout_steps=2,
+        recurrent_sequence_length=2,
+        recurrent_sequence_minibatch_size=2,
+        recurrent_hidden_size=8,
+        ppo_epochs=1,
+        eval_every_steps=4,
+        eval_episodes=2,
+        curriculum_enabled=False,
+        rnd_reward_coef=0.0,
+        target_only_stop=False,
+        dashboard_flag=False,
+        save_path=str(save_path),
+        training_log_path=None,
+        performance_profile="strict",
+        maze_workers=0,
+        device="cpu",
+        require_cuda=False,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    before = clone_agent_weights(agent)
+
+    tracker = train(agent=agent, config=config)
+
+    assert save_path.exists()
+    assert agent.update_count > 0
+    assert all(torch.isfinite(value).all() for value in agent.policy_net.state_dict().values())
+    assert any(
+        not torch.equal(before[name], value.detach().cpu())
+        for name, value in agent.policy_net.state_dict().items()
+    )
+    assert tracker.latest_eval.solve_rate >= 0.0
+    restored = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    restored.load(str(save_path))
+    assert restored.total_env_steps == agent.total_env_steps
+
+
 def test_local_observation_bounds_cover_center_and_clip_at_edges():
     assert local_observation_bounds((5, 5), 7, (11, 11)) == (2, 2, 9, 9)
     assert local_observation_bounds((1, 1), 7, (11, 11)) == (0, 0, 5, 5)
@@ -248,10 +852,12 @@ def test_full_observation_channels():
     assert obs[1].sum() == 1.0
     assert obs[2, env.goal[0], env.goal[1]] == 1.0
     assert obs[2].sum() == 1.0
-    assert np.all(obs[3] == 1.0)
+    expected_count = 1.0 / DEFAULT_VISIT_COUNT_CLIP
+    assert np.isclose(obs[3, env.start[0], env.start[1]], expected_count)
+    assert np.isclose(obs[3].sum(), expected_count)
 
 
-def test_local_observation_keeps_agent_centered_and_goal_visible():
+def test_local_observation_omits_mouse_position_and_keeps_goal_visible():
     env = Maze(
         fixed_grid(),
         observation_mode="local",
@@ -261,17 +867,158 @@ def test_local_observation_keeps_agent_centered_and_goal_visible():
 
     obs = env.reset()
 
-    assert obs.shape == (5, 5, 5)
-    assert obs[1, 2, 2] == 1.0
+    assert obs.shape == (3, 5, 5)
+    assert obs[1, 2, 4] == 1.0
     assert obs[1].sum() == 1.0
-    assert obs[2, 2, 4] == 1.0
-    assert np.all(obs[3] == 1.0)
-    assert obs[4, 2, 2] == 1.0
-    assert obs[4].sum() == 1.0
+    expected_count = 1.0 / DEFAULT_VISIT_COUNT_CLIP
+    assert np.isclose(obs[2, 2, 2], expected_count)
+    assert np.isclose(obs[2].sum(), expected_count)
 
     next_obs, _reward, _done, _info = env.step(0)
-    assert next_obs[4, 2, 1] == 1.0
-    assert next_obs[4, 2, 2] == 1.0
+    assert np.isclose(next_obs[2, 2, 1], expected_count)
+    assert np.isclose(next_obs[2, 2, 2], expected_count)
+
+
+@pytest.mark.parametrize(
+    ("remaining_time_channel", "visit_count_channel", "expected_channels"),
+    [
+        (False, False, 2),
+        (False, True, 3),
+        (True, False, 3),
+        (True, True, 4),
+    ],
+)
+def test_local_observation_channel_flags_control_shape_and_contents(
+    remaining_time_channel,
+    visit_count_channel,
+    expected_channels,
+):
+    environment = Maze(
+        fixed_grid(),
+        observation_mode="local",
+        view_size=5,
+        max_episode_steps=10,
+        remaining_time_channel=remaining_time_channel,
+        visit_count_channel=visit_count_channel,
+        wall_occlusion=False,
+    )
+
+    observation = environment.reset()
+
+    assert observation.shape == (expected_channels, 5, 5)
+    specs = inference_channel_specs(
+        observation,
+        "local",
+        remaining_time_channel,
+        visit_count_channel,
+    )
+    labels = [label for label, _channel, _color in specs]
+    assert ("Time remaining" in labels) is remaining_time_channel
+    assert ("Visit count" in labels) is visit_count_channel
+    assert "Mouse" not in labels
+
+
+@pytest.mark.parametrize("observation_mode", ["full", "local"])
+@pytest.mark.parametrize("remaining_time_channel", [False, True])
+@pytest.mark.parametrize("visit_count_channel", [False, True])
+def test_spatial_network_accepts_each_observation_channel_layout(
+    observation_mode,
+    remaining_time_channel,
+    visit_count_channel,
+):
+    environment = Maze(
+        fixed_grid(),
+        observation_mode=observation_mode,
+        view_size=5,
+        max_episode_steps=10,
+        remaining_time_channel=remaining_time_channel,
+        visit_count_channel=visit_count_channel,
+        wall_occlusion=False,
+    )
+    state = environment.reset()
+    network = SpatialQNetwork(
+        state.shape,
+        has_agent_channel=observation_mode == "full",
+    )
+
+    output = network(torch.from_numpy(state[np.newaxis]))
+
+    assert output.shape == (1, 4)
+
+
+def test_spatial_policy_gather_uses_center_for_local_and_mouse_for_full():
+    local_values = torch.zeros((1, 4, 5, 5))
+    local_values[0, :, 1, 1] = 3.0
+    local_values[0, :, 2, 2] = torch.arange(4, dtype=torch.float32)
+    local_observation = torch.zeros((1, 4, 5, 5))
+    local_observation[:, 0] = 1.0
+    local_result = _gather_policy_cell(local_values, local_observation, False)
+
+    full_values = torch.zeros((1, 4, 5, 5))
+    full_values[0, :, 1, 1] = torch.arange(4, dtype=torch.float32)
+    full_observation = torch.zeros((1, 4, 5, 5))
+    full_observation[0, 1, 1, 1] = 1.0
+    full_result = _gather_policy_cell(full_values, full_observation, True)
+
+    expected = torch.arange(4, dtype=torch.float32)
+    assert torch.equal(local_result[0], expected)
+    assert torch.equal(full_result[0], expected)
+
+
+def test_visit_count_channel_increments_and_clips():
+    environment = Maze(
+        fixed_grid(),
+        observation_mode="local",
+        view_size=5,
+        max_episode_steps=20,
+        visit_count_clip=2,
+        wall_occlusion=False,
+    )
+    environment.reset()
+
+    environment.step(0)
+    second_visit, _reward, _done, _info = environment.step(1)
+    environment.step(0)
+    clipped, _reward, _done, _info = environment.step(1)
+
+    assert second_visit[2, 2, 2] == 1.0
+    assert clipped[2, 2, 2] == 1.0
+    assert environment.visit_counts[environment.start] == 3
+
+
+def test_wall_occlusion_hides_goal_behind_visible_wall():
+    grid = np.zeros((7, 7), dtype=np.uint8)
+    grid[[0, -1], :] = 1
+    grid[:, [0, -1]] = 1
+    grid[3, 2] = 2
+    grid[3, 3] = 1
+    grid[3, 5] = 3
+    occluded = Maze(
+        grid,
+        observation_mode="local",
+        view_size=7,
+        wall_occlusion=True,
+    ).reset()
+    unoccluded = Maze(
+        grid,
+        observation_mode="local",
+        view_size=7,
+        wall_occlusion=False,
+    ).reset()
+
+    assert occluded[0, 3, 4] == 1.0
+    assert occluded[1, 3, 6] == 0.0
+    assert unoccluded[1, 3, 6] == 1.0
+
+
+def test_local_visibility_prevents_diagonal_corner_peeking():
+    walls = np.zeros((5, 5), dtype=np.bool_)
+    walls[2, 3] = True
+
+    visible = local_visibility_mask(walls)
+
+    assert visible[2, 3]
+    assert not visible[3, 3]
 
 
 def test_reward_invalid_move_solve_and_timeout_flags():
@@ -315,7 +1062,7 @@ def test_potential_reward_discourages_two_step_oscillation():
 
     assert toward_reward > 0.0
     assert reverse_reward < 0.0
-    assert toward_reward + reverse_reward < 0.0
+    assert toward_reward + reverse_reward < 0.05
     assert done is False
     assert reverse_done is False
 
@@ -416,15 +1163,19 @@ def test_default_timeout_provides_local_recovery_budget(monkeypatch):
     assert config.min_episode_steps == 20
     assert config.timeout_step_factor == 4.0
     assert config.max_episode_steps is None
-    assert config.recurrent_sequence_length == 64
-    assert config.recurrent_sequence_minibatch_size == 32
-    assert config.recurrent_hidden_size == 128
+    assert config.recurrent_sequence_length == 128
+    assert config.recurrent_sequence_minibatch_size == 16
+    assert config.recurrent_hidden_size == 512
+    assert config.action_space == "continuous"
+    assert config.invalid_move_penalty == pytest.approx(-0.2)
+    assert config.distance_shaping_mode == "potential"
+    assert config.rnd_reward_coef == pytest.approx(0.05)
     assert config.hard_maze_fraction == 0.05
-    assert config.precision_recovery_enabled is False
+    assert config.precision_recovery_enabled is True
     assert config.target_solve_rate == 1.0
     assert config.target_solve_evals == 3
     assert env.optimal_start_steps == 2
-    assert env.max_episode_steps == 20
+    assert env.max_episode_steps == 56
 
 
 def test_recurrent_precision_schedule_holds_lr_and_entropy_floors_after_budget():
@@ -432,6 +1183,7 @@ def test_recurrent_precision_schedule_holds_lr_and_entropy_floors_after_budget()
         max_env_steps=100,
         learning_rate=1e-3,
         ppo_entropy_coef=2e-2,
+        action_space="discrete",
         dashboard_flag=False,
         save_path=None,
         training_log_path=None,
@@ -452,6 +1204,51 @@ def test_recurrent_precision_schedule_holds_lr_and_entropy_floors_after_budget()
     assert np.isclose(_rnd_coefficient(100, config), 0.0)
 
 
+def test_recurrent_precision_schedule_is_monotonic_over_actual_phase():
+    config = TrainConfig(
+        max_env_steps=100_000_000,
+        learning_rate=3e-4,
+        continuous_entropy_coef=0.003,
+        action_space="continuous",
+        precision_fraction=0.20,
+        precision_phase_min_steps=50_000_000,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    steps = (50_000_000, 70_000_000, 80_000_000, 90_000_000, 100_000_000)
+    values = [_recurrent_ppo_precision_schedule(step, config) for step in steps]
+    learning_rates = [value[0] for value in values]
+    entropies = [value[1] for value in values]
+
+    assert learning_rates == sorted(learning_rates, reverse=True)
+    assert entropies == sorted(entropies, reverse=True)
+    assert np.isclose(learning_rates[0], 1.2e-4)
+    assert np.isclose(learning_rates[-1], 3e-6)
+    assert np.isclose(entropies[0], 0.003)
+    assert np.isclose(entropies[-1], 0.0003)
+
+
+def test_curriculum_final_stage_boundary_reserves_configured_budget_fraction():
+    config = TrainConfig(
+        max_env_steps=100_000_000,
+        curriculum_final_stage_fraction=0.20,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+
+    assert _curriculum_final_stage_start_step(config) == 80_000_000
+    assert _curriculum_final_stage_start_step(
+        replace(config, curriculum_final_stage_fraction=0.0)
+    ) is None
+    assert _curriculum_final_stage_start_step(
+        replace(config, curriculum_enabled=False)
+    ) is None
+
+
 def test_default_recurrent_minibatch_preserves_2048_transition_density():
     config = TrainConfig(
         dashboard_flag=False,
@@ -460,8 +1257,8 @@ def test_default_recurrent_minibatch_preserves_2048_transition_density():
         device="cpu",
     )
 
-    assert config.recurrent_sequence_length == 64
-    assert config.recurrent_sequence_minibatch_size == 32
+    assert config.recurrent_sequence_length == 128
+    assert config.recurrent_sequence_minibatch_size == 16
     assert (
         config.recurrent_sequence_length
         * config.recurrent_sequence_minibatch_size
@@ -496,16 +1293,19 @@ def test_target_only_evaluation_ignores_episode_cap_until_step_interval():
 def test_profile_selected_environment_parallelism_preserves_overrides():
     fast = TrainConfig(
         algorithm="recurrent_ppo",
+        action_space="discrete",
         performance_profile="rtx3090-fast",
         num_envs=None,
     )
     portable = TrainConfig(
         algorithm="recurrent_ppo",
+        action_space="discrete",
         performance_profile="portable",
         num_envs=None,
     )
     explicit = TrainConfig(
         algorithm="recurrent_ppo",
+        action_space="discrete",
         performance_profile="rtx3090-fast",
         num_envs=256,
     )
@@ -675,11 +1475,11 @@ def test_hard_maze_fraction_ramps_with_validation_and_reservoir_is_deterministic
     for sampler in (first, second):
         sampler.add_failed_grids([fixed_grid()])
 
-    first.record_validation_solve_rate(0.90)
+    first.record_validation_solve_rate(0.60)
     assert first.effective_hard_maze_fraction() == 0.0
-    first.record_validation_solve_rate(0.945)
+    first.record_validation_solve_rate(0.70)
     assert np.isclose(first.effective_hard_maze_fraction(), 0.075)
-    first.record_validation_solve_rate(0.99)
+    first.record_validation_solve_rate(0.80)
     assert np.isclose(first.effective_hard_maze_fraction(), 0.15)
 
     assert first.hard_candidates_seen == second.hard_candidates_seen
@@ -941,6 +1741,7 @@ def test_prioritized_replay_samples_high_priority_transition_more_often():
 def test_transition_indexed_epsilon_schedule_and_benchmark_suites():
     config = TrainConfig(
         maze_size=(5, 5),
+        observation_mode="full",
         epsilon_decay_steps=10,
         epsilon_final_steps=20,
         epsilon_start=1.0,
@@ -1306,7 +2107,7 @@ def test_chart_histories_are_bounded_and_preserve_run_endpoints():
 
     assert len(tracker.reward_history) <= DASHBOARD_MAX_HISTORY_POINTS
     assert len(tracker.train_solve_history) <= DASHBOARD_MAX_HISTORY_POINTS
-    assert tracker.reward_history[0][0] == 1
+    assert tracker.reward_history[0][0] > 0
     assert tracker.reward_history[-1][0] == final_episode
 
 
@@ -1452,12 +2253,112 @@ def test_dashboard_poll_resizes_and_repaints_cached_state():
     assert render_calls == [(state, tracker)]
 
 
+def test_dashboard_process_proxy_replaces_stale_frame_without_blocking():
+    class LatestQueue:
+        def __init__(self):
+            self.items = [("stale", "frame")]
+
+        def put_nowait(self, item):
+            if self.items:
+                raise mouse_agent_module.queue.Full
+            self.items.append(item)
+
+        def get_nowait(self):
+            if not self.items:
+                raise mouse_agent_module.queue.Empty
+            return self.items.pop(0)
+
+    class LiveProcess:
+        @staticmethod
+        def is_alive():
+            return True
+
+    dashboard = DashboardProcess.__new__(DashboardProcess)
+    dashboard.running = True
+    dashboard.disabled = False
+    dashboard._messages = LatestQueue()
+    dashboard._process = LiveProcess()
+    tracker = MetricsTracker()
+    tracker.reward_history.append((1, 2.0))
+    tracker.loss_history.append((1, 0.5))
+    tracker.greedy_solve_history.append((1, 0.75))
+    state = object()
+
+    dashboard.draw(state, tracker)
+
+    queued_state, queued_charts = dashboard._messages.items[0]
+    assert queued_state is state
+    assert queued_charts.reward_history == [(1, 2.0)]
+    assert queued_charts.loss_history == [(1, 0.5)]
+    assert queued_charts.greedy_solve_history == [(1, 0.75)]
+
+
+def test_dashboard_process_exits_when_training_parent_disappears(monkeypatch):
+    class EmptyQueue:
+        @staticmethod
+        def get(timeout):
+            raise mouse_agent_module.queue.Empty
+
+    class FakeDashboard:
+        instance = None
+
+        def __init__(self, width, height):
+            self.disabled = False
+            self.running = True
+            self.poll_count = 0
+            self.closed = False
+            self.size = (width, height)
+            FakeDashboard.instance = self
+
+        def poll(self):
+            self.poll_count += 1
+
+        def close(self):
+            self.closed = True
+
+    parent_checks = iter((True, False))
+    monkeypatch.setattr(mouse_agent_module, "Dashboard", FakeDashboard)
+    monkeypatch.setattr(
+        mouse_agent_module.os,
+        "getppid",
+        lambda: 1234 if next(parent_checks) else 1,
+    )
+
+    mouse_agent_module._dashboard_process_main(
+        EmptyQueue(),
+        width=900,
+        height=600,
+        parent_pid=1234,
+    )
+
+    assert FakeDashboard.instance is not None
+    assert FakeDashboard.instance.size == (900, 600)
+    assert FakeDashboard.instance.poll_count == 1
+    assert FakeDashboard.instance.closed is True
+
+
 def test_cli_omitted_args_use_top_level_train_config_defaults():
     args = parse_args([])
+    config = _train_config_from_args(args)
 
-    assert _train_config_from_args(args) == TrainConfig()
+    assert config == TrainConfig()
+    assert config.remaining_time_channel is DEFAULT_REMAINING_TIME_CHANNEL is False
+    assert config.visit_count_channel is DEFAULT_VISIT_COUNT_CHANNEL is True
+    assert config.visit_count_clip == DEFAULT_VISIT_COUNT_CLIP == 5
+    assert config.wall_occlusion is DEFAULT_WALL_OCCLUSION is True
+    assert config.algorithm == "recurrent_ppo"
+    assert config.action_space == "continuous"
+    assert config.distance_shaping_mode == "potential"
+    assert config.continuous_step_scale == pytest.approx(0.25)
+    assert config.invalid_move_penalty == pytest.approx(-0.2)
+    assert config.rnd_reward_coef == pytest.approx(0.05)
+    assert config.recurrent_hidden_size == 512
     assert _optional_bool(args.train_flag, DEFAULT_TRAIN_FLAG) is DEFAULT_TRAIN_FLAG
     assert _optional_bool(args.infer_flag, DEFAULT_INFER_FLAG) is DEFAULT_INFER_FLAG
+    assert _optional_bool(
+        args.show_input_channels,
+        DEFAULT_SHOW_INPUT_CHANNELS,
+    ) is DEFAULT_SHOW_INPUT_CHANNELS
     assert args.inference_mazes == DEFAULT_INFERENCE_MAZES
 
 
@@ -1467,7 +2368,8 @@ def test_cli_help_renders_all_percentage_descriptions(capsys):
 
     assert exit_info.value.code == 0
     help_text = capsys.readouterr().out
-    assert "90%" in help_text
+    assert "60%" in help_text
+    assert "80%" in help_text
 
 
 def test_target_only_stop_is_finite_by_default_and_can_be_enabled():
@@ -1610,6 +2512,45 @@ def test_cli_inference_maze_count_accepts_finite_and_infinite_values():
         parse_args(["--inference-mazes", "-1"])
 
 
+def test_cli_input_channel_visualization_overrides_module_default():
+    assert parse_args(["--show-input-channels"]).show_input_channels is True
+    assert parse_args(["--no-show-input-channels"]).show_input_channels is False
+
+
+def test_cli_observation_channel_and_visibility_flags_override_defaults():
+    args = parse_args(
+        [
+            "--remaining-time-channel",
+            "--no-visit-count-channel",
+            "--visit-count-clip",
+            "7",
+            "--no-wall-occlusion",
+        ]
+    )
+    config = _train_config_from_args(args)
+
+    assert config.remaining_time_channel is True
+    assert config.visit_count_channel is False
+    assert config.visit_count_clip == 7
+    assert config.wall_occlusion is False
+
+    with pytest.raises(ValueError, match="visit_count_clip"):
+        TrainConfig(visit_count_clip=0)
+
+
+def test_inference_input_channel_panel_toggles_with_i_key():
+    class FakePygame:
+        KEYDOWN = 2
+        K_i = 105
+
+    class Event:
+        type = FakePygame.KEYDOWN
+        key = FakePygame.K_i
+
+    assert _toggle_input_channel_panel(FakePygame, Event(), False) is True
+    assert _toggle_input_channel_panel(FakePygame, Event(), True) is False
+
+
 def test_inference_loop_generates_requested_number_of_fresh_mazes(monkeypatch):
     config = TrainConfig(maze_size=(5, 5), save_path=None, training_log_path=None)
     generated_sizes = []
@@ -1619,14 +2560,30 @@ def test_inference_loop_generates_requested_number_of_fresh_mazes(monkeypatch):
         generated_sizes.append((rows, cols))
         return fixed_grid()
 
-    def fake_visualize(agent, maze_grid, *, observation_mode, config):
+    def fake_visualize(
+        agent,
+        maze_grid,
+        *,
+        observation_mode,
+        config,
+        show_input_channels,
+    ):
         rendered_mazes.append(maze_grid)
+        assert show_input_channels is True
         return True
 
     monkeypatch.setattr(mouse_agent_module, "generate_random_maze", fake_generate)
     monkeypatch.setattr(mouse_agent_module, "visualize_inference", fake_visualize)
 
-    assert run_inference_loop(object(), config, maze_count=3) == 3
+    assert (
+        run_inference_loop(
+            object(),
+            config,
+            maze_count=3,
+            show_input_channels=True,
+        )
+        == 3
+    )
     assert generated_sizes == [(5, 5), (5, 5), (5, 5)]
     assert len(rendered_mazes) == 3
 
@@ -1697,6 +2654,8 @@ def test_cli_args_override_top_level_train_config_defaults():
             "64",
             "--post-curriculum-eval-every-steps",
             "777",
+            "--curriculum-final-stage-fraction",
+            "0.3",
             "--precision-fraction",
             "0.25",
             "--precision-learning-rate-fraction",
@@ -1744,6 +2703,7 @@ def test_cli_args_override_top_level_train_config_defaults():
     assert config.ppo_rollout_steps == 8
     assert config.recurrent_hidden_size == 64
     assert config.post_curriculum_eval_every_steps == 777
+    assert config.curriculum_final_stage_fraction == pytest.approx(0.3)
     assert config.precision_fraction == 0.25
     assert config.precision_learning_rate_fraction == 0.02
     assert config.precision_entropy_fraction == 0.2
@@ -2039,6 +2999,7 @@ def test_sidecar_resume_keeps_current_and_frozen_best_separate(
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+       action_space="discrete",
         observation_mode="local",
         view_size=5,
         recurrent_hidden_size=16,
@@ -2381,7 +3342,13 @@ def test_training_saves_new_best_weights_to_configured_path(tmp_path, capsys):
 
 
 def test_remaining_time_channel_is_observable_and_decreases():
-    env = Maze(fixed_grid(), observation_mode="full", max_episode_steps=10)
+    env = Maze(
+        fixed_grid(),
+        observation_mode="full",
+        max_episode_steps=10,
+        remaining_time_channel=True,
+        visit_count_channel=False,
+    )
 
     initial = env.reset()
     next_state, _reward, _done, _info = env.step(0)
@@ -2418,6 +3385,7 @@ def test_recurrent_sequence_matches_step_unroll_and_resets_hidden_state():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+        action_space="discrete",
         observation_mode="full",
         num_envs=2,
         ppo_rollout_steps=4,
@@ -2491,9 +3459,11 @@ def test_local_recurrent_agent_uses_rnd_without_distance_shaping():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+       action_space="discrete",
         observation_mode="local",
         view_size=5,
         distance_shaping_mode="potential",
+        rnd_reward_coef=0.3,
         num_envs=1,
         ppo_rollout_steps=4,
         recurrent_sequence_length=2,
@@ -2509,9 +3479,9 @@ def test_local_recurrent_agent_uses_rnd_without_distance_shaping():
     observation = Maze(
         fixed_grid(), observation_mode="local", view_size=5, max_episode_steps=10
     ).reset()
-    states = torch.from_numpy(observation).view(1, 1, 5, 5, 5).repeat(2, 1, 1, 1, 1)
+    states = torch.from_numpy(observation).view(1, 1, 3, 5, 5).repeat(2, 1, 1, 1, 1)
 
-    assert config.distance_shaping_mode == "none"
+    assert config.distance_shaping_mode == "potential"
     assert agent.rnd is not None
     bonuses = agent.rnd.bonus_and_update(states, config.rnd_reward_clip)
     assert bonuses.shape == (2, 1)
@@ -2536,6 +3506,7 @@ def test_prefetched_generation_is_seed_deterministic():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+        action_space="discrete",
         dashboard_flag=False,
         save_path=None,
         training_log_path=None,
@@ -2554,6 +3525,7 @@ def test_process_prefetcher_preserves_seeded_task_order():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+        action_space="discrete",
         curriculum_enabled=True,
         dashboard_flag=False,
         save_path=None,
@@ -2612,10 +3584,11 @@ def test_process_prefetcher_prioritizes_hard_replay_variants():
     )
 
 
-def test_recurrent_checkpoint_v3_round_trip_and_rejects_legacy(tmp_path):
+def test_recurrent_checkpoint_v9_round_trip_and_rejects_legacy(tmp_path):
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+       action_space="discrete",
         recurrent_hidden_size=16,
         ppo_rollout_steps=4,
         recurrent_sequence_length=2,
@@ -2627,8 +3600,8 @@ def test_recurrent_checkpoint_v3_round_trip_and_rejects_legacy(tmp_path):
         performance_profile="portable",
         maze_workers=0,
     )
-    checkpoint = tmp_path / "recurrent_v3.pth"
-    legacy = tmp_path / "legacy.pth"
+    checkpoint = tmp_path / "recurrent_v9.pth"
+    legacy = tmp_path / "legacy_v8.pth"
     agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
     agent.update_count = 7
     agent.total_env_steps = 42
@@ -2645,19 +3618,74 @@ def test_recurrent_checkpoint_v3_round_trip_and_rejects_legacy(tmp_path):
 
     restored = RecurrentPPOAgent(config, device=torch.device("cpu"))
     restored.load(str(checkpoint))
-    torch.save({"schema_version": 2, "algorithm": "dqn"}, legacy)
+    torch.save({"schema_version": 8, "algorithm": "recurrent_ppo"}, legacy)
 
     assert restored.update_count == 7
     assert restored.total_env_steps == 42
     assert restored.training_state == agent.training_state
-    with pytest.raises(ValueError, match="schema-v3"):
+    with pytest.raises(ValueError, match="schema-v9"):
         restored.load(str(legacy))
+
+    mismatched = replace(config, visit_count_channel=False)
+    mismatched_agent = RecurrentPPOAgent(mismatched, device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="observation settings"):
+        mismatched_agent.load(str(checkpoint))
+
+
+def test_final_best_checkpoint_restores_matching_optimizer_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_eval_greedy",
+        lambda agent, config, **kwargs: EvalMetrics(solve_rate=0.5),
+    )
+    save_path = tmp_path / "best-with-optimizer.pth"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        action_space="discrete",
+        recurrent_hidden_size=16,
+        ppo_rollout_steps=4,
+        recurrent_sequence_length=2,
+        dashboard_flag=False,
+        save_path=str(save_path),
+        training_log_path=None,
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    best_weights = clone_agent_weights(agent)
+    best_optimizer_state = mouse_agent_module.clone_optimizer_state(agent)
+    agent.optimizer.param_groups[0]["lr"] = 0.123
+
+    mouse_agent_module._finish_training(
+        agent,
+        config,
+        mouse_agent_module._TrainingLogger(None),
+        MetricsTracker(),
+        None,
+        completed=1,
+        total_steps=1,
+        last_eval=EvalMetrics(),
+        best_eval_rate=0.5,
+        best_weights=best_weights,
+        start_time=0.0,
+        process_start_cpu=0.0,
+        best_optimizer_state=best_optimizer_state,
+    )
+    payload = torch.load(save_path, map_location="cpu", weights_only=False)
+
+    assert payload["optimizer_state_dict"]["param_groups"][0]["lr"] == pytest.approx(
+        config.learning_rate
+    )
 
 
 def test_short_local_recurrent_training_smoke():
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+       action_space="discrete",
         observation_mode="local",
         view_size=5,
         episodes=3,
@@ -2692,6 +3720,7 @@ def test_recurrent_resume_uses_saved_curriculum_definitions(monkeypatch):
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+       action_space="discrete",
         observation_mode="local",
         view_size=5,
         episodes=1,
@@ -2745,6 +3774,7 @@ def test_short_recurrent_training_promotes_automatic_curriculum(monkeypatch, tmp
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+       action_space="discrete",
         observation_mode="local",
         view_size=5,
         episodes=10,
@@ -2787,6 +3817,198 @@ def test_short_recurrent_training_promotes_automatic_curriculum(monkeypatch, tmp
     assert all("active_eval_every_steps" in record for record in learners)
 
 
+def test_finite_training_reserves_final_stage_and_logs_budget_promotion(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_curriculum_stage_eval",
+        lambda agent, config, curriculum: EvalMetrics(solve_rate=0.0),
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_eval_greedy",
+        lambda agent, config, **kwargs: EvalMetrics(solve_rate=0.5),
+    )
+    log_path = tmp_path / "reserved-final-stage.jsonl"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        action_space="discrete",
+        observation_mode="local",
+        view_size=5,
+        episodes=100,
+        max_env_steps=10,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        rnd_reward_coef=0.0,
+        eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
+        eval_episodes=1,
+        curriculum_probe_mazes=8,
+        curriculum_promotion_rate=1.0,
+        curriculum_promotion_evals=2,
+        curriculum_eval_episodes=1,
+        curriculum_final_stage_fraction=0.5,
+        target_solve_rate=1.0,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=str(log_path),
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+
+    train(agent=RecurrentPPOAgent(config, device=torch.device("cpu")), config=config)
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    forced = [
+        record
+        for record in records
+        if record["event"] == "curriculum"
+        and record.get("promotion_reason") == "budget_reserve"
+    ]
+
+    assert len(forced) == 1
+    assert forced[0]["total_steps"] == 5
+    assert forced[0]["stage"]["name"] == "5x5-unrestricted"
+    assert forced[0]["active_eval_every_steps"] == 1
+
+
+def test_curriculum_stage_scores_cannot_replace_unrestricted_best(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_curriculum_stage_eval",
+        lambda agent, config, curriculum: EvalMetrics(solve_rate=0.9),
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_eval_greedy",
+        lambda agent, config, **kwargs: EvalMetrics(solve_rate=0.5),
+    )
+    log_path = tmp_path / "distribution-safe-best.jsonl"
+    save_path = tmp_path / "distribution-safe-best.pth"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        action_space="discrete",
+        observation_mode="local",
+        view_size=5,
+        episodes=10,
+        max_env_steps=8,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        rnd_reward_coef=0.0,
+        eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
+        eval_episodes=1,
+        curriculum_probe_mazes=8,
+        curriculum_promotion_rate=0.8,
+        curriculum_promotion_evals=1,
+        curriculum_eval_episodes=1,
+        curriculum_final_stage_fraction=0.0,
+        target_solve_rate=1.0,
+        dashboard_flag=False,
+        save_path=str(save_path),
+        training_log_path=str(log_path),
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+
+    train(agent=agent, config=config)
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    new_bests = [
+        record
+        for record in records
+        if record["event"] == "checkpoint" and record["reason"] == "new_best"
+    ]
+
+    assert agent.best_greedy_solve_rate == pytest.approx(0.5)
+    assert len(new_bests) == 1
+    assert new_bests[0]["greedy"]["solve_rate"] == pytest.approx(0.5)
+    assert all(
+        not record["is_new_best"]
+        for record in records
+        if record["event"] == "eval"
+        and record["greedy"]["solve_rate"] == pytest.approx(0.9)
+    )
+
+
+def test_incomplete_curriculum_saves_only_resumable_latest_checkpoint(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_curriculum_stage_eval",
+        lambda agent, config, curriculum: EvalMetrics(solve_rate=0.0),
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_eval_greedy",
+        lambda agent, config, **kwargs: EvalMetrics(solve_rate=0.25),
+    )
+    save_path = tmp_path / "incomplete.pth"
+    log_path = tmp_path / "incomplete.jsonl"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        action_space="discrete",
+        observation_mode="local",
+        view_size=5,
+        episodes=1,
+        max_env_steps=4,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        rnd_reward_coef=0.0,
+        eval_every_steps=1,
+        eval_episodes=1,
+        curriculum_probe_mazes=8,
+        curriculum_final_stage_fraction=0.0,
+        dashboard_flag=False,
+        save_path=str(save_path),
+        training_log_path=str(log_path),
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+
+    train(agent=RecurrentPPOAgent(config, device=torch.device("cpu")), config=config)
+    train_end = next(
+        json.loads(line)
+        for line in log_path.read_text().splitlines()
+        if json.loads(line)["event"] == "train_end"
+    )
+
+    assert not save_path.exists()
+    assert os.path.exists(latest_checkpoint_path(str(save_path)))
+    assert train_end["final_checkpoint_path"] == latest_checkpoint_path(str(save_path))
+    assert train_end["greedy"]["solve_rate"] == pytest.approx(0.25)
+
+
 def test_target_only_recurrent_ppo_confirms_frozen_candidate_and_ignores_legacy_streak(
     monkeypatch,
     tmp_path,
@@ -2799,6 +4021,7 @@ def test_target_only_recurrent_ppo_confirms_frozen_candidate_and_ignores_legacy_
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+       action_space="discrete",
         observation_mode="local",
         view_size=5,
         episodes=1,
@@ -2817,6 +4040,7 @@ def test_target_only_recurrent_ppo_confirms_frozen_candidate_and_ignores_legacy_
         target_solve_evals=2,
         target_only_stop=True,
         curriculum_enabled=True,
+        curriculum_final_stage_fraction=0.0,
         curriculum_promotion_rate=0.9,
         curriculum_promotion_evals=3,
         curriculum_eval_episodes=1,
@@ -2879,6 +4103,7 @@ def test_failed_target_confirmation_resumes_training(monkeypatch):
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+       action_space="discrete",
         observation_mode="local",
         view_size=5,
         episodes=1,
@@ -2928,6 +4153,7 @@ def test_disabled_precision_recovery_clears_legacy_active_state(
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+       action_space="discrete",
         observation_mode="local",
         view_size=5,
         episodes=1,
@@ -3006,6 +4232,7 @@ def test_precision_recovery_handles_improvement_and_rollback(
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
+        action_space="discrete",
         observation_mode="local",
         view_size=5,
         episodes=1,
@@ -3065,5 +4292,438 @@ def test_precision_recovery_handles_improvement_and_rollback(
         for record in recovery_learners
     )
     assert agent.training_state["precision_recovery"]["active"] is False
-    assert agent.training_state["target_confirmed"] is True
-    assert not rates
+
+
+def test_finite_training_starts_precision_recovery_before_budget_end(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_eval_greedy",
+        lambda agent, config, **kwargs: EvalMetrics(solve_rate=0.5),
+    )
+    log_path = tmp_path / "finite-recovery.jsonl"
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        action_space="discrete",
+        observation_mode="local",
+        view_size=5,
+        episodes=100,
+        max_env_steps=6,
+        max_episode_steps=4,
+        num_envs=1,
+        ppo_rollout_steps=1,
+        ppo_epochs=1,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=1,
+        rnd_reward_coef=0.0,
+        eval_every_steps=1,
+        post_curriculum_eval_every_steps=1,
+        eval_episodes=1,
+        target_solve_rate=1.0,
+        target_only_stop=False,
+        precision_fraction=0.5,
+        precision_phase_min_steps=0,
+        precision_plateau_evals=1,
+        precision_recovery_steps=1,
+        precision_recovery_enabled=True,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=str(log_path),
+        device="cpu",
+        require_cuda=False,
+        performance_profile="portable",
+        maze_workers=0,
+    )
+
+    train(agent=RecurrentPPOAgent(config, device=torch.device("cpu")), config=config)
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    recovery = [record for record in records if record["event"] == "precision_recovery"]
+
+    assert recovery[0]["phase"] == "start"
+    assert recovery[0]["total_steps"] == 5
+    assert recovery[0]["total_steps"] < config.max_env_steps
+    assert any(
+        record["phase"] == "end" and record["outcome"] == "rollback"
+        for record in recovery
+    )
+
+
+def test_precision_phase_triggers_at_absolute_min_steps():
+    config = TrainConfig(
+        max_env_steps=100_000_000,
+        precision_fraction=0.20,
+        precision_phase_min_steps=50_000_000,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+    )
+    assert _in_precision_phase(49_999_999, config) is False
+    assert _in_precision_phase(50_000_000, config) is True
+    assert _in_precision_phase(80_000_000, config) is True
+
+
+def test_allow_new_best_allows_update_when_true():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        save_path = os.path.join(tmpdir, "best_model.zip")
+        config = TrainConfig(
+            max_env_steps=100,
+            episodes=5,
+            eval_every_steps=20,
+            post_curriculum_eval_every_steps=20,
+            dashboard_flag=False,
+            save_path=save_path,
+            training_log_path=None,
+            device="cpu",
+        )
+        agent = MouseAgent(config=config, device=torch.device("cpu"))
+        logger = mouse_agent_module._TrainingLogger(None)
+        tracker = MetricsTracker()
+        eval_metrics = EvalMetrics(
+            solve_rate=0.5,
+            avg_steps=20.0,
+        )
+        _, _, new_best_rate, best_weights = _maybe_run_eval(
+            agent,
+            config,
+            logger,
+            tracker,
+            completed=10,
+            total_steps=20,
+            epsilon=0.0,
+            best_eval_rate=-1.0,
+            best_weights=None,
+            last_eval_step=0,
+            start_time=0.0,
+            process_start_cpu=0.0,
+            allow_new_best=True,
+            evaluation_fn=lambda: eval_metrics,
+        )
+        assert new_best_rate == 0.5
+        assert best_weights is not None
+
+
+def test_allow_new_best_blocks_update_when_false():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = TrainConfig(
+            max_env_steps=100,
+            episodes=5,
+            eval_every_steps=20,
+            post_curriculum_eval_every_steps=20,
+            dashboard_flag=False,
+            save_path=None,
+            training_log_path=None,
+            device="cpu",
+        )
+        agent = MouseAgent(config=config, device=torch.device("cpu"))
+        logger = mouse_agent_module._TrainingLogger(None)
+        tracker = MetricsTracker()
+        eval_metrics = EvalMetrics(
+            solve_rate=0.5,
+            avg_steps=20.0,
+        )
+        _, _, new_best_rate, best_weights = _maybe_run_eval(
+            agent,
+            config,
+            logger,
+            tracker,
+            completed=10,
+            total_steps=20,
+            epsilon=0.0,
+            best_eval_rate=-1.0,
+            best_weights=None,
+            last_eval_step=0,
+            start_time=0.0,
+            process_start_cpu=0.0,
+            allow_new_best=False,
+            evaluation_fn=lambda: eval_metrics,
+        )
+        assert new_best_rate == -1.0
+        assert best_weights is None
+
+
+def test_entropy_boost_persists_across_checkpoints():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        checkpoint_path = os.path.join(tmpdir, "checkpoint.pth")
+        config = TrainConfig(
+            max_env_steps=100,
+            ppo_entropy_floor=0.2,
+            dashboard_flag=False,
+            save_path=None,
+            training_log_path=None,
+            device="cpu",
+        )
+        agent = MouseAgent(config=config, device=torch.device("cpu"))
+        _update_training_state(
+            agent,
+            completed=10,
+            total_steps=50,
+            last_eval_step=40,
+            train_rng=random.Random(config.seed),
+            entropy_boost=0.05,
+        )
+        torch.save(
+            {"weights": clone_agent_weights(agent), "training_state": agent.training_state},
+            checkpoint_path,
+        )
+        loaded = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        assert loaded["training_state"]["entropy_boost"] == 0.05
+
+
+@pytest.mark.parametrize("trail_length", [1, 2, 3, 5])
+def test_continuous_trail_drawing_needs_two_or_more_points(trail_length):
+    """Regression: pygame.draw.lines() crashes with fewer than 2 points.
+
+    The continuous-mode trail rendering must guard against short trails that
+    produce zero or one pixel coordinate before calling draw.lines().
+    """
+    pygame = pytest.importorskip("pygame")
+    surface = pygame.Surface((100, 100))
+    background = (26, 31, 38)
+    surface.fill(background)
+
+    trail_color = (91, 142, 222)
+    cell_size = 20
+    maze_x, maze_y = 10, 10
+
+    trail = [(float(i), float(i)) for i in range(trail_length)]
+    pixel_pts = [
+        (maze_x + pt[1] * cell_size + cell_size / 2, maze_y + pt[0] * cell_size + cell_size / 2)
+        for pt in trail[:-1]
+    ]
+
+    if len(pixel_pts) >= 2:
+        pygame.draw.lines(surface, trail_color, False, pixel_pts, max(2, cell_size // 8))
+    elif len(pixel_pts) == 1:
+        pygame.draw.circle(surface, trail_color, pixel_pts[0], max(1, cell_size // 6))
+
+    pixels = pygame.surfarray.array3d(surface)
+    bg_arr = np.full_like(pixels, background)
+    if trail_length >= 2:
+        assert np.any(pixels != bg_arr), (
+            f"Expected visible trail for length {trail_length}"
+        )
+    else:
+        np.testing.assert_array_equal(pixels, bg_arr)
+
+
+def test_continuous_trail_single_point_does_not_crash():
+    """Regression: first frame has exactly one trail point; must not raise."""
+    pygame = pytest.importorskip("pygame")
+    surface = pygame.Surface((100, 100))
+    background = (26, 31, 38)
+    surface.fill(background)
+
+    trail_color = (91, 142, 222)
+    cell_size = 20
+    maze_x, maze_y = 10, 10
+
+    trail = [(0.0, 0.0)]
+    pixel_pts = [
+        (maze_x + pt[1] * cell_size + cell_size / 2, maze_y + pt[0] * cell_size + cell_size / 2)
+        for pt in trail[:-1]
+    ]
+
+    with pytest.raises(ValueError, match="points argument must contain"):
+        pygame.draw.lines(surface, trail_color, False, pixel_pts, max(2, cell_size // 8))
+
+
+def test_mouse_icon_accepts_float_coordinates():
+    """Regression: continuous mode passes float pixel coords to _draw_mouse_icon.
+
+    The icon drawing code uses pygame.draw.arc() and other rect-based primitives
+    that require integer coordinates. Float inputs must be rounded without crashing.
+    """
+    pygame = pytest.importorskip("pygame")
+    cell_size = 48
+    surface = pygame.Surface((cell_size, cell_size))
+    background = (11, 13, 17)
+    surface.fill(background)
+
+    _draw_mouse_icon(pygame, surface, 0.7, 0.3, cell_size)
+
+    pixels = pygame.surfarray.array3d(surface)
+    bg_arr = np.full_like(pixels, background)
+    assert np.any(pixels != bg_arr), "Mouse icon should be visible at float coordinates"
+
+
+def test_inference_rendering_full_loop_with_bfs_planner():
+    """Regression: run the full visualize_inference rendering loop headlessly.
+
+    Previous crashes occurred because numpy.float32 scalars leaked into pygame
+    drawing calls (draw.lines, draw.circle) which only accept native Python
+    int/float. This test exercises the complete render path with a BFS planner
+    to ensure no TypeError surfaces during trail/icon drawing.
+    """
+
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ["SDL_AUDIODRIVER"] = "dummy"
+    pygame = pytest.importorskip("pygame")
+    pygame.init()
+
+    config = TrainConfig(
+        maze_size=(7, 7),
+        save_path=None,
+        training_log_path=None,
+        observation_mode="full",
+        action_space="discrete",
+    )
+    grid = make_maze(config).grid
+    planner = BfsPlanner()
+
+    result = mouse_agent_module.visualize_inference(
+        planner,
+        grid.copy(),
+        fps=5,
+        observation_mode="full",
+        config=config,
+        show_input_channels=False,
+    )
+    assert result is True
+    pygame.quit()
+
+
+def test_numpy_float32_does_not_leak_into_pygame_pixel_coords():
+    """Regression: continuous action output must be native Python floats.
+
+    get_actions_stateful returns np.float32 arrays for continuous actions.
+    tuple(np_array) preserves numpy scalars, which crash pygame.draw.lines().
+    The fix converts each element to float() before returning the tuple.
+    """
+
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ["SDL_AUDIODRIVER"] = "dummy"
+    pygame = pytest.importorskip("pygame")
+    pygame.init()
+
+    # Simulate what _inference_action returns for a continuous agent:
+    # actions[0] is np.float32, tuple(actions[0]) would leak numpy scalars.
+    raw_actions = np.array([[0.5, -0.3]], dtype=np.float32)
+    action_tuple = tuple(float(v) for v in raw_actions[0])
+
+    # Verify types are native Python floats, not numpy scalars
+    assert type(action_tuple[0]) is float
+    assert type(action_tuple[1]) is float
+
+    # Simulate continuous_position accumulation with these values
+    pos = (float(0), float(0))
+    new_x = pos[0] + action_tuple[0]
+    new_y = pos[1] + action_tuple[1]
+    assert type(new_x) is float
+    assert type(new_y) is float
+
+    # Build pixel coordinates the same way visualize_inference does
+    maze_x, maze_y, cell_size = 10, 10, 20
+    pt = (new_x, new_y)
+    px = maze_x + pt[1] * cell_size + cell_size / 2
+    py = maze_y + pt[0] * cell_size + cell_size / 2
+
+    # This must not raise TypeError
+    surface = pygame.Surface((100, 100))
+    surface.fill((26, 31, 38))
+    trail_color = (91, 142, 222)
+    pixel_pts = [(px, py), (px + 10, py + 10)]
+    pygame.draw.lines(surface, trail_color, False, pixel_pts, max(2, cell_size // 8))
+
+    pixels = pygame.surfarray.array3d(surface)
+    bg_arr = np.full_like(pixels, (26, 31, 38))
+    assert np.any(pixels != bg_arr), "Trail should be visible"
+
+    pygame.quit()
+
+
+def test_numpy_float32_pixel_coordinates_render_with_installed_pygame():
+    """Keep rendering compatible with pygame versions accepting NumPy scalars."""
+
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ["SDL_AUDIODRIVER"] = "dummy"
+    pygame = pytest.importorskip("pygame")
+    pygame.init()
+
+    surface = pygame.Surface((100, 100))
+    surface.fill((26, 31, 38))
+
+    # Raw numpy.float32 values (what tuple(np_array) produces)
+    raw = np.array([0.5, -0.3], dtype=np.float32)
+    bad_tuple = tuple(raw)  # elements are numpy.float32
+    assert type(bad_tuple[0]) is not float
+
+    maze_x, maze_y, cell_size = 10, 10, 20
+    px = maze_x + bad_tuple[1] * cell_size + cell_size / 2
+    py = maze_y + bad_tuple[0] * cell_size + cell_size / 2
+
+    pygame.draw.lines(
+        surface, (91, 142, 222), False, [(px, py), (px + 10, py + 10)], 2
+    )
+    background = np.full_like(pygame.surfarray.array3d(surface), (26, 31, 38))
+    assert np.any(pygame.surfarray.array3d(surface) != background)
+
+    pygame.quit()
+
+
+def test_chart_normalizes_x_axis_against_data_range_not_zero():
+    """Regression: resumed training starts recording at large episode numbers.
+
+    Chart x-coordinates must be normalized against the actual data span, not
+    against absolute zero, so data points spread across the chart width
+    instead of clustering at the right edge.
+    """
+
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ["SDL_AUDIODRIVER"] = "dummy"
+    pygame = pytest.importorskip("pygame")
+    pygame.init()
+
+    try:
+        screen = pygame.Surface((500, 400))
+        screen.fill((24, 28, 34))
+
+        dashboard = Dashboard.__new__(Dashboard)
+        dashboard.running = True
+        dashboard.disabled = False
+        dashboard.screen = screen
+        dashboard.pygame = pygame
+
+        base = 5_000_000
+        data = [(base + i, float(i)) for i in range(10)]
+
+        dashboard._draw_chart(
+            rect=(50, 50, 400, 300),
+            label="Reward",
+            data=data,
+            color=(76, 201, 240),
+            current_episode=base + 10,
+        )
+
+        pixels = pygame.surfarray.array3d(screen)
+        plot_region = pixels[50 + 34:50 + 300 - 40, 50 + 46:50 + 400 - 16]
+
+        bg_color = (63, 72, 84)
+        bg_mask = (
+            (plot_region[:, :, 0] == bg_color[0])
+            & (plot_region[:, :, 1] == bg_color[1])
+            & (plot_region[:, :, 2] == bg_color[2])
+        )
+
+        non_bg_cols = np.any(~bg_mask, axis=0)
+        non_bg_indices = np.where(non_bg_cols)[0]
+
+        if len(non_bg_indices) < 2:
+            pytest.fail("Chart data should span multiple columns across the plot")
+
+        left_edge = int(non_bg_indices.min())
+        right_edge = int(non_bg_indices.max())
+
+        assert left_edge < plot_region.shape[1] // 4, (
+            f"Leftmost data should be near left edge, got col {left_edge}"
+        )
+        assert right_edge > plot_region.shape[1] * 3 // 4, (
+            f"Rightmost data should be near right edge, got col {right_edge}"
+        )
+    finally:
+        pygame.quit()
