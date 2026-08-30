@@ -21,7 +21,7 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 import numpy as np
 import torch
@@ -51,7 +51,7 @@ ACTION_SPACES = ("discrete", "continuous")
 PERFORMANCE_PROFILES = ("auto", "rtx3090-fast", "strict", "portable")
 CURRICULUM_MODES = ("auto", "manual")
 # Checkpoint format version written by the current agent implementation.
-CHECKPOINT_SCHEMA_VERSION = 9
+CHECKPOINT_SCHEMA_VERSION = 10
 # Compatibility episode limit used when training is enabled without an override.
 DEFAULT_EPISODES = 1_000_000
 # Seed used for training maze generation and other random operations.
@@ -149,6 +149,8 @@ DEFAULT_TRAIN_FLAG = False
 DEFAULT_INFER_FLAG = True
 # Number of fresh mazes rendered for inference; zero means run indefinitely.
 DEFAULT_INFERENCE_MAZES = 0
+# Maximum inference frames rendered per second.
+DEFAULT_INFERENCE_FPS = 30
 # Whether inference initially shows the model's spatial input channels.
 DEFAULT_SHOW_INPUT_CHANNELS = True
 # Whether observations include the normalized remaining-episode-time channel.
@@ -917,11 +919,9 @@ def observation_shape(
 
     if observation_mode == "full":
         channels = 3 + int(remaining_time_channel) + int(visit_count_channel)
-        channels += 3 * int(action_space == "continuous")
         return (channels, maze_size[0], maze_size[1])
     if observation_mode == "local":
         channels = 2 + int(remaining_time_channel) + int(visit_count_channel)
-        channels += 3 * int(action_space == "continuous")
         return (channels, view_size, view_size)
     raise ValueError(f"unsupported observation_mode: {observation_mode!r}")
 
@@ -949,10 +949,11 @@ def observation_settings_payload(config: TrainConfig) -> dict[str, object]:
         "wall_occlusion": config.wall_occlusion,
         "action_space": config.action_space,
         "continuous_features": (
-            "broadcast_within_cell_row_col_and_previous_collision"
+            "separate_within_cell_row_col_and_previous_collision"
             if config.action_space == "continuous"
             else "none"
         ),
+        "proprioception_size": 3 if config.action_space == "continuous" else 0,
         "continuous_step_scale": config.continuous_step_scale,
     }
 
@@ -1433,6 +1434,7 @@ class Maze:
             view_size=self.view_size,
             remaining_time_channel=self.remaining_time_channel,
             visit_count_channel=self.visit_count_channel,
+            action_space=self.action_space,
         )
 
     def _compute_bfs_distances(self) -> None:
@@ -1525,28 +1527,30 @@ class Maze:
 
     def observation(self) -> np.ndarray:
         if self.observation_mode == "full":
-            observation = self._full_observation()
-        else:
-            observation = self._local_observation(self.current_position)
-        return self._with_continuous_features(observation)
+            return self._full_observation()
+        return self._local_observation(self.current_position)
 
-    def _with_continuous_features(self, observation: np.ndarray) -> np.ndarray:
-        """Append translation-invariant proprioception in continuous mode."""
+    def proprioception(self) -> np.ndarray:
+        """Return within-cell offsets and previous collision for continuous control."""
 
         if self.action_space != "continuous":
-            return observation
+            return np.empty(0, dtype=np.float32)
         offsets = 2.0 * (
             np.asarray(self.continuous_position, dtype=np.float32)
             - np.asarray(self.current_position, dtype=np.float32)
         )
-        planes = np.stack(
-            [
-                np.full(observation.shape[1:], offsets[0], dtype=np.float32),
-                np.full(observation.shape[1:], offsets[1], dtype=np.float32),
-                np.full(observation.shape[1:], float(self.previous_collision), dtype=np.float32),
-            ]
+        return np.asarray(
+            (offsets[0], offsets[1], float(self.previous_collision)),
+            dtype=np.float32,
         )
-        return np.concatenate((observation, planes), axis=0)
+
+    @property
+    def effective_visit_count_clip(self) -> int:
+        """Return the occupancy-sample clip used by the observation channel."""
+
+        if self.action_space == "continuous":
+            return int(math.ceil(self.visit_count_clip / self.continuous_step_scale))
+        return self.visit_count_clip
 
     def _full_observation(self) -> np.ndarray:
         walls = (self.grid == 1).astype(np.float32)
@@ -1580,8 +1584,8 @@ class Maze:
                 goal[vi, vj] = float((r, c) == self.goal)
                 visit_counts[vi, vj] = min(
                     int(self.visit_counts[r, c]),
-                    self.visit_count_clip,
-                ) / self.visit_count_clip
+                    self.effective_visit_count_clip,
+                ) / self.effective_visit_count_clip
         if self.wall_occlusion:
             visible = local_visibility_mask(walls.astype(np.bool_))
             walls *= visible
@@ -1601,9 +1605,9 @@ class Maze:
         return np.stack(channels)
 
     def _normalized_visit_counts(self) -> np.ndarray:
-        return np.minimum(self.visit_counts, self.visit_count_clip).astype(
+        return np.minimum(self.visit_counts, self.effective_visit_count_clip).astype(
             np.float32
-        ) / self.visit_count_clip
+        ) / self.effective_visit_count_clip
 
     @property
     def remaining_time_fraction(self) -> float:
@@ -1697,7 +1701,6 @@ class Maze:
                 collision_cause = "wall"
                 break
         invalid = collision_cause != "none"
-        old_cell = self.current_position
         if invalid:
             self.invalid_moves += 1
             executed = np.zeros(2, dtype=np.float32)
@@ -1707,8 +1710,7 @@ class Maze:
             assert destination_cell is not None
             self.current_position = destination_cell
             executed = displacement.astype(np.float32)
-            if self.current_position != old_cell:
-                self.visit_counts[self.current_position] += 1
+        self.visit_counts[self.current_position] += 1
         self.previous_collision = invalid
 
         new_cl_dist = self.centerline_distance(self.continuous_position)
@@ -2629,6 +2631,7 @@ class BatchStep:
     requested_actions: np.ndarray | None = None
     executed_displacements: np.ndarray | None = None
     collision_causes: np.ndarray | None = None
+    proprioception: np.ndarray | None = None
 
 
 class MazeBatch:
@@ -2669,6 +2672,11 @@ class MazeBatch:
         if self.continuous != (first.action_space == "continuous"):
             raise ValueError("MazeBatch action mode must match its environments")
         self.continuous_step_scale = first.continuous_step_scale
+        self.effective_visit_count_clip = (
+            int(math.ceil(self.visit_count_clip / self.continuous_step_scale))
+            if self.continuous
+            else self.visit_count_clip
+        )
         self.grids = np.empty((self.size, *grid_shape), dtype=np.uint8)
         self.bfs_distances = np.empty((self.size, *grid_shape), dtype=np.float32)
         self.starts = np.empty((self.size, 2), dtype=np.int64)
@@ -2842,12 +2850,11 @@ class MazeBatch:
             channels.append(
                 np.minimum(
                     self.visit_counts[selected],
-                    self.visit_count_clip,
+                    self.effective_visit_count_clip,
                 ).astype(np.float32)
-                / self.visit_count_clip
+                / self.effective_visit_count_clip
             )
-        observations = np.stack(channels, axis=1).astype(np.float32, copy=False)
-        return self._with_continuous_features(observations, selected)
+        return np.stack(channels, axis=1).astype(np.float32, copy=False)
 
     def _local_observations(self, selected: np.ndarray) -> np.ndarray:
         half = self.view_size // 2
@@ -2884,9 +2891,9 @@ class MazeBatch:
         visit_counts = (
             np.minimum(
                 self.visit_counts[batch_indices, clipped_rows, clipped_cols],
-                self.visit_count_clip,
+                self.effective_visit_count_clip,
             ).astype(np.float32)
-            / self.visit_count_clip
+            / self.effective_visit_count_clip
         )
         visit_counts *= in_bounds
         if self.wall_occlusion:
@@ -2911,28 +2918,27 @@ class MazeBatch:
             )
         if self.visit_count_channel:
             channels.append(visit_counts)
-        observations = np.stack(channels, axis=1).astype(np.float32, copy=False)
-        return self._with_continuous_features(observations, selected)
+        return np.stack(channels, axis=1).astype(np.float32, copy=False)
 
-    def _with_continuous_features(
-        self,
-        observations: np.ndarray,
-        selected: np.ndarray,
-    ) -> np.ndarray:
-        """Append broadcast within-cell offsets and prior collision state."""
+    def proprioception(self, indices: np.ndarray | None = None) -> np.ndarray:
+        """Build batched continuous within-cell offsets and collision flags."""
 
         if not self.continuous:
-            return observations
+            selected_count = self.size if indices is None else len(indices)
+            return np.empty((selected_count, 0), dtype=np.float32)
+        selected = (
+            np.arange(self.size, dtype=np.int64)
+            if indices is None
+            else np.asarray(indices, dtype=np.int64)
+        )
         offsets = 2.0 * (
             self.continuous_positions[selected].astype(np.float32)
             - self.positions[selected].astype(np.float32)
         )
-        spatial_shape = observations.shape[2:]
-        planes = np.empty((len(selected), 3, *spatial_shape), dtype=np.float32)
-        planes[:, 0] = offsets[:, 0, np.newaxis, np.newaxis]
-        planes[:, 1] = offsets[:, 1, np.newaxis, np.newaxis]
-        planes[:, 2] = self.previous_collisions[selected, np.newaxis, np.newaxis]
-        return np.concatenate((observations, planes), axis=1)
+        values = np.empty((len(selected), 3), dtype=np.float32)
+        values[:, :2] = offsets
+        values[:, 2] = self.previous_collisions[selected]
+        return values
 
     def valid_action_masks(self, indices: np.ndarray | None = None) -> np.ndarray:
         """Return legal action masks for every current batch position."""
@@ -3067,7 +3073,6 @@ class MazeBatch:
             )
 
         old_positions = self.continuous_positions[selected].copy()
-        old_cells = self.positions[selected].copy()
         displacements = action_array * self.continuous_step_scale
         executed = np.zeros_like(displacements)
         substeps = np.maximum(
@@ -3129,19 +3134,11 @@ class MazeBatch:
             )
             self.positions[valid_environments] = destination_cells[valid_indices]
             executed[valid_indices] = displacements[valid_indices]
-            entered_new_cells = np.any(
-                old_cells[valid_indices] != destination_cells[valid_indices],
-                axis=1,
-            )
-            entered_indices = valid_indices[entered_new_cells]
-            if len(entered_indices):
-                entered_environments = selected[entered_indices]
-                entered_cells = destination_cells[entered_indices]
-                self.visit_counts[
-                    entered_environments,
-                    entered_cells[:, 0],
-                    entered_cells[:, 1],
-                ] += 1
+        self.visit_counts[
+            selected,
+            self.positions[selected, 0],
+            self.positions[selected, 1],
+        ] += 1
         self.previous_collisions[selected] = invalid
         self.invalid_moves[selected] += invalid.astype(np.int64)
 
@@ -3187,6 +3184,7 @@ class MazeBatch:
             requested_actions=action_array.copy(),
             executed_displacements=executed,
             collision_causes=collision_causes,
+            proprioception=self.proprioception(selected),
         )
 
     def _centerline_distance_batch(
@@ -3823,13 +3821,17 @@ class RecurrentActorCriticNetwork(nn.Module):
         self.has_agent_channel = has_agent_channel
         self.continuous = continuous
         self.action_dim = 2 if continuous else output_size
+        self.proprioception_size = 3 if continuous else 0
         self.trunk = SpatialTrunk(
             input_shape,
             channels=64,
             has_agent_channel=has_agent_channel,
         )
         action_feature_dim = self.action_dim
-        self.gru = nn.GRUCell(64 + action_feature_dim + 1, hidden_size)
+        self.gru = nn.GRUCell(
+            64 + self.proprioception_size + action_feature_dim + 1,
+            hidden_size,
+        )
         if continuous:
             self.mean_head = nn.Linear(hidden_size, self.action_dim)
             self.log_std_head = nn.Linear(hidden_size, self.action_dim)
@@ -3853,6 +3855,7 @@ class RecurrentActorCriticNetwork(nn.Module):
         previous_rewards: torch.Tensor,
         episode_starts: torch.Tensor,
         hidden: torch.Tensor,
+        proprioception: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden = hidden * (~episode_starts).to(hidden.dtype).unsqueeze(1)
         features = self.spatial_features(observations)
@@ -3865,10 +3868,19 @@ class RecurrentActorCriticNetwork(nn.Module):
             safe_actions = previous_actions.clamp_min(0)
             action_features = nn.functional.one_hot(safe_actions, 4).to(features.dtype)
             action_features *= valid_actions.to(features.dtype).unsqueeze(1)
-        inputs = torch.cat(
-            (features, action_features, previous_rewards.to(features.dtype).unsqueeze(1)),
-            dim=1,
+        input_features = [features]
+        if self.continuous:
+            if proprioception is None or proprioception.shape != (features.shape[0], 3):
+                actual = None if proprioception is None else tuple(proprioception.shape)
+                raise ValueError(
+                    "continuous proprioception must have shape "
+                    f"({features.shape[0]}, 3), got {actual}"
+                )
+            input_features.append(proprioception.to(features.dtype))
+        input_features.extend(
+            (action_features, previous_rewards.to(features.dtype).unsqueeze(1))
         )
+        inputs = torch.cat(input_features, dim=1)
         next_hidden = self.gru(inputs, hidden.to(inputs.dtype))
         if self.continuous:
             mean = self.mean_head(next_hidden).float()
@@ -3891,6 +3903,7 @@ class RecurrentActorCriticNetwork(nn.Module):
         previous_rewards: torch.Tensor,
         episode_starts: torch.Tensor,
         initial_hidden: torch.Tensor,
+        proprioception: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.continuous:
             return self._forward_sequence_continuous(
@@ -3899,6 +3912,7 @@ class RecurrentActorCriticNetwork(nn.Module):
                 previous_rewards,
                 episode_starts,
                 initial_hidden,
+                proprioception,
             )
         logits: list[torch.Tensor] = []
         values: list[torch.Tensor] = []
@@ -3910,6 +3924,7 @@ class RecurrentActorCriticNetwork(nn.Module):
                 previous_rewards[step],
                 episode_starts[step],
                 hidden,
+                None,
             )
             logits.append(step_logits)
             values.append(step_values)
@@ -3922,11 +3937,18 @@ class RecurrentActorCriticNetwork(nn.Module):
         previous_rewards: torch.Tensor,
         episode_starts: torch.Tensor,
         initial_hidden: torch.Tensor,
+        proprioception: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         means: list[torch.Tensor] = []
         values: list[torch.Tensor] = []
         log_stds: list[torch.Tensor] = []
         hidden = initial_hidden
+        if proprioception is None or proprioception.shape != (*observations.shape[:2], 3):
+            actual = None if proprioception is None else tuple(proprioception.shape)
+            raise ValueError(
+                "continuous sequence proprioception must have shape "
+                f"{(*observations.shape[:2], 3)}, got {actual}"
+            )
         for step in range(observations.shape[0]):
             step_mean, step_values, hidden, step_log_std = self.forward_step(
                 observations[step],
@@ -3934,6 +3956,7 @@ class RecurrentActorCriticNetwork(nn.Module):
                 previous_rewards[step],
                 episode_starts[step],
                 hidden,
+                proprioception[step],
             )
             means.append(step_mean)
             values.append(step_values)
@@ -4119,11 +4142,13 @@ class RecurrentPPOAgent:
         episode_starts: torch.Tensor,
         hidden: torch.Tensor,
         deterministic: bool,
+        proprioception: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.policy_net.continuous:
             return self._step_continuous(
                 states, action_masks, previous_actions,
                 previous_rewards, episode_starts, hidden, deterministic,
+                proprioception,
             )
         with self.autocast():
             logits, values, next_hidden = self.forward_step(
@@ -4147,6 +4172,7 @@ class RecurrentPPOAgent:
         episode_starts: torch.Tensor,
         hidden: torch.Tensor,
         deterministic: bool,
+        proprioception: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         with self.autocast():
             mean, values, next_hidden, log_std = self.forward_step(
@@ -4155,6 +4181,7 @@ class RecurrentPPOAgent:
                 previous_rewards,
                 episode_starts,
                 hidden,
+                proprioception,
             )
         std = log_std.exp()
         distribution = torch.distributions.Normal(mean, std)
@@ -4174,9 +4201,12 @@ class RecurrentPPOAgent:
         previous_rewards: np.ndarray,
         episode_starts: np.ndarray,
         hidden: torch.Tensor,
+        proprioception: np.ndarray | None = None,
     ) -> tuple[np.ndarray, torch.Tensor]:
         with torch.no_grad():
             if self.policy_net.continuous:
+                if proprioception is None:
+                    raise ValueError("continuous stateful inference requires proprioception")
                 previous_actions = np.asarray(previous_actions, dtype=np.float32)
                 if previous_actions.shape != (len(states), 2):
                     raise ValueError(
@@ -4195,6 +4225,11 @@ class RecurrentPPOAgent:
                     torch.as_tensor(episode_starts, dtype=torch.bool, device=self.device),
                     hidden,
                     deterministic=True,
+                    proprioception=torch.as_tensor(
+                        proprioception,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
                 )
                 return actions.cpu().numpy().astype(np.float32), next_hidden
             actions, _log_probs, _values, next_hidden = self.step(
@@ -4213,6 +4248,7 @@ class RecurrentPPOAgent:
         states: np.ndarray,
         epsilon: float = 0.0,
         action_masks: np.ndarray | None = None,
+        proprioception: np.ndarray | None = None,
     ) -> np.ndarray:
         del epsilon
         if states.ndim == len(self.observation_shape):
@@ -4231,6 +4267,7 @@ class RecurrentPPOAgent:
             np.zeros(len(states), dtype=np.float32),
             np.ones(len(states), dtype=np.bool_),
             self.initial_policy_state(len(states)),
+            proprioception,
         )
         return actions
 
@@ -4239,8 +4276,9 @@ class RecurrentPPOAgent:
         state: np.ndarray,
         epsilon: float = 0.0,
         action_mask: np.ndarray | None = None,
+        proprioception: np.ndarray | None = None,
     ) -> int | np.ndarray:
-        action = self.get_actions(state, epsilon, action_mask)[0]
+        action = self.get_actions(state, epsilon, action_mask, proprioception)[0]
         if self.policy_net.continuous:
             return np.asarray(action, dtype=np.float32)
         return int(action)
@@ -4726,6 +4764,7 @@ def _eval_greedy(
         continuous=isinstance(agent, RecurrentPPOAgent) and agent.policy_net.continuous,
     )
     states = environment_batch.observations()
+    proprioception = environment_batch.proprioception()
     active = np.ones(len(envs), dtype=np.bool_)
     recurrent_hidden = (
         agent.initial_policy_state(len(envs))
@@ -4768,6 +4807,7 @@ def _eval_greedy(
                 previous_rewards[active_indices],
                 episode_starts[active_indices],
                 recurrent_hidden.index_select(0, hidden_indices),
+                proprioception[active_indices],
             )
             recurrent_hidden.index_copy_(0, hidden_indices, next_hidden)
         else:
@@ -4828,6 +4868,9 @@ def _eval_greedy(
                 np.count_nonzero(rounded_goal & ~step_result.solved)
             )
         states[active_indices] = step_result.states
+        if continuous_evaluation:
+            assert step_result.proprioception is not None
+            proprioception[active_indices] = step_result.proprioception
         if continuous_evaluation:
             assert step_result.executed_displacements is not None
             previous_actions[active_indices] = step_result.executed_displacements
@@ -7263,6 +7306,7 @@ def _recurrent_ppo_update(
     agent: RecurrentPPOAgent,
     config: TrainConfig,
     states: torch.Tensor,
+    proprioception: torch.Tensor,
     action_masks: torch.Tensor,
     actions: torch.Tensor,
     previous_actions: torch.Tensor,
@@ -7294,6 +7338,10 @@ def _recurrent_ppo_update(
         advantages.std(unbiased=False) + 1e-8
     )
     state_chunks = _recurrent_sequence_chunks(states, sequence_length)
+    proprioception_chunks = _recurrent_sequence_chunks(
+        proprioception,
+        sequence_length,
+    )
     mask_chunks = _recurrent_sequence_chunks(
         action_masks,
         sequence_length,
@@ -7365,6 +7413,10 @@ def _recurrent_ppo_update(
                 offset : offset + config.recurrent_sequence_minibatch_size
             ]
             state_batch = state_chunks.index_select(0, selected).transpose(0, 1)
+            proprioception_batch = proprioception_chunks.index_select(
+                0,
+                selected,
+            ).transpose(0, 1)
             mask_batch = mask_chunks.index_select(0, selected).transpose(0, 1)
             if is_continuous:
                 mask_batch = torch.ones_like(mask_batch)
@@ -7392,6 +7444,7 @@ def _recurrent_ppo_update(
                     previous_reward_batch,
                     start_batch,
                     initial_hidden,
+                    proprioception_batch if is_continuous else None,
                 )
             if is_continuous:
                 means, new_values, _hidden, log_stds = sequence_result
@@ -7631,6 +7684,7 @@ def _train_recurrent_ppo(
     environments = [prefetcher.next() for _ in range(env_count)]
     environment_batch = MazeBatch(environments, continuous=agent.policy_net.continuous)
     states = environment_batch.observations()
+    proprioception = environment_batch.proprioception()
     action_masks_np = environment_batch.valid_action_masks()
     hidden = agent.initial_policy_state(env_count)
     if agent.policy_net.continuous:
@@ -7644,6 +7698,7 @@ def _train_recurrent_ppo(
         """Start fresh recurrent contexts after restoring frozen-best weights."""
 
         nonlocal states
+        nonlocal proprioception
         nonlocal hidden
         nonlocal environment_batch
         nonlocal previous_actions_np
@@ -7653,6 +7708,7 @@ def _train_recurrent_ppo(
             continuous=agent.policy_net.continuous,
         )
         states = environment_batch.observations()
+        proprioception = environment_batch.proprioception()
         action_masks_np = environment_batch.valid_action_masks()
         hidden = agent.initial_policy_state(env_count)
         if agent.policy_net.continuous:
@@ -7669,6 +7725,13 @@ def _train_recurrent_ppo(
         dtype=torch.float32,
         pin_memory=pin_memory,
     )
+    proprioception_size = 3 if agent.policy_net.continuous else 0
+    proprioception_staging = torch.empty(
+        env_count,
+        proprioception_size,
+        dtype=torch.float32,
+        pin_memory=pin_memory,
+    )
     mask_staging = torch.empty(env_count, 4, dtype=torch.bool, pin_memory=pin_memory)
     last_eval = EvalMetrics()
     last_dashboard_episode = -config.dashboard_every
@@ -7678,6 +7741,12 @@ def _train_recurrent_ppo(
     rollout_states_buffer = torch.empty(
         *rollout_shape,
         *agent.observation_shape,
+        dtype=torch.float32,
+        device=agent.device,
+    )
+    rollout_proprioception_buffer = torch.empty(
+        *rollout_shape,
+        proprioception_size,
         dtype=torch.float32,
         device=agent.device,
     )
@@ -7760,6 +7829,7 @@ def _train_recurrent_ppo(
                 )
         collector_started = time.perf_counter()
         rollout_states = rollout_states_buffer
+        rollout_proprioception = rollout_proprioception_buffer
         rollout_masks = rollout_masks_buffer
         rollout_actions = rollout_actions_buffer
         rollout_previous_actions = rollout_previous_actions_buffer
@@ -7783,6 +7853,11 @@ def _train_recurrent_ppo(
             transfer_started = time.perf_counter()
             state_staging.copy_(torch.from_numpy(states))
             state_tensor = state_staging.to(agent.device, non_blocking=pin_memory)
+            proprioception_staging.copy_(torch.from_numpy(proprioception))
+            proprioception_tensor = proprioception_staging.to(
+                agent.device,
+                non_blocking=pin_memory,
+            )
             mask_staging.copy_(torch.from_numpy(action_masks_np))
             mask_tensor = mask_staging.to(agent.device, non_blocking=pin_memory)
             transfer_seconds += time.perf_counter() - transfer_started
@@ -7809,6 +7884,7 @@ def _train_recurrent_ppo(
                 device=agent.device,
             )
             rollout_states[step].copy_(state_tensor)
+            rollout_proprioception[step].copy_(proprioception_tensor)
             rollout_masks[step].copy_(mask_tensor)
             rollout_previous_actions[step].copy_(previous_action_tensor)
             rollout_previous_rewards[step].copy_(previous_reward_tensor)
@@ -7823,6 +7899,9 @@ def _train_recurrent_ppo(
                     episode_start_tensor,
                     hidden,
                     deterministic=False,
+                    proprioception=(
+                        proprioception_tensor if is_continuous_mode else None
+                    ),
                 )
             if is_continuous_mode:
                 actions_np = actions_t.cpu().numpy().astype(np.float32)
@@ -7863,12 +7942,19 @@ def _train_recurrent_ppo(
             agent.total_env_steps += env_count
             actual_steps = step + 1
             states = result.states
+            if is_continuous_mode:
+                assert result.proprioception is not None
+                proprioception = result.proprioception
             action_masks_np = result.action_masks
             if replaced_indices:
                 replacement_indices = np.asarray(replaced_indices, dtype=np.int64)
                 states[replacement_indices] = environment_batch.observations(
                     replacement_indices
                 )
+                if is_continuous_mode:
+                    proprioception[replacement_indices] = environment_batch.proprioception(
+                        replacement_indices
+                    )
                 action_masks_np[replacement_indices] = (
                     environment_batch.valid_action_masks(replacement_indices)
                 )
@@ -7889,6 +7975,7 @@ def _train_recurrent_ppo(
             break
         collector_seconds = time.perf_counter() - collector_started
         rollout_states = rollout_states[:actual_steps]
+        rollout_proprioception = rollout_proprioception[:actual_steps]
         rollout_masks = rollout_masks[:actual_steps]
         rollout_actions = rollout_actions[:actual_steps]
         rollout_previous_actions = rollout_previous_actions[:actual_steps]
@@ -7912,6 +7999,11 @@ def _train_recurrent_ppo(
             )
         combined_rewards = rollout_rewards + rnd_coefficient * intrinsic_rewards
         next_state_tensor = torch.as_tensor(states, dtype=torch.float32, device=agent.device)
+        next_proprioception_tensor = torch.as_tensor(
+            proprioception,
+            dtype=torch.float32,
+            device=agent.device,
+        )
         with torch.inference_mode():
             _actions, _log_probs, next_values, _next_hidden = agent.step(
                 next_state_tensor,
@@ -7929,6 +8021,9 @@ def _train_recurrent_ppo(
                 torch.as_tensor(episode_starts_np, dtype=torch.bool, device=agent.device),
                 hidden,
                 deterministic=True,
+                proprioception=(
+                    next_proprioception_tensor if is_continuous_mode else None
+                ),
             )
         advantages, returns = _compute_gae_torch(
             combined_rewards,
@@ -7961,6 +8056,7 @@ def _train_recurrent_ppo(
             agent,
             config,
             rollout_states,
+            rollout_proprioception,
             rollout_masks,
             rollout_actions,
             rollout_previous_actions,
@@ -8660,6 +8756,17 @@ class InferenceLayout:
     channel_panel_rect: Rect | None = None
 
 
+@dataclass(slots=True)
+class InferenceSession:
+    """Persistent pygame resources shared across inference mazes."""
+
+    pygame: Any
+    screen: Any
+    clock: Any
+    fps: int
+    show_input_channels: bool
+
+
 INFERENCE_CHANNEL_PANEL_WIDTH = 300
 INFERENCE_CHANNEL_PANEL_GAP = 12
 
@@ -8901,6 +9008,48 @@ def _initial_inference_window(
     )
 
 
+def _create_inference_session(
+    maze_shape: tuple[int, int],
+    fps: int,
+    show_input_channels: bool,
+) -> InferenceSession:
+    """Initialize the pygame resources used for one inference invocation."""
+
+    if fps < 1:
+        raise ValueError("inference FPS must be positive")
+
+    import pygame
+
+    os.environ["SDL_VIDEO_CENTERED"] = "1"
+    pygame.init()
+    try:
+        rows, cols = maze_shape
+        window_size = _initial_inference_window(
+            pygame,
+            rows,
+            cols,
+            show_input_channels=show_input_channels,
+        )
+        screen = pygame.display.set_mode(window_size, pygame.RESIZABLE)
+        pygame.display.set_caption("MouseMaze Inference")
+        return InferenceSession(
+            pygame=pygame,
+            screen=screen,
+            clock=pygame.time.Clock(),
+            fps=fps,
+            show_input_channels=show_input_channels,
+        )
+    except BaseException:
+        pygame.quit()
+        raise
+
+
+def _close_inference_session(session: InferenceSession) -> None:
+    """Release a persistent inference session."""
+
+    session.pygame.quit()
+
+
 def _draw_local_observation_highlight(
     pg,
     screen,
@@ -8967,9 +9116,6 @@ def inference_channel_specs(
         "Goal": (255, 201, 45),
         "Time remaining": (64, 178, 154),
         "Visit count": (225, 116, 86),
-        "Within-cell row": (132, 94, 194),
-        "Within-cell col": (84, 138, 199),
-        "Previous collision": (203, 78, 91),
     }
     channel_names = ["Walls"]
     if observation_mode == "full":
@@ -8979,10 +9125,6 @@ def inference_channel_specs(
         channel_names.append("Time remaining")
     if visit_count_channel:
         channel_names.append("Visit count")
-    if action_space == "continuous":
-        channel_names.extend(
-            ("Within-cell row", "Within-cell col", "Previous collision")
-        )
     expected_channels = len(channel_names)
     if state.ndim != 3 or state.shape[0] != expected_channels:
         raise ValueError(
@@ -9026,14 +9168,15 @@ def _draw_input_channel_panel(
     remaining_time_channel: bool,
     visit_count_channel: bool,
     action_space: str = "discrete",
+    proprioception: np.ndarray | None = None,
 ) -> None:
-    """Draw labeled thumbnails for the observation tensor passed to the model."""
+    """Draw spatial input thumbnails and continuous scalar proprioception."""
 
     panel_x, panel_y, panel_width, panel_height = panel_rect
     pg.draw.rect(screen, (34, 40, 48), panel_rect, border_radius=8)
     title_font = pg.font.SysFont("arial", 16)
     label_font = pg.font.SysFont("arial", 13)
-    title = title_font.render("Model input channels", True, (236, 240, 244))
+    title = title_font.render("Model inputs", True, (236, 240, 244))
     screen.blit(title, (panel_x + 12, panel_y + 10))
 
     specs = inference_channel_specs(
@@ -9045,13 +9188,21 @@ def _draw_input_channel_panel(
     )
     columns = 2
     rows = (len(specs) + columns - 1) // columns
+    scalar_height = 52 if action_space == "continuous" else 0
     outer_pad = 12
     gap = 8
     title_height = 34
     tile_width = max(1, (panel_width - outer_pad * 2 - gap) // columns)
     tile_height = max(
         1,
-        (panel_height - title_height - outer_pad - gap * (rows - 1)) // rows,
+        (
+            panel_height
+            - title_height
+            - outer_pad
+            - scalar_height
+            - gap * (rows - 1)
+        )
+        // rows,
     )
     label_height = 20
 
@@ -9082,6 +9233,31 @@ def _draw_input_channel_panel(
             width=1,
         )
 
+    if action_space == "continuous":
+        if proprioception is None or np.asarray(proprioception).shape != (3,):
+            actual = None if proprioception is None else np.asarray(proprioception).shape
+            raise ValueError(
+                "continuous input panel expected proprioception shape (3,), "
+                f"got {actual}"
+            )
+        row_offset, col_offset, previous_collision = np.asarray(
+            proprioception,
+            dtype=np.float32,
+        )
+        scalar_y = panel_y + panel_height - scalar_height + 4
+        offset_text = label_font.render(
+            f"Within-cell row {row_offset:+.2f} | col {col_offset:+.2f}",
+            True,
+            (205, 213, 222),
+        )
+        collision_text = label_font.render(
+            f"Previous collision: {'yes' if previous_collision >= 0.5 else 'no'}",
+            True,
+            (203, 78, 91) if previous_collision >= 0.5 else (205, 213, 222),
+        )
+        screen.blit(offset_text, (panel_x + outer_pad, scalar_y))
+        screen.blit(collision_text, (panel_x + outer_pad, scalar_y + 20))
+
 
 def _toggle_input_channel_panel(pg, event, visible: bool) -> bool:
     """Toggle input-channel visibility for the inference ``I`` shortcut."""
@@ -9091,17 +9267,68 @@ def _toggle_input_channel_panel(pg, event, visible: bool) -> bool:
     return visible
 
 
+def _next_blocked_streak(blocked_streak: int, moved: bool) -> int:
+    """Update the consecutive blocked-step count shown during inference."""
+
+    return 0 if moved else blocked_streak + 1
+
+
+def _inference_status_line(env: Maze, observation_mode: str, done: bool) -> str:
+    """Build the inference HUD line with visible timeout progress."""
+
+    outcome = ""
+    if done:
+        solved = (
+            continuous_position_is_solved(env.continuous_position, env.goal)
+            if env.action_space == "continuous"
+            else env.current_position == env.goal
+        )
+        outcome = " | SOLVED" if solved else " | TIMEOUT"
+    view_status = f"{observation_mode} observation"
+    if observation_mode == "local":
+        view_status += f" ({env.view_size}x{env.view_size} highlighted)"
+    return f"Steps {env.steps:>3}/{env.max_episode_steps:<3} | {view_status}{outcome}"
+
+
 def visualize_inference(
     agent: Agent | Planner,
     maze_grid: np.ndarray,
-    fps: int = 15,
+    fps: int = DEFAULT_INFERENCE_FPS,
     observation_mode: str | None = None,
     config: TrainConfig | None = None,
     show_input_channels: bool = DEFAULT_SHOW_INPUT_CHANNELS,
+    session: InferenceSession | None = None,
 ) -> bool:
     """Render one maze and return whether it completed without window closure."""
 
-    import pygame
+    owns_session = session is None
+    active_session = session or _create_inference_session(
+        tuple(int(value) for value in maze_grid.shape),
+        fps,
+        show_input_channels,
+    )
+    try:
+        return _visualize_inference_episode(
+            agent,
+            maze_grid,
+            observation_mode=observation_mode,
+            config=config,
+            session=active_session,
+        )
+    finally:
+        if owns_session:
+            _close_inference_session(active_session)
+
+
+def _visualize_inference_episode(
+    agent: Agent | Planner,
+    maze_grid: np.ndarray,
+    *,
+    observation_mode: str | None,
+    config: TrainConfig | None,
+    session: InferenceSession,
+) -> bool:
+    """Render one maze using an existing inference session."""
 
     agent_config = config or getattr(agent, "config", TrainConfig())
     mode = observation_mode or agent_config.observation_mode
@@ -9128,21 +9355,14 @@ def visualize_inference(
         continuous_step_scale=agent_config.continuous_step_scale,
     )
 
-    os.environ["SDL_VIDEO_CENTERED"] = "1"
-    pygame.init()
+    pygame = session.pygame
+    screen = session.screen
+    clock = session.clock
     rows, cols = env.grid.shape
-    window_size = _initial_inference_window(
-        pygame,
-        rows,
-        cols,
-        show_input_channels=show_input_channels,
-    )
-    screen = pygame.display.set_mode(window_size, pygame.RESIZABLE)
-    pygame.display.set_caption("MouseMaze Inference")
-    clock = pygame.time.Clock()
 
     trail = [env.continuous_position]
     state = env.reset()
+    proprioception = env.proprioception()
     action_mask = env.valid_action_mask()
     recurrent_hidden = (
         agent.initial_policy_state(1) if isinstance(agent, RecurrentPPOAgent) else None
@@ -9160,32 +9380,32 @@ def visualize_inference(
         previous_action,
         previous_reward,
         episode_start,
+        proprioception,
     )
     done = False
-    last_blocked = False
+    blocked_streak = 0
 
     while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit()
                 return False
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                pygame.quit()
                 return False
-            show_input_channels = _toggle_input_channel_panel(
+            session.show_input_channels = _toggle_input_channel_panel(
                 pygame,
                 event,
-                show_input_channels,
+                session.show_input_channels,
             )
             if event.type == pygame.VIDEORESIZE:
                 resized = (max(320, event.w), max(240, event.h))
                 screen = pygame.display.set_mode(resized, pygame.RESIZABLE)
+                session.screen = screen
 
         window_w, window_h = screen.get_size()
         layout = inference_layout(
             (window_w, window_h),
             (rows, cols),
-            show_input_channels=show_input_channels,
+            show_input_channels=session.show_input_channels,
         )
         maze_x, maze_y, maze_width, maze_height = layout.maze_rect
         cell_size = layout.cell_size
@@ -9287,6 +9507,7 @@ def visualize_inference(
                 agent_config.remaining_time_channel,
                 agent_config.visit_count_channel,
                 agent_config.action_space,
+                proprioception,
             )
 
         hud_x, hud_y, hud_width, hud_height = layout.hud_rect
@@ -9296,22 +9517,8 @@ def visualize_inference(
             layout.hud_rect,
             border_radius=max(3, min(8, hud_height // 7)),
         )
-        blocked = " blocked" if last_blocked else ""
-        outcome = ""
-        if done:
-            outcome = (
-                " | SOLVED"
-                if (
-                    continuous_position_is_solved(env.continuous_position, env.goal)
-                    if is_continuous_action
-                    else env.current_position == env.goal
-                )
-                else " | TIMEOUT"
-            )
-        view_status = f"{mode} observation"
-        if mode == "local":
-            view_status += f" ({env.view_size}x{env.view_size} highlighted)"
-        status_line = f"Steps {env.steps:>3} | {view_status}{outcome}"
+        blocked = f" | Blocked streak {blocked_streak}" if blocked_streak else ""
+        status_line = _inference_status_line(env, mode, done)
         if is_continuous_action:
             action_label = f"({action[0]:+.2f}, {action[1]:+.2f})"
         else:
@@ -9354,15 +9561,19 @@ def visualize_inference(
             (hud_x + 10, text_y + status_font.get_linesize() + line_gap),
         )
         pygame.display.flip()
-        clock.tick(fps)
+        clock.tick(session.fps)
 
         if done:
             break
 
         trail.append(env.continuous_position)
         next_state, step_reward, done, step_info = env.step(action)
-        last_blocked = not bool(step_info["moved"])
+        blocked_streak = _next_blocked_streak(
+            blocked_streak,
+            bool(step_info["moved"]),
+        )
         state = next_state
+        proprioception = env.proprioception()
         action_mask = env.valid_action_mask()
         if is_continuous_action:
             executed = np.asarray(step_info["executed_displacement"], dtype=np.float32)
@@ -9379,6 +9590,7 @@ def visualize_inference(
             previous_action,
             previous_reward,
             episode_start,
+            proprioception,
         )
 
     label = (
@@ -9391,7 +9603,6 @@ def visualize_inference(
         else "TIMEOUT"
     )
     print(f"Steps: {env.steps} -- {label}")
-    pygame.quit()
     return True
 
 
@@ -9403,6 +9614,7 @@ def _inference_action(
     previous_action: int = -1,
     previous_reward: float = 0.0,
     episode_start: bool = True,
+    proprioception: np.ndarray | None = None,
 ) -> tuple[int, np.ndarray | None, torch.Tensor | None]:
     """Choose a legal action and optionally return learned action values."""
 
@@ -9411,10 +9623,19 @@ def _inference_action(
             recurrent_hidden = policy.initial_policy_state(1)
         is_continuous = policy.policy_net.continuous
         if is_continuous:
+            if proprioception is None or np.asarray(proprioception).shape != (3,):
+                actual = None if proprioception is None else np.asarray(proprioception).shape
+                raise ValueError(
+                    "continuous inference requires proprioception shape (3,), "
+                    f"got {actual}"
+                )
             if isinstance(previous_action, int):
                 prev_actions_arr = np.array([[-1.0, -1.0]], dtype=np.float32)
             else:
-                prev_actions_arr = np.array([[previous_action[0], previous_action[1]]], dtype=np.float32)
+                prev_actions_arr = np.array(
+                    [[previous_action[0], previous_action[1]]],
+                    dtype=np.float32,
+                )
         else:
             prev_actions_arr = np.array([previous_action], dtype=np.int64)
         actions, next_hidden = policy.get_actions_stateful(
@@ -9424,6 +9645,11 @@ def _inference_action(
             np.array([previous_reward], dtype=np.float32),
             np.array([episode_start], dtype=np.bool_),
             recurrent_hidden,
+            (
+                None
+                if not is_continuous
+                else np.asarray(proprioception, dtype=np.float32)[np.newaxis]
+            ),
         )
         if is_continuous:
             return tuple(float(v) for v in actions[0]), None, next_hidden
@@ -9457,11 +9683,24 @@ def _inference_count(value: str) -> int:
     return count
 
 
+def _positive_int(value: str) -> int:
+    """Parse a strictly positive integer CLI value."""
+
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 def run_inference_loop(
     agent: Agent | Planner,
     config: TrainConfig,
     maze_count: int = DEFAULT_INFERENCE_MAZES,
     show_input_channels: bool = DEFAULT_SHOW_INPUT_CHANNELS,
+    fps: int = DEFAULT_INFERENCE_FPS,
 ) -> int:
     """Run inference on fresh mazes until a count or window close stops it.
 
@@ -9471,21 +9710,34 @@ def run_inference_loop(
 
     if maze_count < 0:
         raise ValueError("maze_count must be non-negative")
+    if fps < 1:
+        raise ValueError("inference FPS must be positive")
 
     completed = 0
-    while maze_count == 0 or completed < maze_count:
-        completed += 1
-        maze_grid = make_maze(config).grid
-        limit = "infinite" if maze_count == 0 else str(maze_count)
-        print(f"Inference on fresh maze {completed}/{limit}:")
-        if not visualize_inference(
-            agent,
-            maze_grid.copy(),
-            observation_mode=config.observation_mode,
-            config=config,
-            show_input_channels=show_input_channels,
-        ):
-            break
+    session: InferenceSession | None = None
+    try:
+        while maze_count == 0 or completed < maze_count:
+            completed += 1
+            maze_grid = make_maze(config).grid
+            if session is None:
+                session = _create_inference_session(
+                    tuple(int(value) for value in maze_grid.shape),
+                    fps,
+                    show_input_channels,
+                )
+            limit = "infinite" if maze_count == 0 else str(maze_count)
+            print(f"Inference on fresh maze {completed}/{limit}:")
+            if not visualize_inference(
+                agent,
+                maze_grid.copy(),
+                observation_mode=config.observation_mode,
+                config=config,
+                session=session,
+            ):
+                break
+    finally:
+        if session is not None:
+            _close_inference_session(session)
     return completed
 
 
@@ -9513,7 +9765,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Resume the selected/latest schema-v9 checkpoint; fresh training "
+            "Resume the selected/latest schema-v10 checkpoint; fresh training "
             "is the default."
         ),
     )
@@ -9788,6 +10040,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--inference-fps",
+        type=_positive_int,
+        default=DEFAULT_INFERENCE_FPS,
+        metavar="FPS",
+        help="Maximum inference frames per second (default: 30).",
+    )
+    parser.add_argument(
         "--show-input-channels",
         dest="show_input_channels",
         action=argparse.BooleanOptionalAction,
@@ -10033,6 +10292,7 @@ def main(argv: list[str] | None = None) -> None:
                 args.show_input_channels,
                 DEFAULT_SHOW_INPUT_CHANNELS,
             ),
+            fps=args.inference_fps,
         )
 
 

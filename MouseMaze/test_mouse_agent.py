@@ -16,6 +16,7 @@ from MouseAgent import (
     DASHBOARD_MAX_HISTORY_POINTS,
     DASHBOARD_TOOLTIPS,
     DEFAULT_INFER_FLAG,
+    DEFAULT_INFERENCE_FPS,
     DEFAULT_INFERENCE_MAZES,
     DEFAULT_REMAINING_TIME_CHANNEL,
     DEFAULT_SHOW_INPUT_CHANNELS,
@@ -59,7 +60,9 @@ from MouseAgent import (
     _format_number,
     _format_pct,
     _generate_prefetched_grid,
+    _inference_status_line,
     _optional_bool,
+    _next_blocked_streak,
     _non_overlapping_episode_ticks,
     _rects_overlap,
     _in_precision_phase,
@@ -334,27 +337,58 @@ def _continuous_maze(
     )
 
 
+def test_continuous_input_panel_renders_spatial_and_scalar_inputs():
+    pygame = pytest.importorskip("pygame")
+    environment = _continuous_maze()
+    state = environment.reset()
+    proprioception = environment.proprioception()
+    original_state = state.copy()
+    original_proprioception = proprioception.copy()
+    pygame.init()
+    try:
+        screen = pygame.Surface((500, 400))
+        screen.fill((26, 31, 38))
+        _draw_input_channel_panel(
+            pygame,
+            screen,
+            (0, 0, 500, 400),
+            state,
+            "local",
+            False,
+            True,
+            "continuous",
+            proprioception,
+        )
+        pixels = pygame.surfarray.array3d(screen)
+        assert np.any(pixels != np.asarray((26, 31, 38), dtype=np.uint8))
+        np.testing.assert_array_equal(state, original_state)
+        np.testing.assert_array_equal(proprioception, original_proprioception)
+    finally:
+        pygame.quit()
+
+
 def test_continuous_reset_and_proprioception_expose_within_cell_state():
     env = _continuous_maze()
     initial = env.reset()
     env.continuous_position = (1.0, 1.25)
     offset_state = env.observation()
+    offset_proprioception = env.proprioception()
 
-    assert initial.shape == (6, 5, 5)
-    assert not np.array_equal(initial, offset_state)
-    assert np.allclose(offset_state[-3], 0.0)
-    assert np.allclose(offset_state[-2], 0.5)
+    assert initial.shape == (3, 5, 5)
+    np.testing.assert_array_equal(initial, offset_state)
+    np.testing.assert_allclose(offset_proprioception, (0.0, 0.5, 0.0))
 
     env.continuous_position = (1.49, 1.0)
     _state, _reward, _done, info = env.step(np.array([1.0, 0.0], dtype=np.float32))
     assert info["invalid"] is True
     assert info["collision_cause"] == "wall"
-    assert np.all(env.observation()[-1] == 1.0)
+    assert env.proprioception()[2] == 1.0
 
     env.reset()
     assert env.current_position == env.start
     assert env.continuous_position == tuple(float(value) for value in env.start)
     assert env.previous_collision is False
+    np.testing.assert_array_equal(env.proprioception(), np.zeros(3, dtype=np.float32))
 
 
 def test_continuous_scalar_and_batch_transitions_match_and_report_execution():
@@ -376,6 +410,8 @@ def test_continuous_scalar_and_batch_transitions_match_and_report_execution():
             result.executed_displacements[0], info["executed_displacement"]
         )
         assert result.collision_causes[0] == info["collision_cause"]
+        assert result.proprioception is not None
+        np.testing.assert_allclose(result.proprioception[0], scalar.proprioception())
 
 
 def _alternate_continuous_grid():
@@ -420,7 +456,7 @@ def test_continuous_noncontiguous_subset_uses_selected_grids_only():
     np.testing.assert_array_equal(batch.visit_counts[1], inactive[3])
 
 
-def test_continuous_sweep_blocks_diagonal_corner_and_counts_cell_entries():
+def test_continuous_transitions_count_resulting_cell_occupancy():
     env = _continuous_maze(step_scale=1.0)
     initial_visits = int(env.visit_counts.sum())
 
@@ -428,14 +464,43 @@ def test_continuous_sweep_blocks_diagonal_corner_and_counts_cell_entries():
     assert info["invalid"] is True
     assert info["collision_cause"] == "wall"
     assert env.continuous_position == (1.0, 1.0)
-    assert int(env.visit_counts.sum()) == initial_visits
+    assert int(env.visit_counts.sum()) == initial_visits + 1
 
     env = _continuous_maze(step_scale=0.25)
+    assert env.effective_visit_count_clip == 20
     env.step(np.array([0.0, 0.5], dtype=np.float32))
-    assert int(env.visit_counts.sum()) == 1
-    env.step(np.array([0.0, 1.0], dtype=np.float32))
-    env.step(np.array([0.0, 1.0], dtype=np.float32))
     assert int(env.visit_counts.sum()) == 2
+    env.step(np.array([0.0, 1.0], dtype=np.float32))
+    env.step(np.array([0.0, 1.0], dtype=np.float32))
+    assert int(env.visit_counts.sum()) == 4
+
+    visits_before_observation = env.visit_counts.copy()
+    env.observation()
+    env.observation()
+    np.testing.assert_array_equal(env.visit_counts, visits_before_observation)
+
+
+@pytest.mark.parametrize(
+    ("step_scale", "expected_clip"),
+    [(0.25, 20), (0.3, 17), (1.0, 5)],
+)
+def test_continuous_visit_clip_scales_with_control_step(step_scale, expected_clip):
+    env = _continuous_maze(
+        step_scale=step_scale,
+        max_episode_steps=expected_clip + 2,
+    )
+
+    assert env.effective_visit_count_clip == expected_clip
+    for _ in range(expected_clip - 1):
+        state, _reward, done, _info = env.step(np.zeros(2, dtype=np.float32))
+        assert not done
+
+    assert env.visit_counts[env.start] == expected_clip
+    assert state[2, 2, 2] == pytest.approx(1.0)
+
+    clipped, _reward, _done, _info = env.step(np.zeros(2, dtype=np.float32))
+    assert env.visit_counts[env.start] == expected_clip + 1
+    assert clipped[2, 2, 2] == pytest.approx(1.0)
 
 
 def test_continuous_geodesic_shaping_rewards_forward_and_cache_replacement():
@@ -501,9 +566,19 @@ def test_continuous_recurrent_adapter_preserves_previous_action_floats(monkeypat
     state = _continuous_maze().reset()[np.newaxis]
     captured = {}
 
-    def fake_step(states, masks, previous_actions, rewards, starts, hidden, deterministic):
+    def fake_step(
+        states,
+        masks,
+        previous_actions,
+        rewards,
+        starts,
+        hidden,
+        deterministic,
+        proprioception=None,
+    ):
         del masks, rewards, starts, deterministic
         captured["previous_actions"] = previous_actions.detach().cpu().numpy()
+        captured["proprioception"] = proprioception.detach().cpu().numpy()
         return (
             torch.zeros((len(states), 2)),
             torch.zeros(len(states)),
@@ -520,8 +595,13 @@ def test_continuous_recurrent_adapter_preserves_previous_action_floats(monkeypat
         np.zeros(1, dtype=np.float32),
         np.zeros(1, dtype=np.bool_),
         agent.initial_policy_state(1),
+        np.zeros((1, 3), dtype=np.float32),
     )
     np.testing.assert_array_equal(captured["previous_actions"], previous)
+    np.testing.assert_array_equal(
+        captured["proprioception"],
+        np.zeros((1, 3), dtype=np.float32),
+    )
 
     with pytest.raises(ValueError, match="shape"):
         agent.get_actions_stateful(
@@ -531,6 +611,7 @@ def test_continuous_recurrent_adapter_preserves_previous_action_floats(monkeypat
             np.zeros(1, dtype=np.float32),
             np.zeros(1, dtype=np.bool_),
             agent.initial_policy_state(1),
+            np.zeros((1, 3), dtype=np.float32),
         )
 
 
@@ -542,12 +623,20 @@ def test_squashed_continuous_policy_is_bounded_and_log_probs_recompute():
     rewards = torch.zeros(16)
     starts = torch.ones(16, dtype=torch.bool)
     hidden = agent.initial_policy_state(16)
+    proprioception = torch.zeros((16, 3))
 
     actions, log_probs, _values, _hidden = agent.step(
-        states, masks, previous, rewards, starts, hidden, deterministic=False
+        states,
+        masks,
+        previous,
+        rewards,
+        starts,
+        hidden,
+        deterministic=False,
+        proprioception=proprioception,
     )
     mean, _values, _hidden, log_std = agent.policy_net.forward_step(
-        states, previous, rewards, starts, hidden
+        states, previous, rewards, starts, hidden, proprioception
     )
     distribution = torch.distributions.Normal(mean, log_std.exp())
     recomputed = mouse_agent_module._bounded_action_log_prob(distribution, actions)
@@ -579,6 +668,7 @@ def test_continuous_policy_enforces_exploration_log_std_floor():
         torch.zeros(2),
         torch.ones(2, dtype=torch.bool),
         agent.initial_policy_state(2),
+        torch.zeros((2, 3)),
     )
 
     assert torch.all(log_std == CONTINUOUS_LOG_STD_MIN)
@@ -614,6 +704,7 @@ def test_continuous_recurrent_sequence_matches_step_unroll():
         [[True, True], [False, False], [False, True]]
     )
     initial_hidden = agent.initial_policy_state(2)
+    proprioception = torch.zeros((3, 2, 3))
 
     sequence = agent.policy_net.forward_sequence(
         observations,
@@ -621,6 +712,7 @@ def test_continuous_recurrent_sequence_matches_step_unroll():
         previous_rewards,
         episode_starts,
         initial_hidden,
+        proprioception,
     )
     means, values, sequence_hidden, log_stds = sequence
     hidden = initial_hidden
@@ -634,6 +726,7 @@ def test_continuous_recurrent_sequence_matches_step_unroll():
             previous_rewards[step],
             episode_starts[step],
             hidden,
+            proprioception[step],
         )
         step_means.append(mean)
         step_values.append(value)
@@ -685,6 +778,7 @@ def test_recurrent_ppo_kl_stopping_completes_the_first_epoch():
     previous_rewards = torch.zeros(time_steps, env_count)
     episode_starts = torch.zeros(time_steps, env_count, dtype=torch.bool)
     episode_starts[0] = True
+    proprioception = torch.zeros(time_steps, env_count, 3)
     hidden_states = torch.zeros(
         time_steps, env_count, config.recurrent_hidden_size
     )
@@ -695,6 +789,7 @@ def test_recurrent_ppo_kl_stopping_completes_the_first_epoch():
             previous_rewards,
             episode_starts,
             agent.initial_policy_state(env_count),
+            proprioception,
         )
         distribution = torch.distributions.Normal(means, log_stds.exp())
         current_log_probs = mouse_agent_module._bounded_action_log_prob(
@@ -710,6 +805,7 @@ def test_recurrent_ppo_kl_stopping_completes_the_first_epoch():
         agent,
         config,
         states,
+        proprioception,
         action_masks,
         actions,
         previous_actions,
@@ -2360,6 +2456,15 @@ def test_cli_omitted_args_use_top_level_train_config_defaults():
         DEFAULT_SHOW_INPUT_CHANNELS,
     ) is DEFAULT_SHOW_INPUT_CHANNELS
     assert args.inference_mazes == DEFAULT_INFERENCE_MAZES
+    assert args.inference_fps == DEFAULT_INFERENCE_FPS == 30
+
+
+def test_cli_accepts_positive_inference_fps_and_rejects_invalid_values():
+    assert parse_args(["--inference-fps", "60"]).inference_fps == 60
+
+    for invalid in ("0", "-1", "fast"):
+        with pytest.raises(SystemExit):
+            parse_args(["--inference-fps", invalid])
 
 
 def test_cli_help_renders_all_percentage_descriptions(capsys):
@@ -2555,6 +2660,17 @@ def test_inference_loop_generates_requested_number_of_fresh_mazes(monkeypatch):
     config = TrainConfig(maze_size=(5, 5), save_path=None, training_log_path=None)
     generated_sizes = []
     rendered_mazes = []
+    created_sessions = []
+    closed_sessions = []
+
+    class FakeSession:
+        show_input_channels = True
+
+    def fake_create_session(maze_shape, fps, show_input_channels):
+        session = FakeSession()
+        session.show_input_channels = show_input_channels
+        created_sessions.append((maze_shape, fps, session))
+        return session
 
     def fake_generate(rows, cols, rng=None):
         generated_sizes.append((rows, cols))
@@ -2566,13 +2682,27 @@ def test_inference_loop_generates_requested_number_of_fresh_mazes(monkeypatch):
         *,
         observation_mode,
         config,
-        show_input_channels,
+        session,
     ):
         rendered_mazes.append(maze_grid)
-        assert show_input_channels is True
+        assert session is created_sessions[0][2]
+        if len(rendered_mazes) == 1:
+            session.show_input_channels = False
+        else:
+            assert session.show_input_channels is False
         return True
 
     monkeypatch.setattr(mouse_agent_module, "generate_random_maze", fake_generate)
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_create_inference_session",
+        fake_create_session,
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_close_inference_session",
+        closed_sessions.append,
+    )
     monkeypatch.setattr(mouse_agent_module, "visualize_inference", fake_visualize)
 
     assert (
@@ -2581,21 +2711,36 @@ def test_inference_loop_generates_requested_number_of_fresh_mazes(monkeypatch):
             config,
             maze_count=3,
             show_input_channels=True,
+            fps=45,
         )
         == 3
     )
     assert generated_sizes == [(5, 5), (5, 5), (5, 5)]
     assert len(rendered_mazes) == 3
+    assert created_sessions[0][:2] == ((5, 5), 45)
+    assert closed_sessions == [created_sessions[0][2]]
 
 
 def test_inference_loop_infinite_mode_stops_when_window_closes(monkeypatch):
     config = TrainConfig(maze_size=(5, 5), save_path=None, training_log_path=None)
     render_count = 0
+    session = object()
+    closed_sessions = []
 
     monkeypatch.setattr(
         mouse_agent_module,
         "generate_random_maze",
         lambda rows, cols, rng=None: fixed_grid(),
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_create_inference_session",
+        lambda maze_shape, fps, show_input_channels: session,
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_close_inference_session",
+        closed_sessions.append,
     )
 
     def fake_visualize(*args, **kwargs):
@@ -2606,6 +2751,64 @@ def test_inference_loop_infinite_mode_stops_when_window_closes(monkeypatch):
     monkeypatch.setattr(mouse_agent_module, "visualize_inference", fake_visualize)
 
     assert run_inference_loop(object(), config, maze_count=0) == 2
+    assert closed_sessions == [session]
+
+
+def test_inference_loop_closes_session_when_rendering_fails(monkeypatch):
+    config = TrainConfig(maze_size=(5, 5), save_path=None, training_log_path=None)
+    session = object()
+    closed_sessions = []
+
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "generate_random_maze",
+        lambda rows, cols, rng=None: fixed_grid(),
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_create_inference_session",
+        lambda maze_shape, fps, show_input_channels: session,
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_close_inference_session",
+        closed_sessions.append,
+    )
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "visualize_inference",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("render failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        run_inference_loop(object(), config, maze_count=1)
+
+    assert closed_sessions == [session]
+
+
+def test_inference_loop_rejects_non_positive_fps():
+    config = TrainConfig(maze_size=(5, 5), save_path=None, training_log_path=None)
+
+    with pytest.raises(ValueError, match="FPS must be positive"):
+        run_inference_loop(object(), config, maze_count=1, fps=0)
+
+
+def test_inference_status_reports_timeout_progress_and_blocked_streak():
+    env = Maze(
+        fixed_grid(),
+        observation_mode="local",
+        max_episode_steps=10,
+        action_space="continuous",
+    )
+    env.steps = 4
+
+    status = _inference_status_line(env, "local", done=False)
+
+    assert "Steps   4/10" in status
+    assert "local observation (5x5 highlighted)" in status
+    assert _next_blocked_streak(0, moved=False) == 1
+    assert _next_blocked_streak(7, moved=False) == 8
+    assert _next_blocked_streak(8, moved=True) == 0
 
 
 def test_cli_args_override_top_level_train_config_defaults():
@@ -3584,7 +3787,7 @@ def test_process_prefetcher_prioritizes_hard_replay_variants():
     )
 
 
-def test_recurrent_checkpoint_v9_round_trip_and_rejects_legacy(tmp_path):
+def test_recurrent_checkpoint_v10_round_trip_and_rejects_v9(tmp_path):
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
@@ -3600,8 +3803,8 @@ def test_recurrent_checkpoint_v9_round_trip_and_rejects_legacy(tmp_path):
         performance_profile="portable",
         maze_workers=0,
     )
-    checkpoint = tmp_path / "recurrent_v9.pth"
-    legacy = tmp_path / "legacy_v8.pth"
+    checkpoint = tmp_path / "recurrent_v10.pth"
+    legacy = tmp_path / "legacy_v9.pth"
     agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
     agent.update_count = 7
     agent.total_env_steps = 42
@@ -3618,12 +3821,12 @@ def test_recurrent_checkpoint_v9_round_trip_and_rejects_legacy(tmp_path):
 
     restored = RecurrentPPOAgent(config, device=torch.device("cpu"))
     restored.load(str(checkpoint))
-    torch.save({"schema_version": 8, "algorithm": "recurrent_ppo"}, legacy)
+    torch.save({"schema_version": 9, "algorithm": "recurrent_ppo"}, legacy)
 
     assert restored.update_count == 7
     assert restored.total_env_steps == 42
     assert restored.training_state == agent.training_state
-    with pytest.raises(ValueError, match="schema-v9"):
+    with pytest.raises(ValueError, match="schema-v10"):
         restored.load(str(legacy))
 
     mismatched = replace(config, visit_count_channel=False)
@@ -3714,6 +3917,49 @@ def test_short_local_recurrent_training_smoke():
 
     assert agent.update_count > 0
     assert len(tracker.solved) == 3
+
+
+def test_short_continuous_recurrent_training_and_checkpoint_smoke(tmp_path):
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        action_space="continuous",
+        observation_mode="local",
+        view_size=5,
+        episodes=2,
+        max_env_steps=16,
+        max_episode_steps=4,
+        num_envs=2,
+        ppo_rollout_steps=2,
+        recurrent_hidden_size=16,
+        recurrent_sequence_length=1,
+        recurrent_sequence_minibatch_size=2,
+        ppo_epochs=1,
+        rnd_reward_coef=0.0,
+        target_only_stop=False,
+        eval_every_steps=1_000,
+        eval_episodes=1,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+        require_cuda=False,
+        performance_profile="strict",
+        maze_workers=0,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+
+    tracker = train(agent=agent, config=config)
+    checkpoint = tmp_path / "continuous-smoke-v10.pth"
+    agent.save(str(checkpoint))
+    restored = RecurrentPPOAgent(config, device=torch.device("cpu"))
+    restored.load(str(checkpoint))
+
+    assert agent.update_count > 0
+    assert len(tracker.solved) == 2
+    assert restored.observation_shape == (3, 5, 5)
+    assert restored.update_count == agent.update_count
 
 
 def test_recurrent_resume_uses_saved_curriculum_definitions(monkeypatch):
@@ -4552,7 +4798,7 @@ def test_mouse_icon_accepts_float_coordinates():
     assert np.any(pixels != bg_arr), "Mouse icon should be visible at float coordinates"
 
 
-def test_inference_rendering_full_loop_with_bfs_planner():
+def test_inference_rendering_full_loop_with_bfs_planner(monkeypatch):
     """Regression: run the full visualize_inference rendering loop headlessly.
 
     Previous crashes occurred because numpy.float32 scalars leaked into pygame
@@ -4575,16 +4821,35 @@ def test_inference_rendering_full_loop_with_bfs_planner():
     )
     grid = make_maze(config).grid
     planner = BfsPlanner()
+    tick_values = []
+    original_create_session = mouse_agent_module._create_inference_session
+
+    class RecordingClock:
+        def tick(self, fps):
+            tick_values.append(fps)
+
+    def create_recording_session(maze_shape, fps, show_input_channels):
+        session = original_create_session(maze_shape, fps, show_input_channels)
+        session.clock = RecordingClock()
+        return session
+
+    monkeypatch.setattr(
+        mouse_agent_module,
+        "_create_inference_session",
+        create_recording_session,
+    )
 
     result = mouse_agent_module.visualize_inference(
         planner,
         grid.copy(),
-        fps=5,
+        fps=73,
         observation_mode="full",
         config=config,
         show_input_channels=False,
     )
     assert result is True
+    assert tick_values and set(tick_values) == {73}
+    assert pygame.get_init() is False
     pygame.quit()
 
 

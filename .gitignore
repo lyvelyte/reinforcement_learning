@@ -200,3 +200,6 @@ Thumbs.db
 
 # Windows downloaded-file metadata
 *:Zone.Identifier
+
+*.pth
+*.jsonl
