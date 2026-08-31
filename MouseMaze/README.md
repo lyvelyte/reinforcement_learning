@@ -2,23 +2,35 @@
 
 MouseMaze trains recurrent PPO agents on procedurally generated perfect mazes.
 The default is a continuous recurrent PPO agent using a centered 5×5 `local`
-observation, a 512-unit GRU, potential-based distance shaping, 0.25-cell control
+observation, a 512-unit GRU, graph-aware progress shaping, 0.25-cell control
 steps, a `-0.2` invalid-move penalty, and a small RND reward. Walls block line of
 sight; `full` mode exposes the complete map. Local observations include an
-egocentric crop with optional clipped visit counts.
+egocentric crop with optional visit-count history.
 
-Default full-map observations contain wall, mouse, goal, and clipped visit-count
-channels. Default local observations contain wall, goal, and clipped visit-count
+Default full-map observations contain wall, mouse, goal, and visit-count
+channels. Default local observations contain wall, goal, and visit-count
 channels only. Discrete counts saturate at five visits by default. Continuous
-counts record the cell occupied after every control step, including collisions,
-and use a step-scaled saturation threshold of
-`ceil(visit_count_clip / continuous_step_scale)` (20 samples by default).
+counts record the occupied cell after every control step, including collisions,
+and use `log1p(count) / log1p(max_episode_steps + 1)`. This remains informative
+throughout the episode instead of saturating after 20 samples. The legacy
+step-scaled clipped encoding remains available for schema-v10 inference and
+ablations.
+
 The remaining-time channel is disabled by default. Configure these inputs with
 `--remaining-time-channel`, `--no-visit-count-channel`,
-`--visit-count-clip COUNT`, and `--no-wall-occlusion`; each Boolean option also
+`--visit-count-clip COUNT`, `--visit-count-encoding clipped|episode_log`, and
+`--no-wall-occlusion`; each Boolean option also
 accepts its inverse form. Reward shaping is explicitly selectable with
-`--distance-shaping-mode none|fractional|potential` and is never silently
+`--distance-shaping-mode none|fractional|potential|progress` and is never silently
 overridden by the observation mode.
+
+The default `progress` reward uses a wall-aware route from the occupied cell to
+the goal and rewards only actual reductions in that distance. A stationary
+action therefore receives the step penalty instead of a positive discounted
+potential reward. RND novelty is computed from the reached observation.
+Use `--continuous-distance-mode start_path` only for legacy ablations; it can
+underestimate off-route distance when walls separate a cell from the original
+start-to-goal path.
 
 Continuous recurrent PPO is the default. Use `--action-space discrete` for the
 legacy four-direction policy. Continuous mode supplies normalized within-cell
@@ -40,15 +52,13 @@ should select it explicitly:
 conda run -n ml pytest MouseMaze/test_mouse_agent.py
 ```
 
-If the `ml` environment is already activated, start the recommended continuous
-training profile from this directory with no arguments:
+From the repository root, start the recommended continuous training profile
+with:
 
 ```bash
-python MouseAgent.py
+conda run -n ml python MouseMaze/MouseAgent.py \
+  --train --no-resume --no-infer --remaining-time-channel
 ```
-
-From the repository root, the equivalent environment-independent command is
-`conda run -n ml python MouseMaze/MouseAgent.py`.
 
 ## RTX 3090 training
 
@@ -189,6 +199,10 @@ controls dashboard cadence only; `--eval-every-steps` controls evaluation. The
 legacy `--train-updates-per-step N` alias maps to `N / num_envs` updates per
 transition and cannot be combined with `--updates-per-transition`.
 
+Continuous evaluation records low-action rate, longest same-cell dwell, visit
+saturation for legacy clipped inputs, mean reward and shaping contribution, in
+addition to collisions, loops, action statistics, and difficulty solve rates.
+
 The optional dashboard retains a bounded whole-run chart history, reports
 percentages to two decimal places, and suppresses overlapping episode-axis
 labels. Pygame and its event loop run in a separate process; training publishes
@@ -238,10 +252,12 @@ overrides it for one run.
 The panel shows the channels enabled for the current model: full-map inputs use
 `Walls`, `Mouse`, and `Goal`; local inputs use `Walls` and `Goal`. Both modes
 may additionally include `Time remaining` and `Visit count`. Continuous inputs
-also show compact scalar readouts for `Within-cell row`, `Within-cell col`, and
-`Previous collision` below the spatial thumbnails.
-Recurrent hidden state, previous executed displacement, and previous reward are
-not rendered as maps.
+also show labeled `-1` to `+1` gauges and exact values for `Within-cell row` and
+`Within-cell col`, plus a color-coded `Previous collision` indicator below the
+spatial thumbnails. These are the same proprioception values supplied to the
+policy for the displayed action. Recurrent hidden state, previous executed
+displacement, previous reward, and episode-reset state are policy context rather
+than environment observations and are not included in the panel.
 
 Run the three deterministic held-out suites without training:
 
@@ -258,10 +274,12 @@ not compete for the frozen-best checkpoint; the main `.pth` is created from
 unrestricted evaluation, while `.latest.pth` always retains resumable current
 training state.
 
-Checkpoints and logs use schema v9. Older model artifacts remain archived but
-are intentionally rejected because continuous observations, action likelihoods,
-and motion semantics changed. Loading infers both algorithm and action space
-before constructing the model; an explicit CLI mismatch is rejected.
+New checkpoints and logs use schema v11. Schema-v10 checkpoints remain
+inference- and benchmark-compatible with their clipped visit counts, potential
+reward feedback, and existing proprioception, but cannot be resumed for
+training after the reward and observation semantics changed. Loading infers the
+algorithm, action space, observation encoding, and reward shaping before
+constructing the model; an explicit CLI mismatch is rejected.
 
 The exact full-map BFS planner remains available only as an environment sanity
 check:

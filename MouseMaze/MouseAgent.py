@@ -37,7 +37,7 @@ from gen_maze import generate_random_maze
 # Size of the centered local observation window; it must remain odd.
 VIEW_SIZE = 5
 # Rows and columns used when no maze size is supplied on the command line.
-DEFAULT_MAZE_SIZE = (11, 11)
+DEFAULT_MAZE_SIZE = (21, 21)
 # Observation choices: the full map or a centered local window.
 OBSERVATION_MODES = ("full", "local")
 # Algorithms supported by the trainer and checkpoint loader.
@@ -45,13 +45,16 @@ ALGORITHMS = ("dqn", "ppo", "recurrent_ppo")
 # Q-network layouts: spatial convolutions or a flattened MLP input.
 NETWORK_TYPES = ("spatial", "flat")
 # Reward-shaping choices for distance-to-goal progress.
-DISTANCE_SHAPING_MODES = ("potential", "fractional", "none")
+DISTANCE_SHAPING_MODES = ("progress", "potential", "fractional", "none")
+VISIT_COUNT_ENCODINGS = ("clipped", "episode_log")
+CONTINUOUS_DISTANCE_MODES = ("graph", "start_path")
 ACTION_SPACES = ("discrete", "continuous")
 # Hardware/reproducibility tuning profiles exposed by the CLI.
 PERFORMANCE_PROFILES = ("auto", "rtx3090-fast", "strict", "portable")
 CURRICULUM_MODES = ("auto", "manual")
 # Checkpoint format version written by the current agent implementation.
-CHECKPOINT_SCHEMA_VERSION = 10
+CHECKPOINT_SCHEMA_VERSION = 11
+SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS = (10, CHECKPOINT_SCHEMA_VERSION)
 # Compatibility episode limit used when training is enabled without an override.
 DEFAULT_EPISODES = 1_000_000
 # Seed used for training maze generation and other random operations.
@@ -179,7 +182,7 @@ TIMEOUT_PENALTY = -2.0
 # Multiplier applied to the selected distance-shaping reward.
 DISTANCE_SHAPING_SCALE = 1.0
 # Distance-shaping strategy used unless explicitly overridden.
-DEFAULT_DISTANCE_SHAPING_MODE = "potential"
+DEFAULT_DISTANCE_SHAPING_MODE = "progress"
 
 # Whether curriculum sampling changes maze difficulty during training.
 DEFAULT_CURRICULUM_ENABLED = True
@@ -314,10 +317,12 @@ class TrainConfig:
     observation_mode: str = DEFAULT_OBSERVATION_MODE
     action_space: str | None = None
     continuous_step_scale: float = 0.25
+    continuous_distance_mode: str | None = None
     view_size: int = VIEW_SIZE
     remaining_time_channel: bool = DEFAULT_REMAINING_TIME_CHANNEL
     visit_count_channel: bool = DEFAULT_VISIT_COUNT_CHANNEL
     visit_count_clip: int = DEFAULT_VISIT_COUNT_CLIP
+    visit_count_encoding: str | None = None
     wall_occlusion: bool = DEFAULT_WALL_OCCLUSION
     max_episode_steps: int | None = MAX_EPISODE_STEPS
     timeout_step_factor: float | None = DEFAULT_TIMEOUT_STEP_FACTOR
@@ -423,6 +428,12 @@ class TrainConfig:
                 if self.algorithm == "recurrent_ppo"
                 else "discrete"
             )
+        if self.visit_count_encoding is None:
+            self.visit_count_encoding = (
+                "episode_log" if self.action_space == "continuous" else "clipped"
+            )
+        if self.continuous_distance_mode is None:
+            self.continuous_distance_mode = "graph"
         if self.target_only_stop is None:
             self.target_only_stop = False
         elif self.target_only_stop and self.algorithm != "recurrent_ppo":
@@ -479,6 +490,11 @@ class TrainConfig:
             raise ValueError("continuous action space is supported only by recurrent_ppo")
         if not 0.0 < self.continuous_step_scale <= 1.0:
             raise ValueError("continuous_step_scale must be in (0, 1]")
+        if self.continuous_distance_mode not in CONTINUOUS_DISTANCE_MODES:
+            raise ValueError(
+                "continuous_distance_mode must be one of "
+                f"{CONTINUOUS_DISTANCE_MODES}; got {self.continuous_distance_mode!r}"
+            )
         if len(self.maze_size) != 2 or min(self.maze_size) < 3:
             raise ValueError("maze_size must contain two dimensions >= 3")
         if any(size % 2 == 0 for size in self.maze_size):
@@ -487,6 +503,11 @@ class TrainConfig:
             raise ValueError("view_size must be odd so the agent has a center cell")
         if self.visit_count_clip < 1:
             raise ValueError("visit_count_clip must be >= 1")
+        if self.visit_count_encoding not in VISIT_COUNT_ENCODINGS:
+            raise ValueError(
+                "visit_count_encoding must be one of "
+                f"{VISIT_COUNT_ENCODINGS}; got {self.visit_count_encoding!r}"
+            )
         if self.episodes < 1:
             raise ValueError("episodes must be >= 1")
         if self.max_env_steps < 1:
@@ -656,6 +677,13 @@ class EvalMetrics:
     executed_displacement_std: tuple[float, float] | None = None
     action_saturation_rate: float = 0.0
     no_motion_rate: float = 0.0
+    low_action_rate: float = 0.0
+    visit_saturation_rate: float = 0.0
+    failed_visit_saturation_rate: float = 0.0
+    max_same_cell_dwell_mean: float = 0.0
+    failed_max_same_cell_dwell_mean: float = 0.0
+    reward_mean: float = 0.0
+    distance_shaping_reward_mean: float = 0.0
     collision_cause_rates: dict[str, float] | None = None
     within_cell_offset_mean: tuple[float, float] | None = None
     goal_cell_outside_radius_rate: float = 0.0
@@ -946,6 +974,7 @@ def observation_settings_payload(config: TrainConfig) -> dict[str, object]:
         "remaining_time_channel": config.remaining_time_channel,
         "visit_count_channel": config.visit_count_channel,
         "visit_count_clip": config.visit_count_clip,
+        "visit_count_encoding": config.visit_count_encoding,
         "wall_occlusion": config.wall_occlusion,
         "action_space": config.action_space,
         "continuous_features": (
@@ -965,11 +994,32 @@ def _validate_checkpoint_observation_settings(
 ) -> None:
     expected = observation_settings_payload(config)
     actual = payload.get("observation_settings")
+    if isinstance(actual, dict) and "visit_count_encoding" not in actual:
+        actual = {**actual, "visit_count_encoding": "clipped"}
     if actual != expected:
         raise ValueError(
             f"checkpoint {path!r} uses observation settings {actual!r}; "
             f"current configuration uses {expected!r}. Pass matching channel "
             "and wall-occlusion options."
+        )
+
+
+def _validate_checkpoint_reward_settings(
+    payload: dict[str, object],
+    config: TrainConfig,
+    path: str,
+) -> None:
+    actual = str(payload.get("distance_shaping_mode", "potential"))
+    if actual != config.distance_shaping_mode:
+        raise ValueError(
+            f"checkpoint {path!r} uses distance shaping {actual!r}; current "
+            f"configuration uses {config.distance_shaping_mode!r}"
+        )
+    actual_distance = str(payload.get("continuous_distance_mode", "start_path"))
+    if actual_distance != config.continuous_distance_mode:
+        raise ValueError(
+            f"checkpoint {path!r} uses continuous distance {actual_distance!r}; "
+            f"current configuration uses {config.continuous_distance_mode!r}"
         )
 
 
@@ -1285,6 +1335,7 @@ def local_visibility_mask(walls: np.ndarray) -> np.ndarray:
 
 CONTINUOUS_GOAL_RADIUS = 0.6
 CONTINUOUS_COLLISION_SUBSTEP = 0.1
+CONTINUOUS_LOW_ACTION_THRESHOLD = 0.02
 
 
 def continuous_position_to_cell(
@@ -1342,6 +1393,27 @@ def continuous_geodesic_distance(
     return best
 
 
+def graph_continuous_goal_distance(
+    position: tuple[float, float] | np.ndarray,
+    cell: tuple[int, int],
+    goal: tuple[int, int],
+    bfs_distances: np.ndarray,
+    bfs_parent: dict[tuple[int, int], tuple[int, int] | None],
+) -> float:
+    """Return wall-aware continuous progress through the cell graph."""
+
+    point = np.asarray(position, dtype=np.float64)
+    if cell == goal:
+        return float(np.linalg.norm(point - np.asarray(goal, dtype=np.float64)))
+    successor = bfs_parent.get(cell)
+    if successor is None:
+        return float("inf")
+    return float(
+        np.linalg.norm(point - np.asarray(successor, dtype=np.float64))
+        + bfs_distances[successor]
+    )
+
+
 class Maze:
     """Grid maze environment with full-map and local observation modes.
 
@@ -1362,6 +1434,7 @@ class Maze:
         remaining_time_channel: bool = DEFAULT_REMAINING_TIME_CHANNEL,
         visit_count_channel: bool = DEFAULT_VISIT_COUNT_CHANNEL,
         visit_count_clip: int = DEFAULT_VISIT_COUNT_CLIP,
+        visit_count_encoding: str | None = None,
         wall_occlusion: bool = DEFAULT_WALL_OCCLUSION,
         max_episode_steps: int | None = MAX_EPISODE_STEPS,
         timeout_step_factor: float | None = None,
@@ -1376,6 +1449,7 @@ class Maze:
         gamma: float = GAMMA,
         action_space: str = "discrete",
         continuous_step_scale: float = 0.25,
+        continuous_distance_mode: str = "graph",
     ):
         if observation_mode not in OBSERVATION_MODES:
             raise ValueError(f"unsupported observation_mode: {observation_mode!r}")
@@ -1385,15 +1459,26 @@ class Maze:
             raise ValueError(f"unsupported action_space: {action_space!r}")
         if not 0.0 < continuous_step_scale <= 1.0:
             raise ValueError("continuous_step_scale must be in (0, 1]")
+        if continuous_distance_mode not in CONTINUOUS_DISTANCE_MODES:
+            raise ValueError(
+                f"unsupported continuous_distance_mode: {continuous_distance_mode!r}"
+            )
         self.grid = grid
         self.observation_mode = observation_mode
         self.view_size = view_size
         self.remaining_time_channel = bool(remaining_time_channel)
         self.visit_count_channel = bool(visit_count_channel)
         self.visit_count_clip = int(visit_count_clip)
+        self.visit_count_encoding = visit_count_encoding or (
+            "episode_log" if action_space == "continuous" else "clipped"
+        )
         self.wall_occlusion = bool(wall_occlusion)
         if self.visit_count_clip < 1:
             raise ValueError("visit_count_clip must be >= 1")
+        if self.visit_count_encoding not in VISIT_COUNT_ENCODINGS:
+            raise ValueError(
+                f"unsupported visit_count_encoding: {self.visit_count_encoding!r}"
+            )
         self.episode_step_cap = (
             None if max_episode_steps is None else int(max_episode_steps)
         )
@@ -1409,6 +1494,7 @@ class Maze:
         self.gamma = float(gamma)
         self.action_space = action_space
         self.continuous_step_scale = float(continuous_step_scale)
+        self.continuous_distance_mode = continuous_distance_mode
         self.previous_collision = False
         self.start = tuple(np.argwhere(self.grid == 2)[0])
         self.goal = tuple(np.argwhere(self.grid == 3)[0])
@@ -1476,11 +1562,20 @@ class Maze:
         return path
 
     def centerline_distance(self, position: tuple[float, float]) -> float:
-        """Return remaining continuous geodesic distance to the goal."""
+        """Return wall-aware continuous distance from ``position`` to the goal."""
 
-        if not hasattr(self, "_centerline"):
-            self._centerline = self._compute_centerline()
-        return continuous_geodesic_distance(position, self._centerline)
+        if self.continuous_distance_mode == "start_path":
+            return continuous_geodesic_distance(position, self._centerline)
+        cell = continuous_position_to_cell(position, self.grid.shape)
+        if cell is None or self.grid[cell] == 1:
+            return float("inf")
+        return graph_continuous_goal_distance(
+            position,
+            cell,
+            self.goal,
+            self.bfs_distances,
+            self._bfs_parent,
+        )
 
     def _resolve_max_episode_steps(self) -> int:
         control_optimal_steps = self.optimal_start_steps
@@ -1582,10 +1677,9 @@ class Maze:
                 cell = self.grid[r, c]
                 walls[vi, vj] = float(cell == 1)
                 goal[vi, vj] = float((r, c) == self.goal)
-                visit_counts[vi, vj] = min(
-                    int(self.visit_counts[r, c]),
-                    self.effective_visit_count_clip,
-                ) / self.effective_visit_count_clip
+                visit_counts[vi, vj] = self._normalized_visit_count(
+                    int(self.visit_counts[r, c])
+                )
         if self.wall_occlusion:
             visible = local_visibility_mask(walls.astype(np.bool_))
             walls *= visible
@@ -1605,9 +1699,26 @@ class Maze:
         return np.stack(channels)
 
     def _normalized_visit_counts(self) -> np.ndarray:
+        if self.visit_count_encoding == "episode_log":
+            denominator = math.log1p(self.max_episode_steps + 1)
+            return np.minimum(
+                np.log1p(self.visit_counts.astype(np.float32)) / denominator,
+                1.0,
+            )
         return np.minimum(self.visit_counts, self.effective_visit_count_clip).astype(
             np.float32
         ) / self.effective_visit_count_clip
+
+    def _normalized_visit_count(self, count: int) -> float:
+        if self.visit_count_encoding == "episode_log":
+            return min(
+                math.log1p(count) / math.log1p(self.max_episode_steps + 1),
+                1.0,
+            )
+        return (
+            min(count, self.effective_visit_count_clip)
+            / self.effective_visit_count_clip
+        )
 
     @property
     def remaining_time_fraction(self) -> float:
@@ -1647,10 +1758,11 @@ class Maze:
         reward = self.step_penalty
         if invalid:
             reward += self.invalid_move_penalty
-        reward += self.distance_shaping_scale * self._distance_shaping(
+        shaping_reward = self.distance_shaping_scale * self._distance_shaping(
             old_distance,
             new_distance,
         )
+        reward += shaping_reward
         if solved:
             reward += self.goal_reward
 
@@ -1670,6 +1782,7 @@ class Maze:
             "optimal_steps": self.optimal_start_steps,
             "steps": self.steps,
             "invalid_moves": self.invalid_moves,
+            "distance_shaping_reward": shaping_reward,
         }
         return self.observation(), reward, done, info
 
@@ -1720,9 +1833,11 @@ class Maze:
         reward = self.step_penalty
         if invalid:
             reward += self.invalid_move_penalty
-        reward += self.distance_shaping_scale * self._centerline_distance_shaping(
-            old_cl_dist, new_cl_dist,
+        shaping_reward = (
+            self.distance_shaping_scale
+            * self._centerline_distance_shaping(old_cl_dist, new_cl_dist)
         )
+        reward += shaping_reward
         if solved:
             reward += self.goal_reward
 
@@ -1745,6 +1860,7 @@ class Maze:
             "requested_action": requested.copy(),
             "executed_displacement": executed.copy(),
             "collision_cause": collision_cause,
+            "distance_shaping_reward": shaping_reward,
         }
         return self.observation(), reward, done, info
 
@@ -1753,6 +1869,8 @@ class Maze:
     ) -> float:
         if self.distance_shaping_mode == "none" or old_distance <= 0:
             return 0.0
+        if self.distance_shaping_mode == "progress":
+            return old_distance - new_distance
         if self.distance_shaping_mode == "fractional":
             return (old_distance - new_distance) / old_distance
         old_potential = -old_distance
@@ -1762,6 +1880,8 @@ class Maze:
     def _distance_shaping(self, old_distance: float, new_distance: float) -> float:
         if self.distance_shaping_mode == "none" or old_distance <= 0:
             return 0.0
+        if self.distance_shaping_mode == "progress":
+            return old_distance - new_distance
         if self.distance_shaping_mode == "fractional":
             return (old_distance - new_distance) / old_distance
         old_potential = -old_distance
@@ -2532,6 +2652,7 @@ def _maze_from_grid(config: TrainConfig, grid: np.ndarray) -> Maze:
         remaining_time_channel=config.remaining_time_channel,
         visit_count_channel=config.visit_count_channel,
         visit_count_clip=config.visit_count_clip,
+        visit_count_encoding=config.visit_count_encoding,
         wall_occlusion=config.wall_occlusion,
         max_episode_steps=config.max_episode_steps,
         timeout_step_factor=config.timeout_step_factor,
@@ -2546,6 +2667,7 @@ def _maze_from_grid(config: TrainConfig, grid: np.ndarray) -> Maze:
         gamma=config.gamma,
         action_space=config.action_space,
         continuous_step_scale=config.continuous_step_scale,
+        continuous_distance_mode=config.continuous_distance_mode,
     )
 
 
@@ -2628,6 +2750,7 @@ class BatchStep:
     invalid: np.ndarray
     solved: np.ndarray
     timeout: np.ndarray
+    distance_shaping_rewards: np.ndarray | None = None
     requested_actions: np.ndarray | None = None
     executed_displacements: np.ndarray | None = None
     collision_causes: np.ndarray | None = None
@@ -2652,9 +2775,11 @@ class MazeBatch:
             or env.remaining_time_channel != first.remaining_time_channel
             or env.visit_count_channel != first.visit_count_channel
             or env.visit_count_clip != first.visit_count_clip
+            or env.visit_count_encoding != first.visit_count_encoding
             or env.wall_occlusion != first.wall_occlusion
             or env.grid.shape != grid_shape
             or env.action_space != first.action_space
+            or env.continuous_distance_mode != first.continuous_distance_mode
             for env in environments
         ):
             raise ValueError("all batched mazes must use one observation and grid shape")
@@ -2665,6 +2790,7 @@ class MazeBatch:
         self.remaining_time_channel = first.remaining_time_channel
         self.visit_count_channel = first.visit_count_channel
         self.visit_count_clip = first.visit_count_clip
+        self.visit_count_encoding = first.visit_count_encoding
         self.wall_occlusion = first.wall_occlusion
         self.continuous = (
             first.action_space == "continuous" if continuous is None else bool(continuous)
@@ -2672,6 +2798,7 @@ class MazeBatch:
         if self.continuous != (first.action_space == "continuous"):
             raise ValueError("MazeBatch action mode must match its environments")
         self.continuous_step_scale = first.continuous_step_scale
+        self.continuous_distance_mode = first.continuous_distance_mode
         self.effective_visit_count_clip = (
             int(math.ceil(self.visit_count_clip / self.continuous_step_scale))
             if self.continuous
@@ -2679,6 +2806,7 @@ class MazeBatch:
         )
         self.grids = np.empty((self.size, *grid_shape), dtype=np.uint8)
         self.bfs_distances = np.empty((self.size, *grid_shape), dtype=np.float32)
+        self.goal_successors = np.empty((self.size, *grid_shape, 2), dtype=np.int64)
         self.starts = np.empty((self.size, 2), dtype=np.int64)
         self.goals = np.empty((self.size, 2), dtype=np.int64)
         self.positions = np.empty((self.size, 2), dtype=np.int64)
@@ -2718,13 +2846,19 @@ class MazeBatch:
             or environment.remaining_time_channel != self.remaining_time_channel
             or environment.visit_count_channel != self.visit_count_channel
             or environment.visit_count_clip != self.visit_count_clip
+            or environment.visit_count_encoding != self.visit_count_encoding
             or environment.wall_occlusion != self.wall_occlusion
             or environment.grid.shape != self.grid_shape
             or environment.continuous_step_scale != self.continuous_step_scale
+            or environment.continuous_distance_mode != self.continuous_distance_mode
         ):
             raise ValueError("replacement maze must match the batch observation shape")
         self.grids[index] = environment.grid
         self.bfs_distances[index] = environment.bfs_distances
+        self.goal_successors[index].fill(-1)
+        for cell, successor in environment._bfs_parent.items():
+            if successor is not None:
+                self.goal_successors[index, cell[0], cell[1]] = successor
         self.starts[index] = environment.start
         self.goals[index] = environment.goal
         self.positions[index] = environment.current_position
@@ -2739,9 +2873,8 @@ class MazeBatch:
         centerline = list(environment._centerline)
         self._centerlines[index] = centerline
         self._set_centerline_geometry(index, centerline)
-        self._current_centerline_distances[index] = continuous_geodesic_distance(
-            environment.continuous_position,
-            centerline,
+        self._current_centerline_distances[index] = environment.centerline_distance(
+            environment.continuous_position
         )
 
     def _set_centerline_geometry(
@@ -2773,39 +2906,77 @@ class MazeBatch:
         indices: np.ndarray,
         positions: np.ndarray,
     ) -> np.ndarray:
-        """Return exact polyline distances for a selected environment batch."""
+        """Return graph-aware continuous distances for a selected batch."""
 
         selected = np.asarray(indices, dtype=np.int64)
         points = np.asarray(positions, dtype=np.float64)
         if selected.shape != (len(points),):
             raise ValueError("indices and positions must have matching leading dimensions")
-        segment_counts = self._centerline_segment_counts[selected]
-        max_segments = int(segment_counts.max(initial=0))
-        distances = np.linalg.norm(points - self.goals[selected], axis=1)
-        if max_segments == 0:
+        if self.continuous_distance_mode == "start_path":
+            segment_counts = self._centerline_segment_counts[selected]
+            max_segments = int(segment_counts.max(initial=0))
+            distances = np.linalg.norm(points - self.goals[selected], axis=1)
+            if max_segments == 0:
+                return distances
+            starts = self._centerline_starts[selected, :max_segments]
+            deltas = self._centerline_deltas[selected, :max_segments]
+            lengths = self._centerline_lengths[selected, :max_segments]
+            remaining = self._centerline_remaining[selected, :max_segments]
+            valid = (
+                np.arange(max_segments)[np.newaxis, :]
+                < segment_counts[:, np.newaxis]
+            )
+            relative = points[:, np.newaxis, :] - starts
+            length_squared = lengths * lengths
+            fractions = np.divide(
+                np.sum(relative * deltas, axis=2),
+                length_squared,
+                out=np.zeros_like(length_squared),
+                where=valid,
+            )
+            np.clip(fractions, 0.0, 1.0, out=fractions)
+            projections = starts + fractions[:, :, np.newaxis] * deltas
+            lateral = np.linalg.norm(points[:, np.newaxis, :] - projections, axis=2)
+            candidates = lateral + (1.0 - fractions) * lengths + remaining
+            candidates[~valid] = np.inf
+            has_segments = segment_counts > 0
+            distances[has_segments] = np.min(candidates[has_segments], axis=1)
             return distances
-
-        starts = self._centerline_starts[selected, :max_segments]
-        deltas = self._centerline_deltas[selected, :max_segments]
-        lengths = self._centerline_lengths[selected, :max_segments]
-        remaining = self._centerline_remaining[selected, :max_segments]
-        valid = np.arange(max_segments)[np.newaxis, :] < segment_counts[:, np.newaxis]
-        relative = points[:, np.newaxis, :] - starts
-        length_squared = lengths * lengths
-        fractions = np.divide(
-            np.sum(relative * deltas, axis=2),
-            length_squared,
-            out=np.zeros_like(length_squared),
-            where=valid,
+        cells = np.floor(points + 0.5).astype(np.int64)
+        rows = np.clip(cells[:, 0], 0, self.grid_shape[0] - 1)
+        cols = np.clip(cells[:, 1], 0, self.grid_shape[1] - 1)
+        successors = self.goal_successors[selected, rows, cols]
+        at_goal = np.all(cells == self.goals[selected], axis=1)
+        targets = np.where(at_goal[:, np.newaxis], self.goals[selected], successors)
+        base = np.where(
+            at_goal,
+            0.0,
+            self.bfs_distances[selected, targets[:, 0], targets[:, 1]],
         )
-        np.clip(fractions, 0.0, 1.0, out=fractions)
-        projections = starts + fractions[:, :, np.newaxis] * deltas
-        lateral = np.linalg.norm(points[:, np.newaxis, :] - projections, axis=2)
-        candidates = lateral + (1.0 - fractions) * lengths + remaining
-        candidates[~valid] = np.inf
-        has_segments = segment_counts > 0
-        distances[has_segments] = np.min(candidates[has_segments], axis=1)
-        return distances
+        return np.linalg.norm(points - targets, axis=1) + base
+
+    def _normalize_visit_counts(
+        self,
+        counts: np.ndarray,
+        selected: np.ndarray,
+    ) -> np.ndarray:
+        """Normalize visit counts using the configured observation encoding."""
+
+        if self.visit_count_encoding == "episode_log":
+            denominator = np.log1p(self.max_episode_steps[selected] + 1).astype(
+                np.float32
+            )
+            denominator = denominator.reshape(
+                (len(selected),) + (1,) * (counts.ndim - 1)
+            )
+            return np.minimum(
+                np.log1p(counts.astype(np.float32)) / denominator,
+                1.0,
+            )
+        return (
+            np.minimum(counts, self.effective_visit_count_clip).astype(np.float32)
+            / self.effective_visit_count_clip
+        )
 
     def observations(self, indices: np.ndarray | None = None) -> np.ndarray:
         """Build batched full or centered local observations."""
@@ -2848,11 +3019,7 @@ class MazeBatch:
             )
         if self.visit_count_channel:
             channels.append(
-                np.minimum(
-                    self.visit_counts[selected],
-                    self.effective_visit_count_clip,
-                ).astype(np.float32)
-                / self.effective_visit_count_clip
+                self._normalize_visit_counts(self.visit_counts[selected], selected)
             )
         return np.stack(channels, axis=1).astype(np.float32, copy=False)
 
@@ -2888,12 +3055,9 @@ class MazeBatch:
                 & (cols == self.goals[selected, 1, np.newaxis, np.newaxis])
             )
         ).astype(np.float32)
-        visit_counts = (
-            np.minimum(
-                self.visit_counts[batch_indices, clipped_rows, clipped_cols],
-                self.effective_visit_count_clip,
-            ).astype(np.float32)
-            / self.effective_visit_count_clip
+        visit_counts = self._normalize_visit_counts(
+            self.visit_counts[batch_indices, clipped_rows, clipped_cols],
+            selected,
         )
         visit_counts *= in_bounds
         if self.wall_occlusion:
@@ -3021,9 +3185,15 @@ class MazeBatch:
         solved = np.all(self.positions[selected] == self.goals[selected], axis=1)
         rewards = np.full(len(selected), self.step_penalty, dtype=np.float32)
         rewards += invalid.astype(np.float32) * self.invalid_move_penalty
-        if self.distance_shaping_mode == "potential":
+        shaping_rewards = np.zeros(len(selected), dtype=np.float32)
+        if self.distance_shaping_mode == "progress":
+            shaping = old_distance - new_distance
+            shaping_rewards = self.distance_shaping_scale * shaping
+        elif self.distance_shaping_mode == "potential":
             shaping = self.gamma * (-new_distance) - (-old_distance)
-            rewards += self.distance_shaping_scale * np.where(old_distance > 0, shaping, 0.0)
+            shaping_rewards = self.distance_shaping_scale * np.where(
+                old_distance > 0, shaping, 0.0
+            )
         elif self.distance_shaping_mode == "fractional":
             shaping = np.divide(
                 old_distance - new_distance,
@@ -3031,7 +3201,8 @@ class MazeBatch:
                 out=np.zeros_like(old_distance),
                 where=old_distance > 0,
             )
-            rewards += self.distance_shaping_scale * shaping
+            shaping_rewards = self.distance_shaping_scale * shaping
+        rewards += shaping_rewards
         rewards += solved.astype(np.float32) * self.goal_reward
         self.steps[selected] += 1
         timeout = ~solved & (
@@ -3050,6 +3221,7 @@ class MazeBatch:
             invalid=invalid,
             solved=solved,
             timeout=timeout,
+            distance_shaping_rewards=shaping_rewards,
         )
 
     def _step_continuous(
@@ -3154,9 +3326,15 @@ class MazeBatch:
 
         rewards = np.full(len(selected), self.step_penalty, dtype=np.float32)
         rewards += invalid.astype(np.float32) * self.invalid_move_penalty
-        if self.distance_shaping_mode == "potential":
+        shaping_rewards = np.zeros(len(selected), dtype=np.float32)
+        if self.distance_shaping_mode == "progress":
+            shaping = old_cl_dist - new_cl_dist
+            shaping_rewards = self.distance_shaping_scale * shaping
+        elif self.distance_shaping_mode == "potential":
             shaping = self.gamma * (-new_cl_dist) - (-old_cl_dist)
-            rewards += self.distance_shaping_scale * np.where(old_cl_dist > 0, shaping, 0.0)
+            shaping_rewards = self.distance_shaping_scale * np.where(
+                old_cl_dist > 0, shaping, 0.0
+            )
         elif self.distance_shaping_mode == "fractional":
             shaping = np.divide(
                 old_cl_dist - new_cl_dist,
@@ -3164,7 +3342,8 @@ class MazeBatch:
                 out=np.zeros_like(old_cl_dist),
                 where=old_cl_dist > 0,
             )
-            rewards += self.distance_shaping_scale * shaping
+            shaping_rewards = self.distance_shaping_scale * shaping
+        rewards += shaping_rewards
         rewards += solved.astype(np.float32) * self.goal_reward
         self.steps[selected] += 1
         timeout = ~solved & (self.steps[selected] >= self.max_episode_steps[selected])
@@ -3181,6 +3360,7 @@ class MazeBatch:
             invalid=invalid,
             solved=solved,
             timeout=timeout,
+            distance_shaping_rewards=shaping_rewards,
             requested_actions=action_array.copy(),
             executed_displacements=executed,
             collision_causes=collision_causes,
@@ -3595,6 +3775,8 @@ class MouseAgent:
             "observation_mode": self.observation_mode,
             "view_size": self.view_size,
             "observation_settings": observation_settings_payload(self.config),
+            "distance_shaping_mode": self.config.distance_shaping_mode,
+            "continuous_distance_mode": self.config.continuous_distance_mode,
             "maze_size": self.config.maze_size,
             "update_count": self.update_count,
             "total_env_steps": self.total_env_steps,
@@ -3607,12 +3789,15 @@ class MouseAgent:
 
     def load(self, path: str) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)
-        if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") not in SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS
+        ):
             raise ValueError(
-                f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} "
-                "checkpoint; older policies must be retrained"
+                f"checkpoint {path!r} is not a supported MouseMaze checkpoint"
             )
         _validate_checkpoint_observation_settings(payload, self.config, path)
+        _validate_checkpoint_reward_settings(payload, self.config, path)
         state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
         if isinstance(payload, dict):
             network_type = payload.get("network_type") or infer_q_network_type(state_dict)
@@ -3776,6 +3961,8 @@ class MaskedPPOAgent:
             "observation_mode": self.observation_mode,
             "view_size": self.view_size,
             "observation_settings": observation_settings_payload(self.config),
+            "distance_shaping_mode": self.config.distance_shaping_mode,
+            "continuous_distance_mode": self.config.continuous_distance_mode,
             "maze_size": self.config.maze_size,
             "update_count": self.update_count,
             "total_env_steps": self.total_env_steps,
@@ -3786,12 +3973,15 @@ class MaskedPPOAgent:
 
     def load(self, path: str) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)
-        if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") not in SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS
+        ):
             raise ValueError(
-                f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} "
-                "checkpoint; older policies must be retrained"
+                f"checkpoint {path!r} is not a supported MouseMaze checkpoint"
             )
         _validate_checkpoint_observation_settings(payload, self.config, path)
+        _validate_checkpoint_reward_settings(payload, self.config, path)
         state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
         self.policy_net.load_state_dict(state_dict)
         if isinstance(payload, dict) and "optimizer_state_dict" in payload:
@@ -4299,6 +4489,8 @@ class RecurrentPPOAgent:
             "action_space": self.config.action_space,
             "view_size": self.view_size,
             "observation_settings": observation_settings_payload(self.config),
+            "distance_shaping_mode": self.config.distance_shaping_mode,
+            "continuous_distance_mode": self.config.continuous_distance_mode,
             "maze_size": self.config.maze_size,
             "recurrent_hidden_size": self.config.recurrent_hidden_size,
             "performance_profile": self.performance_profile,
@@ -4311,10 +4503,12 @@ class RecurrentPPOAgent:
 
     def load(self, path: str) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)
-        if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") not in SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS
+        ):
             raise ValueError(
-                f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} "
-                "checkpoint; older policies must be retrained"
+                f"checkpoint {path!r} is not a supported MouseMaze checkpoint"
             )
         if payload.get("algorithm") != self.algorithm:
             raise ValueError(f"checkpoint algorithm is {payload.get('algorithm')!r}, expected {self.algorithm!r}")
@@ -4324,6 +4518,7 @@ class RecurrentPPOAgent:
                 f"expected {self.config.action_space!r}"
             )
         _validate_checkpoint_observation_settings(payload, self.config, path)
+        _validate_checkpoint_reward_settings(payload, self.config, path)
         self.policy_net.load_state_dict(payload["state_dict"])
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         if self.rnd is not None and payload.get("rnd_state_dict") is not None:
@@ -4739,6 +4934,14 @@ def _eval_greedy(
     within_cell_offset_sum = np.zeros(2, dtype=np.float64)
     saturated_action_steps = 0
     no_motion_steps = 0
+    low_action_steps = 0
+    reward_sum = 0.0
+    shaping_reward_sum = 0.0
+    saturated_visit_steps = np.zeros(config.eval_episodes, dtype=np.int64)
+    episode_step_counts = np.zeros(config.eval_episodes, dtype=np.int64)
+    same_cell_dwell = np.zeros(config.eval_episodes, dtype=np.int64)
+    max_same_cell_dwell = np.zeros(config.eval_episodes, dtype=np.int64)
+    failed_episode = np.zeros(config.eval_episodes, dtype=np.bool_)
     collision_cause_counts: dict[str, int] = {}
     goal_cell_outside_radius_steps = 0
     bucket_totals: dict[str, int] = {}
@@ -4783,6 +4986,7 @@ def _eval_greedy(
         if continuous_evaluation
         else environment_batch.positions.astype(np.float64)
     )
+    previous_cells = environment_batch.positions.copy()
     position_two_steps_ago = np.full_like(previous_position, np.nan)
     position_three_steps_ago = np.full_like(previous_position, np.nan)
     seen_state_actions: list[set[tuple[tuple[int, int], int]]] = [set() for _ in envs]
@@ -4851,6 +5055,11 @@ def _eval_greedy(
             no_motion_steps += int(
                 np.count_nonzero(np.linalg.norm(executed, axis=1) < 1e-6)
             )
+            low_action_steps += int(
+                np.count_nonzero(
+                    np.linalg.norm(requested, axis=1) < CONTINUOUS_LOW_ACTION_THRESHOLD
+                )
+            )
             causes, cause_counts = np.unique(
                 step_result.collision_causes,
                 return_counts=True,
@@ -4877,9 +5086,34 @@ def _eval_greedy(
         else:
             previous_actions[active_indices] = actions
         previous_rewards[active_indices] = step_result.rewards
+        reward_sum += float(step_result.rewards.sum())
+        if step_result.distance_shaping_rewards is not None:
+            shaping_reward_sum += float(step_result.distance_shaping_rewards.sum())
         episode_starts[active_indices] = False
         invalid_moves += int(step_result.invalid.sum())
         total_steps += len(active_indices)
+        episode_step_counts[active_indices] += 1
+        current_cells = environment_batch.positions[active_indices]
+        remained = np.all(current_cells == previous_cells[active_indices], axis=1)
+        same_cell_dwell[active_indices] = np.where(
+            remained,
+            same_cell_dwell[active_indices] + 1,
+            1,
+        )
+        max_same_cell_dwell[active_indices] = np.maximum(
+            max_same_cell_dwell[active_indices],
+            same_cell_dwell[active_indices],
+        )
+        previous_cells[active_indices] = current_cells
+        if environment_batch.visit_count_encoding == "clipped":
+            counts = environment_batch.visit_counts[
+                active_indices,
+                current_cells[:, 0],
+                current_cells[:, 1],
+            ]
+            saturated_visit_steps[active_indices] += (
+                counts >= environment_batch.effective_visit_count_clip
+            )
 
         current_positions = (
             environment_batch.continuous_positions[active_indices].astype(np.float64)
@@ -4919,6 +5153,7 @@ def _eval_greedy(
                     bucket_solves[bucket] = bucket_solves.get(bucket, 0) + 1
                 else:
                     timeouts += 1
+                    failed_episode[env_idx] = True
                     failed_grids.append(environment_batch.grids[env_idx].copy())
                     loop_episodes += int(has_loop[env_idx])
                     repeated_state_action_episodes += int(
@@ -4943,6 +5178,7 @@ def _eval_greedy(
                         )
 
     total = max(config.eval_episodes, 1)
+    timeout_indices = np.flatnonzero(failed_episode)
     requested_action_mean = requested_action_sum / max(action_sample_count, 1)
     requested_action_variance = np.maximum(
         requested_action_square_sum / max(action_sample_count, 1)
@@ -5006,6 +5242,26 @@ def _eval_greedy(
             if action_sample_count
             else 0.0
         ),
+        low_action_rate=(
+            low_action_steps / action_sample_count
+            if action_sample_count
+            else 0.0
+        ),
+        visit_saturation_rate=(
+            float(saturated_visit_steps.sum()) / max(int(episode_step_counts.sum()), 1)
+        ),
+        failed_visit_saturation_rate=(
+            float(saturated_visit_steps[timeout_indices].sum())
+            / max(int(episode_step_counts[timeout_indices].sum()), 1)
+        ),
+        max_same_cell_dwell_mean=float(max_same_cell_dwell.mean()),
+        failed_max_same_cell_dwell_mean=(
+            float(max_same_cell_dwell[timeout_indices].mean())
+            if len(timeout_indices)
+            else 0.0
+        ),
+        reward_mean=reward_sum / max(total_steps, 1),
+        distance_shaping_reward_mean=shaping_reward_sum / max(total_steps, 1),
         collision_cause_rates={
             cause: count / max(total_steps, 1)
             for cause, count in sorted(collision_cause_counts.items())
@@ -5951,6 +6207,13 @@ def _eval_metrics_payload(metrics: EvalMetrics) -> dict[str, object]:
         "executed_displacement_std": metrics.executed_displacement_std,
         "action_saturation_rate": metrics.action_saturation_rate,
         "no_motion_rate": metrics.no_motion_rate,
+        "low_action_rate": metrics.low_action_rate,
+        "visit_saturation_rate": metrics.visit_saturation_rate,
+        "failed_visit_saturation_rate": metrics.failed_visit_saturation_rate,
+        "max_same_cell_dwell_mean": metrics.max_same_cell_dwell_mean,
+        "failed_max_same_cell_dwell_mean": metrics.failed_max_same_cell_dwell_mean,
+        "reward_mean": metrics.reward_mean,
+        "distance_shaping_reward_mean": metrics.distance_shaping_reward_mean,
         "collision_cause_rates": metrics.collision_cause_rates or {},
         "within_cell_offset_mean": metrics.within_cell_offset_mean,
         "goal_cell_outside_radius_rate": metrics.goal_cell_outside_radius_rate,
@@ -6167,12 +6430,10 @@ def checkpoint_training_states(
     payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
     if (
         not isinstance(payload, dict)
-        or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
+        or payload.get("schema_version") not in SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS
     ):
         raise ValueError(
-            f"checkpoint {path!r} is not a MouseMaze "
-            f"schema-v{CHECKPOINT_SCHEMA_VERSION} checkpoint; older policies "
-            "must be retrained"
+            f"checkpoint {path!r} is not a supported MouseMaze checkpoint"
         )
     weights = {
         key: value.detach().cpu().clone()
@@ -6196,27 +6457,84 @@ def create_agent(
 
 def checkpoint_algorithm(path: str) -> str:
     payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
-    if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") not in SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS
+    ):
         raise ValueError(
-            f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} "
-            "checkpoint; older policies must be retrained"
+            f"checkpoint {path!r} is not a supported MouseMaze checkpoint"
         )
     return str(payload.get("algorithm", "dqn"))
+
+
+def checkpoint_schema_version(path: str) -> int:
+    """Return the schema version from a supported checkpoint."""
+
+    payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"checkpoint {path!r} is not a MouseMaze checkpoint")
+    version = int(payload.get("schema_version", -1))
+    if version not in SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS:
+        raise ValueError(f"checkpoint {path!r} has unsupported schema v{version}")
+    return version
 
 
 def checkpoint_action_space(path: str) -> str:
     """Return and validate the action-space metadata stored in a checkpoint."""
 
     payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
-    if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") not in SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS
+    ):
         raise ValueError(
-            f"checkpoint {path!r} is not a MouseMaze schema-v{CHECKPOINT_SCHEMA_VERSION} "
-            "checkpoint; older policies must be retrained"
+            f"checkpoint {path!r} is not a supported MouseMaze checkpoint"
         )
     action_space = str(payload.get("action_space", "discrete"))
     if action_space not in ACTION_SPACES:
         raise ValueError(f"checkpoint {path!r} has invalid action_space {action_space!r}")
     return action_space
+
+
+def checkpoint_observation_settings(path: str) -> dict[str, object]:
+    """Return normalized observation settings from a supported checkpoint."""
+
+    payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") not in SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS
+    ):
+        raise ValueError(f"checkpoint {path!r} has an unsupported schema")
+    settings = payload.get("observation_settings")
+    if not isinstance(settings, dict):
+        raise ValueError(f"checkpoint {path!r} has no observation settings")
+    normalized = dict(settings)
+    normalized.setdefault("visit_count_encoding", "clipped")
+    return normalized
+
+
+def checkpoint_distance_shaping_mode(path: str) -> str:
+    """Return reward semantics needed by recurrent checkpoint inference."""
+
+    payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"checkpoint {path!r} is not a MouseMaze checkpoint")
+    mode = str(payload.get("distance_shaping_mode", "potential"))
+    if mode not in DISTANCE_SHAPING_MODES:
+        raise ValueError(f"checkpoint {path!r} has invalid distance shaping {mode!r}")
+    return mode
+
+
+def checkpoint_continuous_distance_mode(path: str) -> str:
+    """Return the continuous distance semantics stored by a checkpoint."""
+
+    payload = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"checkpoint {path!r} is not a MouseMaze checkpoint")
+    mode = str(payload.get("continuous_distance_mode", "start_path"))
+    if mode not in CONTINUOUS_DISTANCE_MODES:
+        raise ValueError(f"checkpoint {path!r} has invalid distance mode {mode!r}")
+    return mode
 
 
 def ensure_agent_matches_config(agent: Agent, config: TrainConfig) -> None:
@@ -6700,6 +7018,11 @@ def train(
         and os.path.exists(resume_checkpoint_path)
         and config.resume
     ):
+        if checkpoint_schema_version(resume_checkpoint_path) < CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(
+                "schema-v10 checkpoints remain inference-compatible but cannot be "
+                "resumed after reward and observation semantics changed"
+            )
         agent.load(resume_checkpoint_path)
         resumed = True
         _restore_rng_state(agent.training_state)
@@ -7744,6 +8067,12 @@ def _train_recurrent_ppo(
         dtype=torch.float32,
         device=agent.device,
     )
+    rollout_next_states_buffer = torch.empty(
+        *rollout_shape,
+        *agent.observation_shape,
+        dtype=torch.float32,
+        pin_memory=pin_memory,
+    )
     rollout_proprioception_buffer = torch.empty(
         *rollout_shape,
         proprioception_size,
@@ -7829,6 +8158,7 @@ def _train_recurrent_ppo(
                 )
         collector_started = time.perf_counter()
         rollout_states = rollout_states_buffer
+        rollout_next_states = rollout_next_states_buffer
         rollout_proprioception = rollout_proprioception_buffer
         rollout_masks = rollout_masks_buffer
         rollout_actions = rollout_actions_buffer
@@ -7910,6 +8240,7 @@ def _train_recurrent_ppo(
             environment_started = time.perf_counter()
             result = environment_batch.step(actions_np)
             environment_seconds += time.perf_counter() - environment_started
+            rollout_next_states[step].copy_(torch.from_numpy(result.states))
             rollout_actions[step].copy_(actions_t)
             rollout_log_probs[step].copy_(log_probs_t)
             rollout_values[step].copy_(values_t)
@@ -7975,6 +8306,10 @@ def _train_recurrent_ppo(
             break
         collector_seconds = time.perf_counter() - collector_started
         rollout_states = rollout_states[:actual_steps]
+        rollout_next_states = rollout_next_states[:actual_steps].to(
+            agent.device,
+            non_blocking=pin_memory,
+        )
         rollout_proprioception = rollout_proprioception[:actual_steps]
         rollout_masks = rollout_masks[:actual_steps]
         rollout_actions = rollout_actions[:actual_steps]
@@ -7994,7 +8329,7 @@ def _train_recurrent_ppo(
             rnd_coefficient = _rnd_coefficient(total_steps, config)
         if agent.rnd is not None and rnd_coefficient > 0.0:
             intrinsic_rewards = agent.rnd.bonus_and_update(
-                rollout_states,
+                rollout_next_states,
                 config.rnd_reward_clip,
             )
         combined_rewards = rollout_rewards + rnd_coefficient * intrinsic_rewards
@@ -9159,6 +9494,81 @@ def _channel_map_surface(
     return surface
 
 
+def _continuous_input_specs(
+    proprioception: np.ndarray | None,
+) -> tuple[tuple[str, float], tuple[str, float], tuple[str, float]]:
+    """Return the labeled scalar inputs used by a continuous policy."""
+
+    if proprioception is None or np.asarray(proprioception).shape != (3,):
+        actual = None if proprioception is None else np.asarray(proprioception).shape
+        raise ValueError(
+            "continuous input panel expected proprioception shape (3,), "
+            f"got {actual}"
+        )
+    row_offset, col_offset, previous_collision = np.asarray(
+        proprioception,
+        dtype=np.float32,
+    )
+    return (
+        ("Within-cell row", float(row_offset)),
+        ("Within-cell col", float(col_offset)),
+        ("Previous collision", float(previous_collision)),
+    )
+
+
+def _draw_signed_input_gauge(
+    pg,
+    screen,
+    label_font,
+    label: str,
+    value: float,
+    rect: Rect,
+) -> None:
+    """Draw one signed ``[-1, 1]`` scalar with its exact numeric value."""
+
+    x, y, width, height = rect
+    text = label_font.render(f"{label}: {value:+.2f}", True, (205, 213, 222))
+    screen.blit(text, (x, y))
+    track_y = y + max(14, height - 9)
+    track_rect = (x, track_y, max(1, width), 7)
+    pg.draw.rect(screen, (73, 84, 96), track_rect, border_radius=3)
+    center_x = x + width // 2
+    pg.draw.line(
+        screen,
+        (151, 161, 171),
+        (center_x, track_y),
+        (center_x, track_y + 6),
+    )
+    normalized = (float(np.clip(value, -1.0, 1.0)) + 1.0) / 2.0
+    marker_x = x + round(normalized * max(0, width - 1))
+    pg.draw.circle(screen, (75, 167, 232), (marker_x, track_y + 3), 4)
+
+
+def _draw_collision_input(
+    pg,
+    screen,
+    label_font,
+    value: float,
+    rect: Rect,
+) -> None:
+    """Draw the binary previous-collision policy input."""
+
+    x, y, width, height = rect
+    active = value >= 0.5
+    color = (203, 78, 91) if active else (86, 166, 112)
+    radius = max(4, min(7, height // 3))
+    center = (x + radius, y + height // 2)
+    pg.draw.circle(screen, color, center, radius)
+    status = "1 / Yes" if active else "0 / No"
+    text = label_font.render(
+        f"Previous collision: {status}",
+        True,
+        color,
+    )
+    text_x = min(x + radius * 2 + 7, x + max(0, width - text.get_width()))
+    screen.blit(text, (text_x, y + max(0, (height - text.get_height()) // 2)))
+
+
 def _draw_input_channel_panel(
     pg,
     screen,
@@ -9188,10 +9598,31 @@ def _draw_input_channel_panel(
     )
     columns = 2
     rows = (len(specs) + columns - 1) // columns
-    scalar_height = 52 if action_space == "continuous" else 0
     outer_pad = 12
     gap = 8
     title_height = 34
+    label_height = 20
+    scalar_specs = (
+        _continuous_input_specs(proprioception)
+        if action_space == "continuous"
+        else ()
+    )
+    minimum_tile_height = label_height + 1
+    scalar_height = (
+        min(
+            108,
+            max(
+                68,
+                panel_height
+                - title_height
+                - outer_pad
+                - gap * (rows - 1)
+                - rows * minimum_tile_height,
+            ),
+        )
+        if scalar_specs
+        else 0
+    )
     tile_width = max(1, (panel_width - outer_pad * 2 - gap) // columns)
     tile_height = max(
         1,
@@ -9204,7 +9635,6 @@ def _draw_input_channel_panel(
         )
         // rows,
     )
-    label_height = 20
 
     for index, (label, channel, color) in enumerate(specs):
         column = index % columns
@@ -9233,30 +9663,48 @@ def _draw_input_channel_panel(
             width=1,
         )
 
-    if action_space == "continuous":
-        if proprioception is None or np.asarray(proprioception).shape != (3,):
-            actual = None if proprioception is None else np.asarray(proprioception).shape
-            raise ValueError(
-                "continuous input panel expected proprioception shape (3,), "
-                f"got {actual}"
+    if scalar_specs:
+        scalar_x = panel_x + outer_pad
+        scalar_y = panel_y + panel_height - scalar_height
+        scalar_width = max(1, panel_width - outer_pad * 2)
+        scalar_font = _fitted_font(
+            pg,
+            "Previous collision: 1 / Yes",
+            scalar_width,
+            13,
+        )
+        collision_height = max(18, min(25, scalar_height // 4))
+        gauge_height = max(
+            20,
+            min(31, (scalar_height - collision_height - 5) // 2),
+        )
+        for index, (label, value) in enumerate(scalar_specs[:2]):
+            _draw_signed_input_gauge(
+                pg,
+                screen,
+                scalar_font,
+                label,
+                value,
+                (
+                    scalar_x,
+                    scalar_y + index * gauge_height,
+                    scalar_width,
+                    gauge_height,
+                ),
             )
-        row_offset, col_offset, previous_collision = np.asarray(
-            proprioception,
-            dtype=np.float32,
+        _collision_label, collision_value = scalar_specs[2]
+        _draw_collision_input(
+            pg,
+            screen,
+            scalar_font,
+            collision_value,
+            (
+                scalar_x,
+                scalar_y + gauge_height * 2 + 3,
+                scalar_width,
+                collision_height,
+            ),
         )
-        scalar_y = panel_y + panel_height - scalar_height + 4
-        offset_text = label_font.render(
-            f"Within-cell row {row_offset:+.2f} | col {col_offset:+.2f}",
-            True,
-            (205, 213, 222),
-        )
-        collision_text = label_font.render(
-            f"Previous collision: {'yes' if previous_collision >= 0.5 else 'no'}",
-            True,
-            (203, 78, 91) if previous_collision >= 0.5 else (205, 213, 222),
-        )
-        screen.blit(offset_text, (panel_x + outer_pad, scalar_y))
-        screen.blit(collision_text, (panel_x + outer_pad, scalar_y + 20))
 
 
 def _toggle_input_channel_panel(pg, event, visible: bool) -> bool:
@@ -9765,7 +10213,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Resume the selected/latest schema-v10 checkpoint; fresh training "
+            "Resume the selected/latest schema-v11 checkpoint; fresh training "
             "is the default."
         ),
     )
@@ -9781,6 +10229,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--observation-mode", choices=OBSERVATION_MODES, default=None)
     parser.add_argument("--action-space", choices=ACTION_SPACES, default=None)
     parser.add_argument("--continuous-step-scale", type=float, default=None)
+    parser.add_argument(
+        "--continuous-distance-mode",
+        choices=CONTINUOUS_DISTANCE_MODES,
+        default=None,
+    )
     parser.add_argument("--view-size", type=int, default=None)
     parser.add_argument(
         "--remaining-time-channel",
@@ -9792,13 +10245,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--visit-count-channel",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Include clipped normalized per-cell visit counts in observations.",
+        help="Include normalized per-cell visit counts in observations.",
     )
     parser.add_argument(
         "--visit-count-clip",
         type=int,
         default=None,
         help="Visit count represented as 1.0 in the visit-count channel.",
+    )
+    parser.add_argument(
+        "--visit-count-encoding",
+        choices=VISIT_COUNT_ENCODINGS,
+        default=None,
+        help="Encode visits with a legacy clip or episode-scaled logarithm.",
     )
     parser.add_argument(
         "--wall-occlusion",
@@ -10094,10 +10553,12 @@ def _train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         "observation_mode",
         "action_space",
         "continuous_step_scale",
+        "continuous_distance_mode",
         "view_size",
         "remaining_time_channel",
         "visit_count_channel",
         "visit_count_clip",
+        "visit_count_encoding",
         "wall_occlusion",
         "max_episode_steps",
         "timeout_step_factor",
@@ -10241,8 +10702,17 @@ def main(argv: list[str] | None = None) -> None:
         )
     )
     if should_load_checkpoint:
+        checkpoint_schema = checkpoint_schema_version(config.save_path)
+        if config.resume and checkpoint_schema < CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(
+                "schema-v10 checkpoints remain inference-compatible but cannot be "
+                "resumed after reward and observation semantics changed"
+            )
         checkpoint_algo = checkpoint_algorithm(config.save_path)
         checkpoint_actions = checkpoint_action_space(config.save_path)
+        checkpoint_settings = checkpoint_observation_settings(config.save_path)
+        checkpoint_shaping = checkpoint_distance_shaping_mode(config.save_path)
+        checkpoint_distance = checkpoint_continuous_distance_mode(config.save_path)
         if args.algorithm is not None and args.algorithm != checkpoint_algo:
             raise ValueError(
                 f"checkpoint algorithm is {checkpoint_algo!r}, but --algorithm is "
@@ -10256,6 +10726,42 @@ def main(argv: list[str] | None = None) -> None:
         values = {field_.name: getattr(config, field_.name) for field_ in fields(config)}
         values["algorithm"] = checkpoint_algo
         values["action_space"] = checkpoint_actions
+        if (
+            args.distance_shaping_mode is not None
+            and args.distance_shaping_mode != checkpoint_shaping
+        ):
+            raise ValueError(
+                f"checkpoint distance shaping is {checkpoint_shaping!r}, but the CLI "
+                f"requested {args.distance_shaping_mode!r}"
+            )
+        values["distance_shaping_mode"] = checkpoint_shaping
+        if (
+            args.continuous_distance_mode is not None
+            and args.continuous_distance_mode != checkpoint_distance
+        ):
+            raise ValueError(
+                f"checkpoint continuous distance is {checkpoint_distance!r}, but "
+                f"the CLI requested {args.continuous_distance_mode!r}"
+            )
+        values["continuous_distance_mode"] = checkpoint_distance
+        observation_arguments = {
+            "remaining_time_channel": args.remaining_time_channel,
+            "visit_count_channel": args.visit_count_channel,
+            "visit_count_clip": args.visit_count_clip,
+            "visit_count_encoding": args.visit_count_encoding,
+            "wall_occlusion": args.wall_occlusion,
+            "continuous_step_scale": args.continuous_step_scale,
+        }
+        for name, explicit_value in observation_arguments.items():
+            if name not in checkpoint_settings:
+                continue
+            checkpoint_value = checkpoint_settings[name]
+            if explicit_value is not None and explicit_value != checkpoint_value:
+                raise ValueError(
+                    f"checkpoint {name} is {checkpoint_value!r}, but the CLI "
+                    f"requested {explicit_value!r}"
+                )
+            values[name] = checkpoint_value
         config = TrainConfig(**values)
     expected_shape = config_observation_shape(config)
     agent = create_agent(config, expected_shape, device)

@@ -47,11 +47,13 @@ from MouseAgent import (
     TrainConfig,
     _chart_x_max,
     _confirm_target_candidate,
+    _continuous_input_specs,
     _curriculum_final_stage_start_step,
     _dashboard_tooltip_at,
     _draw_cheese_icon,
     _draw_input_channel_panel,
     _draw_mouse_icon,
+    _draw_signed_input_gauge,
     _draw_start_icon,
     _episode_tick_values,
     _gather_policy_cell,
@@ -324,7 +326,12 @@ def test_input_channel_panel_renders_without_mutating_observation():
 
 
 def _continuous_maze(
-    grid=None, *, step_scale=0.25, max_episode_steps=20, shaping="none"
+    grid=None,
+    *,
+    step_scale=0.25,
+    max_episode_steps=20,
+    shaping="none",
+    visit_count_encoding=None,
 ):
     return Maze(
         fixed_grid() if grid is None else grid,
@@ -334,6 +341,7 @@ def _continuous_maze(
         distance_shaping_mode=shaping,
         action_space="continuous",
         continuous_step_scale=step_scale,
+        visit_count_encoding=visit_count_encoding,
     )
 
 
@@ -341,7 +349,7 @@ def test_continuous_input_panel_renders_spatial_and_scalar_inputs():
     pygame = pytest.importorskip("pygame")
     environment = _continuous_maze()
     state = environment.reset()
-    proprioception = environment.proprioception()
+    proprioception = np.asarray((-0.5, 0.75, 1.0), dtype=np.float32)
     original_state = state.copy()
     original_proprioception = proprioception.copy()
     pygame.init()
@@ -361,8 +369,111 @@ def test_continuous_input_panel_renders_spatial_and_scalar_inputs():
         )
         pixels = pygame.surfarray.array3d(screen)
         assert np.any(pixels != np.asarray((26, 31, 38), dtype=np.uint8))
+        scalar_pixels = pixels[:, -108:, :]
+        assert np.any(
+            np.all(scalar_pixels == np.asarray((75, 167, 232)), axis=2)
+        )
+        assert np.any(
+            np.all(scalar_pixels == np.asarray((203, 78, 91)), axis=2)
+        )
         np.testing.assert_array_equal(state, original_state)
         np.testing.assert_array_equal(proprioception, original_proprioception)
+    finally:
+        pygame.quit()
+
+
+@pytest.mark.parametrize(
+    ("proprioception", "expected"),
+    [
+        (
+            (-1.0, 0.0, 0.0),
+            (
+                ("Within-cell row", -1.0),
+                ("Within-cell col", 0.0),
+                ("Previous collision", 0.0),
+            ),
+        ),
+        (
+            (0.25, 1.0, 1.0),
+            (
+                ("Within-cell row", 0.25),
+                ("Within-cell col", 1.0),
+                ("Previous collision", 1.0),
+            ),
+        ),
+    ],
+)
+def test_continuous_input_specs_report_exact_policy_values(
+    proprioception,
+    expected,
+):
+    assert (
+        _continuous_input_specs(np.asarray(proprioception, dtype=np.float32))
+        == expected
+    )
+
+
+@pytest.mark.parametrize("proprioception", [None, np.zeros(2), np.zeros((1, 3))])
+def test_continuous_input_specs_reject_invalid_shapes(proprioception):
+    with pytest.raises(ValueError, match=r"proprioception shape \(3,\)"):
+        _continuous_input_specs(proprioception)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_x"),
+    [(-1.0, 4), (0.0, 64), (1.0, 123)],
+)
+def test_signed_input_gauge_places_marker_across_normalized_range(
+    value,
+    expected_x,
+):
+    pygame = pytest.importorskip("pygame")
+    pygame.init()
+    try:
+        screen = pygame.Surface((132, 40))
+        screen.fill((34, 40, 48))
+        _draw_signed_input_gauge(
+            pygame,
+            screen,
+            pygame.font.SysFont("arial", 13),
+            "Within-cell row",
+            value,
+            (4, 2, 120, 31),
+        )
+        pixels = pygame.surfarray.array3d(screen)
+        marker_pixels = np.argwhere(
+            np.all(pixels == np.asarray((75, 167, 232)), axis=2)
+        )
+        assert marker_pixels.size > 0
+        assert np.any(np.abs(marker_pixels[:, 0] - expected_x) <= 1)
+    finally:
+        pygame.quit()
+
+
+def test_continuous_input_panel_distinguishes_collision_states():
+    pygame = pytest.importorskip("pygame")
+    environment = _continuous_maze()
+    state = environment.reset()
+    pygame.init()
+    try:
+        screens = []
+        for collision in (0.0, 1.0):
+            screen = pygame.Surface((500, 400))
+            _draw_input_channel_panel(
+                pygame,
+                screen,
+                (0, 0, 500, 400),
+                state,
+                "local",
+                False,
+                True,
+                "continuous",
+                np.asarray((0.0, 0.0, collision), dtype=np.float32),
+            )
+            screens.append(pygame.surfarray.array3d(screen)[:, -40:, :])
+        assert not np.array_equal(*screens)
+        assert np.any(np.all(screens[0] == np.asarray((86, 166, 112)), axis=2))
+        assert np.any(np.all(screens[1] == np.asarray((203, 78, 91)), axis=2))
     finally:
         pygame.quit()
 
@@ -406,6 +517,10 @@ def test_continuous_scalar_and_batch_transitions_match_and_report_execution():
         assert result.rewards[0] == pytest.approx(reward)
         assert bool(result.dones[0]) is done
         assert bool(result.invalid[0]) is info["invalid"]
+        assert result.distance_shaping_rewards is not None
+        assert result.distance_shaping_rewards[0] == pytest.approx(
+            info["distance_shaping_reward"]
+        )
         np.testing.assert_allclose(
             result.executed_displacements[0], info["executed_displacement"]
         )
@@ -484,7 +599,9 @@ def test_continuous_transitions_count_resulting_cell_occupancy():
     ("step_scale", "expected_clip"),
     [(0.25, 20), (0.3, 17), (1.0, 5)],
 )
-def test_continuous_visit_clip_scales_with_control_step(step_scale, expected_clip):
+def test_continuous_episode_log_visit_count_remains_informative_past_legacy_clip(
+    step_scale, expected_clip
+):
     env = _continuous_maze(
         step_scale=step_scale,
         max_episode_steps=expected_clip + 2,
@@ -496,15 +613,29 @@ def test_continuous_visit_clip_scales_with_control_step(step_scale, expected_cli
         assert not done
 
     assert env.visit_counts[env.start] == expected_clip
-    assert state[2, 2, 2] == pytest.approx(1.0)
+    value_at_legacy_clip = float(state[2, 2, 2])
+    assert 0.0 < value_at_legacy_clip < 1.0
 
     clipped, _reward, _done, _info = env.step(np.zeros(2, dtype=np.float32))
     assert env.visit_counts[env.start] == expected_clip + 1
-    assert clipped[2, 2, 2] == pytest.approx(1.0)
+    assert clipped[2, 2, 2] > value_at_legacy_clip
 
 
-def test_continuous_geodesic_shaping_rewards_forward_and_cache_replacement():
-    env = _continuous_maze(step_scale=1.0, shaping="potential")
+def test_continuous_legacy_clipped_visit_encoding_saturates_for_v10_models():
+    env = _continuous_maze(
+        step_scale=0.25,
+        max_episode_steps=30,
+        visit_count_encoding="clipped",
+    )
+
+    for _ in range(env.effective_visit_count_clip):
+        state, _reward, _done, _info = env.step(np.zeros(2, dtype=np.float32))
+
+    assert state[2, 2, 2] == pytest.approx(1.0)
+
+
+def test_continuous_graph_shaping_rewards_forward_and_cache_replacement():
+    env = _continuous_maze(step_scale=1.0, shaping="progress")
     _state, forward_reward, _done, _info = env.step(np.array([0.0, 1.0]))
     _state, reverse_reward, _done, _info = env.step(np.array([0.0, -1.0]))
     assert forward_reward > 0.0
@@ -523,7 +654,7 @@ def test_continuous_geodesic_shaping_rewards_forward_and_cache_replacement():
     assert new_path[-1] == tuple(batch.goals[0])
 
 
-def test_vectorized_centerline_distances_match_scalar_geometry():
+def test_vectorized_goal_distances_match_scalar_graph_geometry():
     environments = [
         _continuous_maze(step_scale=0.25),
         _continuous_maze(_alternate_continuous_grid(), step_scale=0.25),
@@ -536,15 +667,28 @@ def test_vectorized_centerline_distances_match_scalar_geometry():
     actual = batch._centerline_distances(np.arange(batch.size), positions)
     expected = np.asarray(
         [
-            mouse_agent_module.continuous_geodesic_distance(
-                positions[index],
-                batch._get_centerline(index),
-            )
+            environments[index].centerline_distance(tuple(positions[index]))
             for index in range(batch.size)
         ]
     )
 
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+
+
+def test_graph_continuous_distance_matches_bfs_at_every_cell_center():
+    env = _continuous_maze(_alternate_continuous_grid(), shaping="progress")
+
+    for cell in map(tuple, np.argwhere(env.grid != 1)):
+        assert env.centerline_distance(cell) == pytest.approx(env.bfs_distances[cell])
+
+
+def test_progress_shaping_never_rewards_a_continuous_no_op():
+    env = _continuous_maze(shaping="progress")
+
+    _state, reward, _done, info = env.step(np.zeros(2, dtype=np.float32))
+
+    assert reward == pytest.approx(env.step_penalty)
+    assert info["distance_shaping_reward"] == pytest.approx(0.0)
 
 
 def _continuous_agent():
@@ -855,6 +999,11 @@ def test_continuous_evaluation_is_invariant_to_maze_order():
     assert first.requested_action_mean is not None
     assert first.executed_displacement_mean is not None
     assert first.collision_cause_rates is not None
+    assert 0.0 <= first.low_action_rate <= 1.0
+    assert first.visit_saturation_rate == 0.0
+    assert first.max_same_cell_dwell_mean >= 1.0
+    assert np.isfinite(first.reward_mean)
+    assert np.isfinite(first.distance_shaping_reward_mean)
 
 
 @pytest.mark.parametrize("algorithm", ["dqn", "ppo"])
@@ -1264,7 +1413,7 @@ def test_default_timeout_provides_local_recovery_budget(monkeypatch):
     assert config.recurrent_hidden_size == 512
     assert config.action_space == "continuous"
     assert config.invalid_move_penalty == pytest.approx(-0.2)
-    assert config.distance_shaping_mode == "potential"
+    assert config.distance_shaping_mode == "progress"
     assert config.rnd_reward_coef == pytest.approx(0.05)
     assert config.hard_maze_fraction == 0.05
     assert config.precision_recovery_enabled is True
@@ -2441,11 +2590,13 @@ def test_cli_omitted_args_use_top_level_train_config_defaults():
     assert config.remaining_time_channel is DEFAULT_REMAINING_TIME_CHANNEL is False
     assert config.visit_count_channel is DEFAULT_VISIT_COUNT_CHANNEL is True
     assert config.visit_count_clip == DEFAULT_VISIT_COUNT_CLIP == 5
+    assert config.visit_count_encoding == "episode_log"
     assert config.wall_occlusion is DEFAULT_WALL_OCCLUSION is True
     assert config.algorithm == "recurrent_ppo"
     assert config.action_space == "continuous"
-    assert config.distance_shaping_mode == "potential"
+    assert config.distance_shaping_mode == "progress"
     assert config.continuous_step_scale == pytest.approx(0.25)
+    assert config.continuous_distance_mode == "graph"
     assert config.invalid_move_penalty == pytest.approx(-0.2)
     assert config.rnd_reward_coef == pytest.approx(0.05)
     assert config.recurrent_hidden_size == 512
@@ -2629,6 +2780,8 @@ def test_cli_observation_channel_and_visibility_flags_override_defaults():
             "--no-visit-count-channel",
             "--visit-count-clip",
             "7",
+            "--visit-count-encoding",
+            "clipped",
             "--no-wall-occlusion",
         ]
     )
@@ -2637,6 +2790,7 @@ def test_cli_observation_channel_and_visibility_flags_override_defaults():
     assert config.remaining_time_channel is True
     assert config.visit_count_channel is False
     assert config.visit_count_clip == 7
+    assert config.visit_count_encoding == "clipped"
     assert config.wall_occlusion is False
 
     with pytest.raises(ValueError, match="visit_count_clip"):
@@ -3787,7 +3941,7 @@ def test_process_prefetcher_prioritizes_hard_replay_variants():
     )
 
 
-def test_recurrent_checkpoint_v10_round_trip_and_rejects_v9(tmp_path):
+def test_recurrent_checkpoint_v11_round_trip_supports_v10_and_rejects_v9(tmp_path):
     config = TrainConfig(
         maze_size=(5, 5),
         algorithm="recurrent_ppo",
@@ -3803,7 +3957,8 @@ def test_recurrent_checkpoint_v10_round_trip_and_rejects_v9(tmp_path):
         performance_profile="portable",
         maze_workers=0,
     )
-    checkpoint = tmp_path / "recurrent_v10.pth"
+    checkpoint = tmp_path / "recurrent_v11.pth"
+    compatible_v10 = tmp_path / "compatible_v10.pth"
     legacy = tmp_path / "legacy_v9.pth"
     agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
     agent.update_count = 7
@@ -3821,12 +3976,34 @@ def test_recurrent_checkpoint_v10_round_trip_and_rejects_v9(tmp_path):
 
     restored = RecurrentPPOAgent(config, device=torch.device("cpu"))
     restored.load(str(checkpoint))
+    compatible_payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    compatible_payload["schema_version"] = 10
+    compatible_payload["observation_settings"].pop("visit_count_encoding")
+    compatible_payload.pop("distance_shaping_mode")
+    compatible_payload.pop("continuous_distance_mode")
+    torch.save(compatible_payload, compatible_v10)
+    v10_config = replace(
+        config,
+        visit_count_encoding="clipped",
+        distance_shaping_mode="potential",
+        continuous_distance_mode="start_path",
+    )
+    RecurrentPPOAgent(v10_config, device=torch.device("cpu")).load(
+        str(compatible_v10)
+    )
+    resume_v10_config = replace(
+        v10_config,
+        resume=True,
+        save_path=str(compatible_v10),
+    )
+    with pytest.raises(ValueError, match="inference-compatible"):
+        train(config=resume_v10_config)
     torch.save({"schema_version": 9, "algorithm": "recurrent_ppo"}, legacy)
 
     assert restored.update_count == 7
     assert restored.total_env_steps == 42
     assert restored.training_state == agent.training_state
-    with pytest.raises(ValueError, match="schema-v10"):
+    with pytest.raises(ValueError, match="supported MouseMaze"):
         restored.load(str(legacy))
 
     mismatched = replace(config, visit_count_channel=False)
@@ -3960,6 +4137,53 @@ def test_short_continuous_recurrent_training_and_checkpoint_smoke(tmp_path):
     assert len(tracker.solved) == 2
     assert restored.observation_shape == (3, 5, 5)
     assert restored.update_count == agent.update_count
+
+
+def test_recurrent_rnd_uses_post_action_observations(monkeypatch):
+    captured = {}
+
+    def capture_bonus(self, observations, clip):
+        del self, clip
+        captured["observations"] = observations.detach().cpu().clone()
+        return torch.zeros(observations.shape[:2], device=observations.device)
+
+    monkeypatch.setattr(RNDModule, "bonus_and_update", capture_bonus)
+    config = TrainConfig(
+        maze_size=(5, 5),
+        algorithm="recurrent_ppo",
+        action_space="continuous",
+        observation_mode="local",
+        episodes=2,
+        max_env_steps=8,
+        max_episode_steps=4,
+        num_envs=2,
+        ppo_rollout_steps=2,
+        recurrent_hidden_size=8,
+        recurrent_sequence_length=2,
+        recurrent_sequence_minibatch_size=2,
+        ppo_epochs=1,
+        rnd_reward_coef=0.05,
+        eval_every_steps=1_000,
+        eval_episodes=1,
+        curriculum_enabled=False,
+        dashboard_flag=False,
+        save_path=None,
+        training_log_path=None,
+        device="cpu",
+        require_cuda=False,
+        performance_profile="strict",
+        maze_workers=0,
+    )
+    agent = RecurrentPPOAgent(config, device=torch.device("cpu"))
+
+    train(agent=agent, config=config)
+
+    observations = captured["observations"]
+    expected_first_reached_visit = np.log1p(2) / np.log1p(config.max_episode_steps + 1)
+    np.testing.assert_allclose(
+        observations[0, :, 2, 2, 2].numpy(),
+        expected_first_reached_visit,
+    )
 
 
 def test_recurrent_resume_uses_saved_curriculum_definitions(monkeypatch):
